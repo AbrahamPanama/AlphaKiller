@@ -1,0 +1,32 @@
+{
+  "name": "alphakiller",
+  "version": "0.1.0",
+  "description": "Desktop image cleanup tool for transparent pixel and anti-aliasing artifacts.",
+  "main": "electron/main.js",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently -k \"vite --host 127.0.0.1\" \"wait-on tcp:5173 && electron .\"",
+    "diagnose:perf": "node scripts/perf-benchmark.mjs",
+    "diagnose:hf": "node scripts/hf-access-check.mjs",
+    "diagnose:bg-remove": "node scripts/bg-remove-smoke.mjs",
+    "benchmark:bg-remove": "node scripts/bg-remove-benchmark.mjs",
+    "build": "vite build",
+    "preview": "vite preview --host 127.0.0.1",
+    "electron": "electron ."
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@vitejs/plugin-react": "^5.0.4",
+    "lucide-react": "^0.468.0",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "utif": "^3.1.0",
+    "vite": "^7.1.12"
+  },
+  "devDependencies": {
+    "concurrently": "^9.2.1",
+    "electron": "^39.2.4",
+    "playwright-core": "^1.59.1",
+    "wait-on": "^9.0.1"
+  }
+}
