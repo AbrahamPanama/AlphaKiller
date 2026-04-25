@@ -4,6 +4,24 @@ Companion to `BACKGROUND_REMOVAL_PLAN.md`. This document is scoped narrowly: add
 
 This plan is implementation-ready: file-level changes, worker abstractions, settings schema, and acceptance criteria. It is not code.
 
+---
+
+## Revision 1 — Phase 0 outcome (2026-04-25) — READ THIS FIRST
+
+Phase 0 verification (§15) is complete and produced a blocker for the original BiRefNet_HR path:
+
+- The only available `BiRefNet_HR` ONNX (GitHub release `v1` asset, ~1 GB at fp32) is exported with a fixed `[1, 3, 2048, 2048]` input shape and no `dynamic_axes`. Every inference would have to pad-or-upscale to exactly 2K, breaking tile and TTA assumptions.
+- ORT Node and ORT Web session creation both succeed against this artifact, but the actual browser forward pass crashes inside `ort-wasm-simd-threaded.asyncify.wasm` with `RuntimeError: null function or function signature mismatch` — the operator-coverage failure mode also gating RMBG-2.0.
+- No `onnx-community` mirror of the HR variant exists. `ZhengPeng7/BiRefNet_HR` and `ZhengPeng7/BiRefNet_HR-matting` on Hugging Face have no `onnx/` directory and no `preprocessor_config.json`.
+
+**Plan of record for V1** is now Path B from the discussion thread: substitute `onnx-community/BiRefNet-ONNX` (general BiRefNet, 1024²-trained, MIT, Transformers.js-ready, confirmed working in community demos) as the "Quality" tier. The picker, worker dispatch, settings layer, error handling, and Phases 1–6 of this plan apply unchanged. Only the model descriptor, tile strategy, and picker copy differ — captured in §16.
+
+**BiRefNet_HR is deferred to Future Work** (§14, with the triage roadmap in §17). Once a browser-forward-compatible ONNX exists — either via upstream ORT Web operator coverage improvements or a re-export with `dynamic_axes` and a browser-safe op set — it slides into the existing dispatch as a third picker entry in roughly two hours.
+
+The rest of this document remains the original Path A plan as written, for historical context. Where §1–§14 say "BiRefNet_HR" and "2048²", read "BiRefNet (general)" and "1024²" until §16 supersedes those specifics. Phase 0's blocker verdict in §15 stands.
+
+---
+
 ## 1. Goal
 
 Give users a per-app-instance choice between:
@@ -372,9 +390,10 @@ If Phase 0 yields outcome **D** (must convert from PyTorch ourselves), add ~half
 
 ## 14. Future Work (Adjacent, Not This Plan)
 
+- **BiRefNet_HR (revisit).** Deferred from V1 per Revision 1. Triage roadmap is in §17. Worth picking up if/when ORT Web operator coverage improves or someone re-exports the model with browser-safe ops + `dynamic_axes`. Drops in as a third picker entry once a working ONNX exists.
 - **Model gallery.** Once the dispatch infrastructure from Phase 2 exists, adding more models is a 2-hour exercise per model. Easy follow-ups: BiRefNet-portrait for portrait-specific cleanup, BiRefNet_T for an even smaller "Fast" tier.
-- **Hybrid quality tier.** Run RMBG-1.4 first for a fast preview, kick off BiRefNet_HR in parallel, swap to its result when ready. Good UX but requires a meaningfully different orchestration pattern.
-- **Offline-bundled BiRefNet_HR.** Ship the ONNX inside the `.app` so the first-run download disappears. ~440 MB cost on disk for a much better cold-start UX.
+- **Hybrid quality tier.** Run RMBG-1.4 first for a fast preview, kick off BiRefNet (general) in parallel, swap to its result when ready. Good UX but requires a meaningfully different orchestration pattern.
+- **Offline-bundled BiRefNet.** Ship the ONNX inside the `.app` so the first-run download disappears. ~440 MB cost on disk for a much better cold-start UX.
 
 ## 15. Verification Notes
 
@@ -400,3 +419,119 @@ Notes:
   - Electron/browser forward pass failed with: RuntimeError: null function or function signature mismatch. The stack reported ort-wasm-simd-threaded.asyncify.wasm, so this is not safe to integrate behind a user-facing picker yet.
   - Verdict: do not begin Phase 1 for BiRefNet_HR until either a browser-forward-compatible ONNX is produced/hosted or the ORT Web runtime failure is resolved. Option C is available as a source artifact, but not cleared for AlphaKiller runtime integration.
 ```
+
+## 16. Revision 1 — Path B Specifics
+
+When implementing under the Revision 1 plan-of-record, apply these specific deltas to the original Path A content. Everything not listed here remains as written.
+
+### 16.1 Model descriptor (supersedes the `birefnet-hr` entry in §6 Phase 2)
+
+```
+const STAGE1_MODELS = {
+  'rmbg-1.4': {
+    repoId: 'briaai/RMBG-1.4',
+    runtime: 'pipeline',
+    task: 'image-segmentation',
+    config: { model_type: 'segformer' }
+  },
+  'birefnet': {                                  // NOTE: id is 'birefnet', not 'birefnet-hr'
+    repoId: 'onnx-community/BiRefNet-ONNX',
+    runtime: 'automodel',
+    inputName: 'input_image',
+    outputName: 'output_image',                  // confirmed in Phase 0 ORT Node test
+    nativeResolution: 1024,                      // not 2048
+    expectsSigmoid: true,
+    normalization: 'imagenet'
+  }
+};
+```
+
+The internal model id changes from `'birefnet-hr'` to `'birefnet'` so the picker, settings keys, and worker payload all reflect that this is the general variant — not the HR one. Future addition of an HR option will use the id `'birefnet-hr'` distinctly.
+
+### 16.2 Settings UI picker copy (supersedes §6 Phase 5)
+
+| Key | Old copy | New copy |
+|---|---|---|
+| Picker option label | "High-resolution (BiRefNet_HR)" | "Quality (BiRefNet)" |
+| Picker option tooltip | "Larger download (~440 MB at fp16). Best for images above 1024 px on a side. MIT-licensed." | "Larger download (~440 MB at fp16). Best for hair, fur, and translucent edges. 1024² inference; tiles for larger images. MIT-licensed." |
+
+The "Fast (RMBG-1.4)" option is unchanged.
+
+### 16.3 Tile strategy (supersedes §6 Phase 4)
+
+The descriptor map's `nativeResolution` field is the source of truth and is now `1024` for `'birefnet'`. The existing `chooseTileStrategy` logic — already model-parameterized in Phase 4's specification — handles this automatically:
+
+- ≤ 1024² source: native, no tiling.
+- 1024–2048² source: tiles of 1024² with 128 px overlap.
+- > 2048² source: tiles of 1024² with 128 px overlap (same).
+
+This is effectively the same behavior the worker already uses for RMBG-1.4. The only difference is which model runs inside each tile.
+
+### 16.4 Performance expectations (supersedes §8)
+
+Wall-clock estimates for the general BiRefNet at 1024² (replaces the BiRefNet_HR row from §8):
+
+| Scenario | RMBG-1.4 (current) | BiRefNet (general, V1 picker entry) |
+|---|---|---|
+| 1024² inference, WebGPU fp16 | ~0.4–0.8s | ~0.7–1.0s |
+| 1024² inference, WASM int8 | ~3–5s | ~5–8s |
+| 2048² source via 1024² tiles, WebGPU fp16 | n/a (model downscales) | ~3–5s (4 tiles + blend) |
+| First-run download | ~70 MB | ~440 MB at fp16 / ~880 MB at fp32 |
+| Resident memory (loaded) | ~120 MB | ~600 MB |
+
+Quality narrative: BiRefNet (general) is materially better than RMBG-1.4 on hair, mesh, fur, and translucent edges across the board. It does not match BiRefNet_HR on >1500 px images, but it does match or exceed RMBG-2.0 on most subjects, while remaining MIT-licensed and shipping a working ONNX.
+
+### 16.5 Acceptance criteria (additions to §11)
+
+- [ ] First load of `'birefnet'` downloads ~440 MB from the Hugging Face CDN with the existing progress strip and toast.
+- [ ] A 2048² source image processed via tiling under `'birefnet'` produces a seamless mask (no visible tile boundaries) with the existing raised-cosine blend.
+- [ ] Picker copy reads "Quality (BiRefNet)", not "High-resolution (BiRefNet_HR)". The acceptance reviewer should not see "_HR" anywhere in the user-facing UI for V1.
+- [ ] `STAGE1_MODELS['birefnet'].outputName` matches the actual ONNX output ("output_image"). Verified empirically in Phase 0.
+
+### 16.6 Effort revision
+
+The revised effort estimate is unchanged at the phase level, with one footnote: Phase 3 (BiRefNet pre/post-processing) is slightly easier under Path B because the input shape is `[1, 3, 1024, 1024]` instead of `[1, 3, 2048, 2048]`, which means the existing tile path lines up directly without the awkward "always run at 2K" workaround that BiRefNet_HR's fixed input shape would have forced. Net: ~half a day saved across Phases 3 and 4.
+
+Total: roughly **2 days best case, 2.5 days with risk-adjusted Phase 0 cleanup** (Phase 0 is already complete; the buffer is for any additional ORT smoke testing on the general BiRefNet ONNX before Phase 2 begins).
+
+## 17. BiRefNet_HR — Triage Roadmap (Deferred Future Work)
+
+Captured here so this work can be picked up later without re-running Phase 0. Three sequential gates; abandon at any one of them.
+
+### 17.1 Gate A — Identify the failing operator (1–2 hours)
+
+Run the existing local artifact at `/Volumes/External/AlphaKiller/.tmp/birefnet/BiRefNet_HR-general-epoch_130.onnx` through one of:
+
+- **ORT verbose logging.** Open an ORT Web session with `logSeverityLevel: 0` and capture the last successful operator dispatched before the crash. The op immediately following is the one with the missing kernel.
+- **Netron inspection.** Load the ONNX in Netron (https://netron.app) and look for: `Roll` (Swin shift-window attention), `Resize` with `mode='cubic'` or `antialias=true`, `Pad` with `mode='reflect'`/`'edge'`, `LayerNormalization` with multi-axis input, `GridSample`, custom-named nodes from the exporter. These are the usual ORT Web coverage gaps.
+- **Bisection.** Truncate the model graph at progressively earlier output nodes and run sessions until the failure point is bracketed.
+
+If the failing op is one of the well-known coverage gaps (e.g., `Roll`), Gate A succeeds with a target. If the failure is across many operators, abandon — the gap is too wide to patch.
+
+### 17.2 Gate B — Re-export from PyTorch with browser-friendly settings (half day)
+
+Use the BiRefNet repo's `tutorials/BiRefNet_pth2onnx.ipynb` or `optimum-cli export onnx`, with these specific settings to maximize ORT Web coverage:
+
+- `opset_version=17` (or 14 if 17 still produces unsupported ops).
+- `do_constant_folding=True`.
+- `dynamic_axes={'input_image': {0: 'batch', 2: 'height', 3: 'width'}}` — eliminates the fixed 2K input shape that itself blocks our tiling and TTA paths.
+- `training=torch.onnx.TrainingMode.EVAL`.
+- Post-export simplification: `python -m onnxsim model.onnx model_simplified.onnx`.
+- If the failing operator is one we can substitute (e.g., replacing `Roll` with explicit `Slice` + `Concat`): patch the PyTorch source before re-export. The BiRefNet codebase has a known Swin variant that uses non-rolled attention; switch to that variant if available.
+
+Output: a re-exported ONNX with `dynamic_axes` and (hopefully) only ORT-Web-supported operators.
+
+### 17.3 Gate C — Validate in-browser forward (1 hour)
+
+Repeat the Phase 0 ORT Web smoke test against the re-exported artifact:
+- Session creation under WebGPU + WASM EPs.
+- 1024² and 2048² forward passes both succeed.
+- Mask quality matches the ORT Node baseline within numerical tolerance.
+
+If all three pass, Gate C succeeds. Host the re-exported ONNX in a personal HF repo (or `onnx-community` mirror with attribution) and add a third picker entry "High-resolution (BiRefNet_HR)" to the existing `STAGE1_MODELS` map. The dispatch infrastructure from Phases 1–5 absorbs it without further refactoring.
+
+### 17.4 Effort and timing
+
+Best case: half a day if Gate A finds a single fixable operator and Gate B's re-export succeeds first try. Worst case: this work doesn't converge and BiRefNet_HR remains deferred indefinitely. The decision to invest is purely about whether the 2K-specialization advantage matters more than the half-day risk; for V1, we've answered no.
+
+This phase only begins after Revision 1's Path B has shipped and stabilized in user testing. It is not on the V1 critical path.

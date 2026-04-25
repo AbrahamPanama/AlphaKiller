@@ -1,5 +1,11 @@
 # AlphaKiller — Background Removal Implementation Plan
 
+> Current implementation note: the shipped worker currently uses
+> `briaai/RMBG-1.4` because the planned `briaai/RMBG-2.0` browser/ONNX path is
+> blocked by ORT session-shape/runtime failures. Treat this document as the
+> quality-target plan; see `README.md` for the runnable implementation state and
+> `BIREFNET_HR_PLAN.md` for the next model-investigation track.
+
 ## 1. Goal
 
 Add an AI-powered background removal feature to AlphaKiller that integrates cleanly with the existing alpha-cleanup pipeline (defringe, color bleed, alpha threshold, alpha hardening, delete pen). The output of the segmentation step should be a soft alpha mask that the existing tools then refine, positioning AlphaKiller as a "cleanup-aware background remover" rather than a one-shot competitor to remove.bg.

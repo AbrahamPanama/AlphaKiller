@@ -1,0 +1,1793 @@
+import React, { useCallback, useEffect, useRef, useState } from "react";
+import {
+  Activity,
+  Blend,
+  Check,
+  ChevronDown,
+  Download,
+  Eraser,
+  Eye,
+  FileImage,
+  FolderOpen,
+  Grid3X3,
+  Hand,
+  ImageDown,
+  Layers,
+  Maximize,
+  Moon,
+  Pipette,
+  RefreshCcw,
+  Save,
+  Scissors,
+  SlidersHorizontal,
+  Sparkles,
+  SplitSquareHorizontal,
+  Upload,
+  Wand2,
+  ZoomIn,
+  ZoomOut
+} from "lucide-react";
+import UTIF from "utif";
+import { applyMaskToImage } from "./imageProcessing.js";
+
+const DEFAULT_SETTINGS = {
+  threshold: { enabled: false, threshold: 128, softness: 8 },
+  defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2 },
+  bleed: { enabled: true, radius: 2, iterations: 2, affectSemiTransparent: true },
+  hardening: { enabled: false, strength: 55, midpoint: 50 }
+};
+
+const PRESETS = [
+  {
+    id: "gentle",
+    name: "Gentle Edge Cleanup",
+    description: "Light defringe and subtle color bleed for icons.",
+    settings: DEFAULT_SETTINGS
+  },
+  {
+    id: "hard-cutout",
+    name: "Hard Alpha Cutout",
+    description: "Binary transparency for masks and pixel art.",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      threshold: { enabled: true, threshold: 128, softness: 0 },
+      defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false },
+      bleed: { ...DEFAULT_SETTINGS.bleed, enabled: false }
+    }
+  },
+  {
+    id: "white-matte",
+    name: "White Matte Defringe",
+    description: "Strong white halo removal for exported artwork.",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      defringe: { enabled: true, matteColor: "#ffffff", strength: 86, radius: 3 }
+    }
+  },
+  {
+    id: "sprite-padding",
+    name: "Sprite Edge Padding",
+    description: "Bleeds edge colors into hidden transparent RGB.",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false },
+      bleed: { enabled: true, radius: 4, iterations: 4, affectSemiTransparent: true }
+    }
+  }
+];
+
+const BACKGROUNDS = [
+  { id: "checker", label: "Checker" },
+  { id: "black", label: "Black" },
+  { id: "white", label: "White" },
+  { id: "gray", label: "Gray" },
+  { id: "custom", label: "Custom" }
+];
+
+const SUPPORTED_IMAGE_EXTENSIONS = [".png", ".webp", ".tif", ".tiff"];
+const RASTER_MIME_RE = /^image\/(png|webp|tiff|x-tiff)$/;
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 32;
+const ZOOM_FACTOR = 1.14;
+const SPLIT_HIT_RADIUS = 14;
+const MIN_BRUSH_SIZE = 1;
+const MAX_BRUSH_SIZE = 128;
+const PROCESSING_DEBOUNCE_MS = 80;
+const BG_REMOVE_TIMEOUT_MS = 180000;
+const BG_REMOVE_EMPTY_MASK_LIMIT = 0.02;
+const checkerPatternCache = new WeakMap();
+
+const BG_REMOVE_LABELS = {
+  idle: "",
+  downloading: "Downloading background-removal model",
+  warming: "Preparing model",
+  inferring: "Removing background",
+  error: "Background removal failed"
+};
+
+export function App() {
+  const fileInputRef = useRef(null);
+  const canvasRef = useRef(null);
+  const originalCanvasRef = useRef(null);
+  const processedCanvasRef = useRef(null);
+  const maskCanvasRef = useRef(null);
+  const diffCanvasRef = useRef(null);
+  const originalCanvasCacheRef = useRef(null);
+  const processedCanvasCacheRef = useRef(null);
+  const maskCanvasCacheRef = useRef(null);
+  const diffCanvasCacheRef = useRef(null);
+  const interactionRef = useRef(null);
+  const brushPointRef = useRef(null);
+  const renderRafRef = useRef(null);
+  const renderCanvasRef = useRef(null);
+  const wheelZoomRef = useRef(null);
+  const dragDepthRef = useRef(0);
+  const sourceObjectUrlRef = useRef(null);
+  const processingWorkerRef = useRef(null);
+  const processingJobIdRef = useRef(0);
+  const latestProcessingRequestRef = useRef(0);
+  const activeProcessingJobRef = useRef(null);
+  const queuedProcessingJobRef = useRef(null);
+  const processingDebounceRef = useRef(null);
+  const bgRemoveWorkerRef = useRef(null);
+  const bgRemoveJobIdRef = useRef(0);
+  const latestBgRemoveRequestRef = useRef(0);
+  const activeBgRemoveJobRef = useRef(null);
+  const pendingBgRemoveJobRef = useRef(null);
+  const bgRemoveTimeoutRef = useRef(null);
+  const preSegmentationOriginalRef = useRef(null);
+  const bgRemoveNoticeShownRef = useRef(false);
+  const [source, setSource] = useState(null);
+  const [originalImageData, setOriginalImageData] = useState(null);
+  const [processedImageData, setProcessedImageData] = useState(null);
+  const [stats, setStats] = useState(null);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [preset, setPreset] = useState("gentle");
+  const [background, setBackground] = useState("checker");
+  const [customBackground, setCustomBackground] = useState("#6f5cff");
+  const [compareMode, setCompareMode] = useState("split");
+  const [split, setSplit] = useState(50);
+  const [zoom, setZoom] = useState(2);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [canvasTool, setCanvasTool] = useState("pan");
+  const [brushSize, setBrushSize] = useState(18);
+  const [status, setStatus] = useState("Ready");
+  const [cursor, setCursor] = useState(null);
+  const [toast, setToast] = useState(null);
+  const [dragging, setDragging] = useState(false);
+  const [canvasMode, setCanvasMode] = useState("idle");
+  const [bgRemoveStatus, setBgRemoveStatus] = useState("idle");
+  const [bgRemoveProgress, setBgRemoveProgress] = useState(0);
+  const [bgRemoveDevice, setBgRemoveDevice] = useState(null);
+  const [bgRemoveRefine, setBgRemoveRefine] = useState(false);
+  const [hasPreSegmentationOriginal, setHasPreSegmentationOriginal] = useState(false);
+  const [hfTokenDialogOpen, setHfTokenDialogOpen] = useState(false);
+  const [hfTokenDraft, setHfTokenDraft] = useState("");
+
+  const isBackgroundRemoving = bgRemoveStatus === "downloading" || bgRemoveStatus === "warming" || bgRemoveStatus === "inferring";
+
+  const loadFile = useCallback(async (file) => {
+    if (!file || !isSupportedImageFile(file)) {
+      setToast({ type: "error", title: "Unsupported file", message: "AlphaKiller currently accepts PNG, WebP, TIFF, and TIF images." });
+      return;
+    }
+
+    setStatus("Loading image");
+    cancelBackgroundRemoval();
+    preSegmentationOriginalRef.current = null;
+    setHasPreSegmentationOriginal(false);
+    if (isTiffFile(file)) {
+      try {
+        const { imageData, previewUrl } = await decodeTiffFile(file);
+        setSource({
+          name: file.name,
+          size: file.size,
+          type: file.type || "image/tiff",
+          format: "TIFF",
+          width: imageData.width,
+          height: imageData.height,
+          url: previewUrl
+        });
+        if (sourceObjectUrlRef.current) {
+          URL.revokeObjectURL(sourceObjectUrlRef.current);
+          sourceObjectUrlRef.current = null;
+        }
+        setOriginalImageData(imageData);
+        setProcessedImageData(imageData);
+        setStats(null);
+        setZoom(imageData.width < 300 ? 3 : 1);
+        setPan({ x: 0, y: 0 });
+        brushPointRef.current = null;
+        setStatus("Image loaded");
+      } catch (error) {
+        console.error(error);
+        setToast({
+          type: "error",
+          title: "Could not read TIFF",
+          message: "This TIFF may use a compression, color mode, or bit depth that is not supported yet."
+        });
+        setStatus("Ready");
+      }
+      return;
+    }
+
+    const url = URL.createObjectURL(file);
+    const image = new Image();
+    image.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = image.naturalWidth;
+      canvas.height = image.naturalHeight;
+      const context = canvas.getContext("2d", { willReadFrequently: true });
+      context.clearRect(0, 0, canvas.width, canvas.height);
+      context.drawImage(image, 0, 0);
+      const imageData = context.getImageData(0, 0, canvas.width, canvas.height);
+      if (sourceObjectUrlRef.current) {
+        URL.revokeObjectURL(sourceObjectUrlRef.current);
+      }
+      sourceObjectUrlRef.current = url;
+      setSource({
+        name: file.name,
+        size: file.size,
+        type: file.type,
+        format: file.type.replace("image/", "").toUpperCase(),
+        width: canvas.width,
+        height: canvas.height,
+        url
+      });
+      setOriginalImageData(imageData);
+      setProcessedImageData(imageData);
+      setStats(null);
+      setZoom(canvas.width < 300 ? 3 : 1);
+      setPan({ x: 0, y: 0 });
+      brushPointRef.current = null;
+      setStatus("Image loaded");
+    };
+    image.onerror = () => {
+      URL.revokeObjectURL(url);
+      setToast({ type: "error", title: "Could not read image", message: "The selected file could not be decoded." });
+      setStatus("Ready");
+    };
+    image.src = url;
+  }, []);
+
+  function ensureProcessingWorker() {
+    if (processingWorkerRef.current) {
+      return processingWorkerRef.current;
+    }
+
+    const worker = new Worker(new URL("./processingWorker.js", import.meta.url), { type: "module" });
+
+    worker.onmessage = (event) => {
+      const { id, width, height, buffer, stats: nextStats, error } = event.data;
+      const activeJob = activeProcessingJobRef.current;
+      if (!activeJob || activeJob.id !== id) return;
+
+      activeProcessingJobRef.current = null;
+      const queuedJob = queuedProcessingJobRef.current;
+
+      if (queuedJob) {
+        queuedProcessingJobRef.current = null;
+        startProcessingJob(queuedJob);
+        return;
+      }
+
+      if (activeJob.requestId !== latestProcessingRequestRef.current) {
+        return;
+      }
+
+      if (error) {
+        setStatus("Processing error");
+        setToast({
+          type: "error",
+          title: "Preview processing failed",
+          message: error
+        });
+        return;
+      }
+
+      setProcessedImageData(new ImageData(new Uint8ClampedArray(buffer), width, height));
+      setStats(nextStats);
+      setStatus("Ready");
+    };
+
+    worker.onerror = (error) => {
+      console.error(error);
+      worker.terminate();
+      if (processingWorkerRef.current === worker) {
+        processingWorkerRef.current = null;
+      }
+      activeProcessingJobRef.current = null;
+      queuedProcessingJobRef.current = null;
+      setStatus("Processing error");
+      setToast({
+        type: "error",
+        title: "Preview processing failed",
+        message: "AlphaKiller could not finish the current preview pass."
+      });
+    };
+
+    processingWorkerRef.current = worker;
+    return worker;
+  }
+
+  function startProcessingJob(job) {
+    const worker = ensureProcessingWorker();
+    const id = ++processingJobIdRef.current;
+    activeProcessingJobRef.current = { id, requestId: job.requestId };
+    setStatus("Processing preview");
+
+    const buffer = new Uint8ClampedArray(job.imageData.data).buffer;
+    worker.postMessage({
+      id,
+      buffer,
+      width: job.imageData.width,
+      height: job.imageData.height,
+      settings: job.settings
+    }, [buffer]);
+  }
+
+  function enqueueProcessingJob(job) {
+    if (activeProcessingJobRef.current) {
+      queuedProcessingJobRef.current = job;
+      return;
+    }
+
+    startProcessingJob(job);
+  }
+
+  function scheduleProcessing(imageData, nextSettings) {
+    const requestId = ++latestProcessingRequestRef.current;
+    const job = {
+      requestId,
+      imageData,
+      settings: structuredClone(nextSettings)
+    };
+
+    if (processingDebounceRef.current) {
+      window.clearTimeout(processingDebounceRef.current);
+    }
+
+    processingDebounceRef.current = window.setTimeout(() => {
+      processingDebounceRef.current = null;
+      enqueueProcessingJob(job);
+    }, PROCESSING_DEBOUNCE_MS);
+  }
+
+  function ensureBgRemoveWorker() {
+    if (bgRemoveWorkerRef.current) {
+      return bgRemoveWorkerRef.current;
+    }
+
+    const worker = new Worker(new URL("./bgRemoveWorker.js", import.meta.url), { type: "module" });
+
+    worker.onmessage = (event) => {
+      const message = event.data;
+      const activeJob = activeBgRemoveJobRef.current;
+      if (!activeJob || activeJob.id !== message.id) return;
+
+      if (activeJob.requestId !== latestBgRemoveRequestRef.current) {
+        return;
+      }
+
+      if (message.type === "progress") {
+        const nextStatus = bgRemoveStageToStatus(message.stage);
+        setBgRemoveStatus(nextStatus);
+        setBgRemoveProgress(message.progress);
+        if (message.device) setBgRemoveDevice(message.device);
+        setStatus(BG_REMOVE_LABELS[nextStatus] || "Removing background");
+        return;
+      }
+
+      clearBgRemoveTimeout();
+      activeBgRemoveJobRef.current = null;
+
+      if (message.type === "error") {
+        finishBgRemoveError(message.error);
+        return;
+      }
+
+      if (message.type !== "result") return;
+
+      if (message.maskMean < BG_REMOVE_EMPTY_MASK_LIMIT) {
+        setBgRemoveStatus("idle");
+        setBgRemoveProgress(0);
+        setStatus("Ready");
+        setToast({
+          type: "warning",
+          title: "No clear subject detected",
+          message: "Background removal did not find a strong foreground subject."
+        });
+        return;
+      }
+
+      const maskBuffer = message.maskBuffer || message.buffer;
+      const nextImageData = applyMaskToImage(activeJob.imageData, maskBuffer);
+      if (!preSegmentationOriginalRef.current) {
+        preSegmentationOriginalRef.current = cloneImageData(activeJob.imageData);
+        setHasPreSegmentationOriginal(true);
+      }
+
+      if (sourceObjectUrlRef.current) {
+        URL.revokeObjectURL(sourceObjectUrlRef.current);
+        sourceObjectUrlRef.current = null;
+      }
+
+      setOriginalImageData(nextImageData);
+      setProcessedImageData(nextImageData);
+      setStats(null);
+      setSource((current) => current ? { ...current, url: imageDataToObjectUrl(nextImageData) } : current);
+      setBgRemoveStatus("idle");
+      setBgRemoveProgress(0);
+      setBgRemoveDevice(message.device);
+      setStatus("Background removed");
+      setToast({
+        type: "success",
+        title: "Background removed",
+        message: `RMBG mask applied in ${(message.durationMs / 1000).toFixed(1)}s${message.device === "cpu" ? " using CPU" : ""}${message.stagesRun?.includes("stage2") ? " with edge refinement" : ""}.`
+      });
+    };
+
+    worker.onerror = (error) => {
+      console.error(error);
+      worker.terminate();
+      if (bgRemoveWorkerRef.current === worker) {
+        bgRemoveWorkerRef.current = null;
+      }
+      activeBgRemoveJobRef.current = null;
+      clearBgRemoveTimeout();
+      finishBgRemoveError("Background removal worker crashed.");
+    };
+
+    bgRemoveWorkerRef.current = worker;
+    return worker;
+  }
+
+  function startBgRemoveJob(job) {
+    const worker = ensureBgRemoveWorker();
+    const id = ++bgRemoveJobIdRef.current;
+    activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData };
+    setBgRemoveStatus("warming");
+    setBgRemoveProgress(0);
+    setBgRemoveDevice(null);
+    setStatus("Preparing model");
+
+    clearBgRemoveTimeout();
+    bgRemoveTimeoutRef.current = window.setTimeout(() => {
+      if (activeBgRemoveJobRef.current?.id !== id) return;
+      worker.postMessage({ type: "cancel", id });
+      worker.terminate();
+      if (bgRemoveWorkerRef.current === worker) {
+        bgRemoveWorkerRef.current = null;
+      }
+      activeBgRemoveJobRef.current = null;
+      finishBgRemoveError("Background removal took too long. Try a smaller image.");
+    }, BG_REMOVE_TIMEOUT_MS);
+
+    const buffer = new Uint8ClampedArray(job.imageData.data).buffer;
+    worker.postMessage({
+      type: "run",
+      id,
+      buffer,
+      width: job.imageData.width,
+      height: job.imageData.height,
+      options: {
+        tta: true,
+        refine: job.refine,
+        tileThreshold: 2048,
+        hfToken: job.hfToken
+      }
+    }, [buffer]);
+  }
+
+  async function runBackgroundRemoval() {
+    if (!originalImageData || isBackgroundRemoving) return;
+
+    const requestId = ++latestBgRemoveRequestRef.current;
+    if (!bgRemoveNoticeShownRef.current) {
+      bgRemoveNoticeShownRef.current = true;
+      setToast({
+        type: "info",
+        title: "First-time download may be large",
+        message: "BRIA RMBG model assets are cached locally after the first successful download."
+      });
+    }
+    const hfToken = await getHuggingFaceToken();
+    if (requestId !== latestBgRemoveRequestRef.current) return;
+    startBgRemoveJob({
+      requestId,
+      imageData: originalImageData,
+      refine: bgRemoveRefine,
+      hfToken
+    });
+  }
+
+  function restoreOriginal() {
+    const snapshot = preSegmentationOriginalRef.current;
+    if (!snapshot) return;
+
+    const restored = cloneImageData(snapshot);
+    preSegmentationOriginalRef.current = null;
+    setHasPreSegmentationOriginal(false);
+    setOriginalImageData(restored);
+    setProcessedImageData(restored);
+    setStats(null);
+    setSource((current) => current ? { ...current, url: imageDataToObjectUrl(restored) } : current);
+    setBgRemoveStatus("idle");
+    setBgRemoveProgress(0);
+    setToast(null);
+    setStatus("Original restored");
+  }
+
+  function cancelBackgroundRemoval() {
+    const activeJob = activeBgRemoveJobRef.current;
+    latestBgRemoveRequestRef.current += 1;
+    clearBgRemoveTimeout();
+    if (activeJob && bgRemoveWorkerRef.current) {
+      bgRemoveWorkerRef.current.postMessage({ type: "cancel", id: activeJob.id });
+      bgRemoveWorkerRef.current.terminate();
+      bgRemoveWorkerRef.current = null;
+    }
+    activeBgRemoveJobRef.current = null;
+    setBgRemoveStatus("idle");
+    setBgRemoveProgress(0);
+    setBgRemoveDevice(null);
+  }
+
+  function finishBgRemoveError(message) {
+    setBgRemoveStatus("error");
+    setBgRemoveProgress(0);
+    setStatus("Ready");
+    setToast({
+      type: "error",
+      title: "Background removal failed",
+      message: getBgRemoveErrorMessage(message)
+    });
+  }
+
+  function submitHfToken(event) {
+    event.preventDefault();
+    const token = sanitizeToken(hfTokenDraft);
+    if (!token) return;
+
+    try {
+      window.localStorage?.setItem("alphakiller:hf-token", token);
+    } catch {
+      setToast({
+        type: "error",
+        title: "Token not saved",
+        message: "The browser preview could not store the Hugging Face token."
+      });
+      return;
+    }
+
+    const pendingJob = pendingBgRemoveJobRef.current;
+    pendingBgRemoveJobRef.current = null;
+    setHfTokenDialogOpen(false);
+    setHfTokenDraft("");
+
+    if (pendingJob && pendingJob.requestId === latestBgRemoveRequestRef.current) {
+      startBgRemoveJob({ ...pendingJob, hfToken: token });
+    }
+  }
+
+  function cancelHfTokenDialog() {
+    pendingBgRemoveJobRef.current = null;
+    setHfTokenDialogOpen(false);
+    setHfTokenDraft("");
+    setStatus("Ready");
+  }
+
+  function clearBgRemoveTimeout() {
+    if (!bgRemoveTimeoutRef.current) return;
+    window.clearTimeout(bgRemoveTimeoutRef.current);
+    bgRemoveTimeoutRef.current = null;
+  }
+
+  useEffect(() => {
+    if (!originalImageData) {
+      setProcessedImageData(null);
+      setStats(null);
+      return;
+    }
+
+    setStatus("Processing preview");
+    scheduleProcessing(originalImageData, settings);
+  }, [originalImageData, settings]);
+
+  useEffect(() => () => {
+    if (processingDebounceRef.current) {
+      window.clearTimeout(processingDebounceRef.current);
+    }
+    if (sourceObjectUrlRef.current) {
+      URL.revokeObjectURL(sourceObjectUrlRef.current);
+      sourceObjectUrlRef.current = null;
+    }
+    clearBgRemoveTimeout();
+    processingWorkerRef.current?.terminate();
+    bgRemoveWorkerRef.current?.terminate();
+  }, []);
+
+  useEffect(() => {
+    if (!toast) return;
+    const id = window.setTimeout(() => setToast(null), 3600);
+    return () => window.clearTimeout(id);
+  }, [toast]);
+
+  const renderCanvas = useCallback(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    const rect = canvas.parentElement.getBoundingClientRect();
+    const nextWidth = Math.max(1, Math.floor(rect.width * window.devicePixelRatio));
+    const nextHeight = Math.max(1, Math.floor(rect.height * window.devicePixelRatio));
+
+    if (canvas.width !== nextWidth || canvas.height !== nextHeight) {
+      canvas.width = nextWidth;
+      canvas.height = nextHeight;
+    }
+
+    ctx.setTransform(window.devicePixelRatio, 0, 0, window.devicePixelRatio, 0, 0);
+    ctx.clearRect(0, 0, rect.width, rect.height);
+    drawBackground(ctx, rect.width, rect.height, background, customBackground);
+
+    if (!source || !originalImageData || !processedImageData) {
+      drawEmptyMark(ctx, rect.width, rect.height);
+      return;
+    }
+
+    const frame = getImageFrame(source, zoom, pan, rect.width, rect.height);
+    const { x, y, width: displayWidth, height: displayHeight } = frame;
+
+    const originalCanvas = imageDataToCachedCanvas(originalImageData, originalCanvasCacheRef, originalCanvasRef);
+    const processedCanvas = imageDataToCachedCanvas(processedImageData, processedCanvasCacheRef, processedCanvasRef);
+
+    ctx.imageSmoothingEnabled = zoom < 3;
+    if (compareMode === "before") {
+      ctx.drawImage(originalCanvas, x, y, displayWidth, displayHeight);
+    } else if (compareMode === "mask") {
+      drawAlphaMask(ctx, processedImageData, x, y, displayWidth, displayHeight, maskCanvasCacheRef, maskCanvasRef);
+    } else if (compareMode === "diff") {
+      drawDifference(ctx, originalImageData, processedImageData, x, y, displayWidth, displayHeight, diffCanvasCacheRef, diffCanvasRef);
+    } else if (compareMode === "split") {
+      const cut = x + displayWidth * (split / 100);
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(x, y, cut - x, displayHeight);
+      ctx.clip();
+      ctx.drawImage(originalCanvas, x, y, displayWidth, displayHeight);
+      ctx.restore();
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(cut, y, x + displayWidth - cut, displayHeight);
+      ctx.clip();
+      ctx.drawImage(processedCanvas, x, y, displayWidth, displayHeight);
+      ctx.restore();
+      ctx.strokeStyle = "rgba(255,255,255,.85)";
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.moveTo(cut, y - 14);
+      ctx.lineTo(cut, y + displayHeight + 14);
+      ctx.stroke();
+      drawSplitHandle(ctx, cut, y, displayHeight);
+      drawBadge(ctx, "BEFORE", x + 10, y + 12);
+      drawBadge(ctx, "AFTER", x + displayWidth - 66, y + 12);
+    } else {
+      ctx.drawImage(processedCanvas, x, y, displayWidth, displayHeight);
+    }
+
+    if (zoom >= 6) drawPixelGrid(ctx, x, y, displayWidth, displayHeight, zoom);
+
+    const brushPoint = brushPointRef.current;
+    if (canvasTool === "delete" && brushPoint) {
+      drawBrushCursor(ctx, brushPoint.x, brushPoint.y, Math.max(3, (brushSize * zoom) / 2), canvasMode === "delete");
+    }
+  }, [source, originalImageData, processedImageData, compareMode, split, zoom, pan, background, customBackground, canvasTool, brushSize, canvasMode]);
+
+  useEffect(() => {
+    renderCanvasRef.current = renderCanvas;
+  }, [renderCanvas]);
+
+  useEffect(() => {
+    renderCanvas();
+  }, [renderCanvas]);
+
+  const scheduleCanvasRender = useCallback(() => {
+    if (renderRafRef.current) return;
+    renderRafRef.current = window.requestAnimationFrame(() => {
+      renderRafRef.current = null;
+      renderCanvas();
+    });
+  }, [renderCanvas]);
+
+  useEffect(() => () => {
+    if (renderRafRef.current) {
+      window.cancelAnimationFrame(renderRafRef.current);
+    }
+    if (wheelZoomRef.current?.raf) {
+      window.cancelAnimationFrame(wheelZoomRef.current.raf);
+    }
+  }, []);
+
+  useEffect(() => {
+    const parent = canvasRef.current?.parentElement;
+    if (!parent || typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(() => renderCanvasRef.current?.());
+    observer.observe(parent);
+    return () => observer.disconnect();
+  }, []);
+
+  const updateSetting = (group, key, value) => {
+    setSettings((current) => ({
+      ...current,
+      [group]: {
+        ...current[group],
+        [key]: value
+      }
+    }));
+  };
+
+  const choosePreset = (id) => {
+    const next = PRESETS.find((item) => item.id === id);
+    if (!next) return;
+    setPreset(id);
+    setSettings(structuredClone(next.settings));
+  };
+
+  const handleExport = async () => {
+    if (!processedImageData || !source) return;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = processedImageData.width;
+    canvas.height = processedImageData.height;
+    canvas.getContext("2d").putImageData(processedImageData, 0, 0);
+    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    const baseName = source.name.replace(/\.[^.]+$/, "");
+    const result = await window.alphaKiller?.savePng({
+      bytes: Array.from(bytes),
+      defaultPath: `${baseName}-cleaned.png`
+    });
+
+    if (result?.canceled) return;
+    setToast({ type: "success", title: "Export complete", message: result?.filePath || "Cleaned PNG saved." });
+  };
+
+  const onDrop = (event) => {
+    event.preventDefault();
+    dragDepthRef.current = 0;
+    setDragging(false);
+    loadFile(event.dataTransfer.files?.[0]);
+  };
+
+  const updateCursorFromPoint = (point) => {
+    if (!source || !processedImageData) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const frame = getImageFrame(source, zoom, pan, rect.width, rect.height);
+    const imagePoint = getImagePoint(point, frame, zoom);
+    if (!imagePoint) {
+      setCursor(null);
+      return;
+    }
+    const { x, y } = imagePoint;
+    const index = (y * source.width + x) * 4;
+    const data = processedImageData.data;
+    setCursor({ x, y, r: data[index], g: data[index + 1], b: data[index + 2], a: data[index + 3] });
+  };
+
+  const eraseAtCanvasPoint = (point, interaction) => {
+    const imagePoint = getImagePoint(point, interaction.frame, zoom);
+    if (!imagePoint) {
+      interaction.lastImagePoint = null;
+      return;
+    }
+
+    eraseLinePixels(
+      interaction.draftData,
+      interaction.width,
+      interaction.height,
+      interaction.lastImagePoint || imagePoint,
+      imagePoint,
+      interaction.brushSize
+    );
+    eraseLineOnCanvas(
+      originalCanvasCacheRef.current?.canvas,
+      interaction.lastImagePoint || imagePoint,
+      imagePoint,
+      interaction.brushSize
+    );
+    eraseLineOnCanvas(
+      processedCanvasCacheRef.current?.canvas,
+      interaction.lastImagePoint || imagePoint,
+      imagePoint,
+      interaction.brushSize
+    );
+    interaction.lastImagePoint = imagePoint;
+    scheduleCanvasRender();
+  };
+
+  const zoomAtPoint = (nextZoom, point) => {
+    const clampedZoom = clamp(nextZoom, MIN_ZOOM, MAX_ZOOM);
+
+    if (!source || !canvasRef.current) {
+      setZoom(clampedZoom);
+      return;
+    }
+
+    const rect = canvasRef.current.getBoundingClientRect();
+    const oldFrame = getImageFrame(source, zoom, pan, rect.width, rect.height);
+    const imageX = (point.x - oldFrame.x) / zoom;
+    const imageY = (point.y - oldFrame.y) / zoom;
+    const centeredX = (rect.width - source.width * clampedZoom) / 2;
+    const centeredY = (rect.height - source.height * clampedZoom) / 2;
+
+    setZoom(clampedZoom);
+    setPan({
+      x: point.x - imageX * clampedZoom - centeredX,
+      y: point.y - imageY * clampedZoom - centeredY
+    });
+  };
+
+  const zoomAroundCanvasCenter = (nextZoom) => {
+    const canvas = canvasRef.current;
+    if (!canvas) {
+      setZoom(clamp(nextZoom, MIN_ZOOM, MAX_ZOOM));
+      return;
+    }
+    const rect = canvas.getBoundingClientRect();
+    zoomAtPoint(nextZoom, { x: rect.width / 2, y: rect.height / 2 });
+  };
+
+  const fitImageToCanvas = () => {
+    if (!source || !canvasRef.current) {
+      setZoom(1);
+      setPan({ x: 0, y: 0 });
+      return;
+    }
+    const rect = canvasRef.current.getBoundingClientRect();
+    const nextZoom = clamp(Math.min((rect.width * 0.82) / source.width, (rect.height * 0.82) / source.height), MIN_ZOOM, MAX_ZOOM);
+    setZoom(nextZoom);
+    setPan({ x: 0, y: 0 });
+  };
+
+  const setSplitFromCanvasX = (canvasX, frame) => {
+    if (!frame.width) return;
+    setSplit(clamp(((canvasX - frame.x) / frame.width) * 100, 0, 100));
+  };
+
+  const onCanvasWheel = (event) => {
+    if (!source || !canvasRef.current) return;
+    event.preventDefault();
+    const point = getCanvasPoint(event, canvasRef.current);
+    if (!wheelZoomRef.current) {
+      wheelZoomRef.current = { delta: 0, point, raf: null };
+    }
+
+    const pending = wheelZoomRef.current;
+    pending.delta += event.deltaY;
+    pending.point = point;
+
+    if (pending.raf) return;
+    pending.raf = window.requestAnimationFrame(() => {
+      const next = wheelZoomRef.current;
+      wheelZoomRef.current = null;
+      if (!next) return;
+      const steps = clamp(-next.delta / 100, -6, 6);
+      zoomAtPoint(zoom * Math.pow(ZOOM_FACTOR, steps), next.point);
+    });
+  };
+
+  const onCanvasPointerDown = (event) => {
+    if (!source || !processedImageData || !canvasRef.current) return;
+    if (event.button !== 0 && event.button !== 1) return;
+
+    const rect = canvasRef.current.getBoundingClientRect();
+    const point = getCanvasPoint(event, canvasRef.current);
+    const frame = getImageFrame(source, zoom, pan, rect.width, rect.height);
+    const splitX = frame.x + frame.width * (split / 100);
+    const overSplit = compareMode === "split" &&
+      point.y >= frame.y - SPLIT_HIT_RADIUS &&
+      point.y <= frame.y + frame.height + SPLIT_HIT_RADIUS &&
+      Math.abs(point.x - splitX) <= SPLIT_HIT_RADIUS;
+    const kind = overSplit ? "split" : event.button === 1 || canvasTool === "pan" ? "pan" : "delete";
+
+    interactionRef.current = {
+      kind,
+      pointerId: event.pointerId,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startPan: pan,
+      rect,
+      frame,
+      width: originalImageData.width,
+      height: originalImageData.height,
+      draftData: kind === "delete" ? new Uint8ClampedArray(originalImageData.data) : null,
+      lastImagePoint: null,
+      brushSize
+    };
+    canvasRef.current.setPointerCapture(event.pointerId);
+    setCanvasMode(kind);
+    brushPointRef.current = point;
+
+    if (kind === "split") {
+      setSplitFromCanvasX(point.x, frame);
+    } else if (kind === "delete") {
+      eraseAtCanvasPoint(point, interactionRef.current);
+      updateCursorFromPoint(point);
+      setStatus("Deleting pixels");
+    }
+
+    event.preventDefault();
+  };
+
+  const onCanvasPointerMove = (event) => {
+    if (!canvasRef.current) return;
+    const point = getCanvasPoint(event, canvasRef.current);
+    const interaction = interactionRef.current;
+
+    if (interaction?.kind === "pan") {
+      setPan({
+        x: interaction.startPan.x + event.clientX - interaction.startClientX,
+        y: interaction.startPan.y + event.clientY - interaction.startClientY
+      });
+      return;
+    }
+
+    if (interaction?.kind === "split") {
+      setSplitFromCanvasX(event.clientX - interaction.rect.left, interaction.frame);
+      updateCursorFromPoint(point);
+      return;
+    }
+
+    if (interaction?.kind === "delete") {
+      brushPointRef.current = point;
+      eraseAtCanvasPoint(point, interaction);
+      updateCursorFromPoint(point);
+      return;
+    }
+
+    if (source) {
+      const rect = canvasRef.current.getBoundingClientRect();
+      const frame = getImageFrame(source, zoom, pan, rect.width, rect.height);
+      const splitX = frame.x + frame.width * (split / 100);
+      const overSplit = compareMode === "split" &&
+        point.y >= frame.y - SPLIT_HIT_RADIUS &&
+        point.y <= frame.y + frame.height + SPLIT_HIT_RADIUS &&
+        Math.abs(point.x - splitX) <= SPLIT_HIT_RADIUS;
+      setCanvasMode(overSplit ? "hover-split" : "idle");
+    }
+
+    brushPointRef.current = point;
+    if (canvasTool === "delete") {
+      scheduleCanvasRender();
+    }
+    updateCursorFromPoint(point);
+  };
+
+  const endCanvasInteraction = (event) => {
+    const interaction = interactionRef.current;
+
+    if (interactionRef.current && canvasRef.current?.hasPointerCapture?.(event.pointerId)) {
+      canvasRef.current.releasePointerCapture(event.pointerId);
+    }
+    if (interaction?.kind === "delete") {
+      setOriginalImageData(new ImageData(new Uint8ClampedArray(interaction.draftData), interaction.width, interaction.height));
+      setStatus("Ready");
+    }
+    interactionRef.current = null;
+    setCanvasMode("idle");
+  };
+
+  return (
+    <div
+      className={`app ${dragging ? "is-dragging" : ""}`}
+      onDragEnter={(event) => {
+        event.preventDefault();
+        dragDepthRef.current += 1;
+        if (!dragging) setDragging(true);
+      }}
+      onDragOver={(event) => {
+        event.preventDefault();
+      }}
+      onDragLeave={(event) => {
+        event.preventDefault();
+        dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
+        if (dragDepthRef.current === 0) setDragging(false);
+      }}
+      onDrop={onDrop}
+    >
+      <input
+        ref={fileInputRef}
+        type="file"
+        accept="image/png,image/webp,image/tiff,.tif,.tiff"
+        hidden
+        onChange={(event) => loadFile(event.target.files?.[0])}
+      />
+
+      <header className="titlebar">
+        <div className="brand">
+          <Scissors size={15} />
+          <strong>AlphaKiller</strong>
+          <span>{source ? source.name : "No image loaded"}</span>
+        </div>
+        <nav>
+          <button className="nav-active">Editor</button>
+          <button>Batch</button>
+          <button>Presets</button>
+        </nav>
+      </header>
+
+      <div className="toolbar">
+        <button className="icon-button" title="Open image" onClick={() => fileInputRef.current?.click()}>
+          <FolderOpen size={16} />
+        </button>
+        <button className="icon-button" title="Save preset">
+          <Save size={16} />
+        </button>
+        <span className="divider" />
+        <button className="icon-button" title="Zoom out" onClick={() => zoomAroundCanvasCenter(zoom / ZOOM_FACTOR)}>
+          <ZoomOut size={16} />
+        </button>
+        <button className="toolbar-value" onClick={() => {
+          setZoom(1);
+          setPan({ x: 0, y: 0 });
+        }}>{Math.round(zoom * 100)}%</button>
+        <button className="icon-button" title="Zoom in" onClick={() => zoomAroundCanvasCenter(zoom * ZOOM_FACTOR)}>
+          <ZoomIn size={16} />
+        </button>
+        <button className="icon-button" title="Fit" onClick={fitImageToCanvas}>
+          <Maximize size={15} />
+        </button>
+        <span className="divider" />
+        <button className={`icon-button ${canvasTool === "pan" ? "active" : ""}`} title="Pan tool" onClick={() => setCanvasTool("pan")}>
+          <Hand size={16} />
+        </button>
+        <button className={`icon-button ${canvasTool === "delete" ? "active" : ""}`} title="Delete Pen" onClick={() => setCanvasTool("delete")}>
+          <Eraser size={16} />
+        </button>
+        <label className={`toolbar-slider ${canvasTool === "delete" ? "enabled" : ""}`}>
+          <span>Size</span>
+          <input
+            type="range"
+            min={MIN_BRUSH_SIZE}
+            max={MAX_BRUSH_SIZE}
+            value={brushSize}
+            onChange={(event) => setBrushSize(Number(event.target.value))}
+            disabled={canvasTool !== "delete"}
+          />
+          <output>{brushSize}px</output>
+        </label>
+        <button
+          className="icon-button bg-remove-button"
+          title="Remove Background"
+          aria-label="Remove Background"
+          disabled={!originalImageData || isBackgroundRemoving}
+          onClick={runBackgroundRemoval}
+        >
+          <Sparkles size={16} />
+        </button>
+        <label className={`hq-toggle ${bgRemoveRefine ? "enabled" : ""}`} title="High-quality edges">
+          <input
+            type="checkbox"
+            checked={bgRemoveRefine}
+            disabled={!originalImageData || isBackgroundRemoving}
+            onChange={(event) => setBgRemoveRefine(event.target.checked)}
+          />
+          <span>High-quality edges</span>
+        </label>
+        <span className="divider" />
+        <Segmented
+          value={compareMode}
+          onChange={setCompareMode}
+          options={[
+            ["after", "After"],
+            ["before", "Before"],
+            ["split", "Split"],
+            ["mask", "Mask"],
+            ["diff", "Diff"]
+          ]}
+        />
+        <div className="spacer" />
+        <button className="primary-button" disabled={!processedImageData} onClick={handleExport}>
+          <Download size={15} />
+          Export PNG
+        </button>
+      </div>
+
+      <main className="workspace">
+        <aside className="sidebar left">
+          <PanelTitle title="Source" action={<Upload size={14} />} />
+          {source ? (
+            <div className="source-card">
+              <div className="thumb">
+                <img src={source.url} alt="" />
+              </div>
+              <strong>{source.name}</strong>
+              <dl>
+                <dt>Size</dt><dd>{source.width} x {source.height}</dd>
+                <dt>Bytes</dt><dd>{formatBytes(source.size)}</dd>
+                <dt>Type</dt><dd>{source.format || source.type.replace("image/", "").toUpperCase()}</dd>
+                <dt>Alpha</dt><dd><span className="pill good">Detected</span></dd>
+              </dl>
+              {hasPreSegmentationOriginal && (
+                <button className="restore-button" onClick={restoreOriginal}>
+                  <RefreshCcw size={13} />
+                  Restore Original
+                </button>
+              )}
+            </div>
+          ) : (
+            <div className="empty-panel">
+              <FileImage size={32} />
+              <strong>Drop a PNG, WebP, or TIFF</strong>
+              <span>The first import stays local and previews immediately.</span>
+              <button onClick={() => fileInputRef.current?.click()}>Open Image</button>
+            </div>
+          )}
+
+          <PanelTitle title="Inspection" />
+          <div className="metric-list">
+            <Metric label="Semi-alpha" value={stats ? percent(stats.semiAlphaPct) : "-"} />
+            <Metric label="Changed pixels" value={stats ? percent(stats.changedPct) : "-"} />
+            <Metric label="Cursor" value={cursor ? `${cursor.x}, ${cursor.y}` : "-"} />
+            <Metric label="RGBA" value={cursor ? `${cursor.r} ${cursor.g} ${cursor.b} ${cursor.a}` : "-"} />
+          </div>
+        </aside>
+
+        <section className={`canvas-shell ${source ? "has-image" : ""} ${canvasTool === "delete" ? "is-eraser" : ""} ${canvasMode === "pan" ? "is-panning" : ""} ${canvasMode === "split" ? "is-splitting" : ""} ${canvasMode === "delete" ? "is-deleting" : ""} ${canvasMode === "hover-split" ? "can-split" : ""}`}>
+          {isBackgroundRemoving && (
+            <div className="bg-remove-progress">
+              <span>{BG_REMOVE_LABELS[bgRemoveStatus]}</span>
+              <strong>{Math.round(bgRemoveProgress * 100)}%</strong>
+              <div><i style={{ width: `${Math.round(bgRemoveProgress * 100)}%` }} /></div>
+            </div>
+          )}
+          <div className="canvas-tools">
+            <div className="swatches" role="group" aria-label="Preview background">
+              {BACKGROUNDS.map((item) => (
+                <button
+                  key={item.id}
+                  className={`swatch ${item.id} ${background === item.id ? "active" : ""}`}
+                  title={item.label}
+                  onClick={() => setBackground(item.id)}
+                />
+              ))}
+              <input
+                type="color"
+                value={customBackground}
+                onChange={(event) => {
+                  setCustomBackground(event.target.value);
+                  setBackground("custom");
+                }}
+                aria-label="Custom preview color"
+              />
+            </div>
+            {compareMode === "split" && (
+              <label className="split-control">
+                <SplitSquareHorizontal size={14} />
+                <input type="range" min="0" max="100" value={split} onChange={(event) => setSplit(Number(event.target.value))} />
+              </label>
+            )}
+          </div>
+          <canvas
+            ref={canvasRef}
+            onWheel={onCanvasWheel}
+            onPointerDown={onCanvasPointerDown}
+            onPointerMove={onCanvasPointerMove}
+            onPointerUp={endCanvasInteraction}
+            onPointerCancel={endCanvasInteraction}
+            onMouseLeave={() => {
+              if (!interactionRef.current) {
+                setCursor(null);
+                brushPointRef.current = null;
+                setCanvasMode("idle");
+                scheduleCanvasRender();
+              }
+            }}
+          />
+          <div className="drop-overlay">
+            <ImageDown size={44} />
+            <strong>Drop image to inspect</strong>
+          </div>
+        </section>
+
+        <aside className="sidebar right">
+          <PanelTitle title="Inspector" action={<SlidersHorizontal size={14} />} />
+          <section className="control-section">
+            <label className="field-label">Preset</label>
+            <div className="select-wrap">
+              <select value={preset} onChange={(event) => choosePreset(event.target.value)}>
+                {PRESETS.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+              </select>
+              <ChevronDown size={14} />
+            </div>
+            <p>{PRESETS.find((item) => item.id === preset)?.description}</p>
+          </section>
+
+          <ToolSection
+            icon={<Wand2 size={15} />}
+            title="Defringe"
+            enabled={settings.defringe.enabled}
+            onToggle={(value) => updateSetting("defringe", "enabled", value)}
+          >
+            <ColorControl label="Matte" value={settings.defringe.matteColor} onChange={(value) => updateSetting("defringe", "matteColor", value)} />
+            <RangeControl label="Strength" value={settings.defringe.strength} min={0} max={100} unit="%" onChange={(value) => updateSetting("defringe", "strength", value)} />
+            <RangeControl label="Edge radius" value={settings.defringe.radius} min={1} max={6} unit="px" onChange={(value) => updateSetting("defringe", "radius", value)} />
+          </ToolSection>
+
+          <ToolSection
+            icon={<Blend size={15} />}
+            title="Color Bleed"
+            enabled={settings.bleed.enabled}
+            onToggle={(value) => updateSetting("bleed", "enabled", value)}
+          >
+            <RangeControl label="Radius" value={settings.bleed.radius} min={1} max={8} unit="px" onChange={(value) => updateSetting("bleed", "radius", value)} />
+            <RangeControl label="Iterations" value={settings.bleed.iterations} min={1} max={6} onChange={(value) => updateSetting("bleed", "iterations", value)} />
+            <ToggleRow label="Affect semi-alpha" checked={settings.bleed.affectSemiTransparent} onChange={(value) => updateSetting("bleed", "affectSemiTransparent", value)} />
+          </ToolSection>
+
+          <ToolSection
+            icon={<Activity size={15} />}
+            title="Alpha Threshold"
+            enabled={settings.threshold.enabled}
+            onToggle={(value) => updateSetting("threshold", "enabled", value)}
+          >
+            <RangeControl label="Threshold" value={settings.threshold.threshold} min={0} max={255} onChange={(value) => updateSetting("threshold", "threshold", value)} />
+            <RangeControl label="Softness" value={settings.threshold.softness} min={0} max={64} onChange={(value) => updateSetting("threshold", "softness", value)} />
+          </ToolSection>
+
+          <ToolSection
+            icon={<Sparkles size={15} />}
+            title="Alpha Hardening"
+            enabled={settings.hardening.enabled}
+            onToggle={(value) => updateSetting("hardening", "enabled", value)}
+          >
+            <RangeControl label="Strength" value={settings.hardening.strength} min={0} max={100} unit="%" onChange={(value) => updateSetting("hardening", "strength", value)} />
+            <RangeControl label="Midpoint" value={settings.hardening.midpoint} min={1} max={99} unit="%" onChange={(value) => updateSetting("hardening", "midpoint", value)} />
+          </ToolSection>
+        </aside>
+      </main>
+
+      <footer className="statusbar">
+        <span><Check size={12} /> {status}</span>
+        <span>Zoom {Math.round(zoom * 100)}%</span>
+        <span>{source ? `${source.width} x ${source.height}` : "No image"}</span>
+        <span>{cursor ? `Alpha ${cursor.a}` : "Alpha -"}</span>
+        <span>{canvasTool === "delete" ? `Delete Pen ${brushSize}px` : "Pan tool"}</span>
+        <span>{isBackgroundRemoving ? `AI ${BG_REMOVE_LABELS[bgRemoveStatus]}${bgRemoveDevice === "cpu" ? " (CPU)" : ""}` : bgRemoveDevice ? `AI ${bgRemoveDevice.toUpperCase()}` : "AI -"}</span>
+        <span>Bg {background}</span>
+      </footer>
+
+      {toast && (
+        <div className={`toast ${toast.type}`}>
+          <strong>{toast.title}</strong>
+          <span>{toast.message}</span>
+        </div>
+      )}
+
+      {hfTokenDialogOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <form className="hf-token-dialog" onSubmit={submitHfToken}>
+            <strong>Hugging Face token</strong>
+            <span>Paste a Hugging Face read token for gated background-removal models.</span>
+            <input
+              autoFocus
+              type="password"
+              value={hfTokenDraft}
+              onChange={(event) => setHfTokenDraft(event.target.value)}
+              placeholder="hf_..."
+              spellCheck={false}
+            />
+            <div className="dialog-actions">
+              <button type="button" onClick={cancelHfTokenDialog}>Cancel</button>
+              <button type="submit" className="primary-button" disabled={!sanitizeToken(hfTokenDraft)}>Save token</button>
+            </div>
+          </form>
+        </div>
+      )}
+
+      <canvas ref={originalCanvasRef} hidden />
+      <canvas ref={processedCanvasRef} hidden />
+      <canvas ref={maskCanvasRef} hidden />
+      <canvas ref={diffCanvasRef} hidden />
+    </div>
+  );
+}
+
+function PanelTitle({ title, action }) {
+  return (
+    <div className="panel-title">
+      <span>{title}</span>
+      {action}
+    </div>
+  );
+}
+
+function Segmented({ value, onChange, options }) {
+  return (
+    <div className="segmented">
+      {options.map(([id, label]) => (
+        <button key={id} className={value === id ? "active" : ""} onClick={() => onChange(id)}>{label}</button>
+      ))}
+    </div>
+  );
+}
+
+function ToolSection({ icon, title, enabled, onToggle, children }) {
+  return (
+    <section className={`tool-section ${enabled ? "enabled" : ""}`}>
+      <header>
+        <span>{icon}{title}</span>
+        <Switch checked={enabled} onChange={onToggle} />
+      </header>
+      <div className="tool-body">{children}</div>
+    </section>
+  );
+}
+
+function RangeControl({ label, value, min, max, unit = "", onChange }) {
+  return (
+    <label className="range-control">
+      <span>{label}<output>{value}{unit}</output></span>
+      <input type="range" min={min} max={max} value={value} onChange={(event) => onChange(Number(event.target.value))} />
+    </label>
+  );
+}
+
+function ColorControl({ label, value, onChange }) {
+  return (
+    <label className="color-control">
+      <span>{label}</span>
+      <input type="color" value={value} onChange={(event) => onChange(event.target.value)} />
+      <code>{value.toUpperCase()}</code>
+    </label>
+  );
+}
+
+function ToggleRow({ label, checked, onChange }) {
+  return (
+    <label className="toggle-row">
+      <span>{label}</span>
+      <Switch checked={checked} onChange={onChange} />
+    </label>
+  );
+}
+
+function Switch({ checked, onChange }) {
+  return (
+    <button className={`switch ${checked ? "on" : ""}`} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}>
+      <span />
+    </button>
+  );
+}
+
+function Metric({ label, value }) {
+  return (
+    <div className="metric">
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+
+function imageDataToCachedCanvas(imageData, cacheRef, fallbackRef) {
+  if (!cacheRef.current) {
+    cacheRef.current = {
+      canvas: fallbackRef?.current || document.createElement("canvas"),
+      imageData: null
+    };
+  }
+
+  const cache = cacheRef.current;
+  const canvas = cache.canvas;
+
+  if (cache.imageData !== imageData) {
+    if (canvas.width !== imageData.width || canvas.height !== imageData.height) {
+      canvas.width = imageData.width;
+      canvas.height = imageData.height;
+    }
+    canvas.getContext("2d").putImageData(imageData, 0, 0);
+    cache.imageData = imageData;
+  }
+
+  return canvas;
+}
+
+function drawBackground(ctx, width, height, background, customBackground) {
+  if (background === "checker") {
+    ctx.fillStyle = getCheckerPattern(ctx);
+    ctx.fillRect(0, 0, width, height);
+    return;
+  }
+  ctx.fillStyle = background === "black" ? "#000" : background === "white" ? "#fff" : background === "gray" ? "#858b94" : customBackground;
+  ctx.fillRect(0, 0, width, height);
+}
+
+function getCheckerPattern(ctx) {
+  const cached = checkerPatternCache.get(ctx);
+  if (cached) return cached;
+
+  const size = 18;
+  const tile = document.createElement("canvas");
+  tile.width = size * 2;
+  tile.height = size * 2;
+  const tileCtx = tile.getContext("2d");
+  tileCtx.fillStyle = "#202327";
+  tileCtx.fillRect(0, 0, tile.width, tile.height);
+  tileCtx.fillStyle = "#181b1f";
+  tileCtx.fillRect(0, 0, size, size);
+  tileCtx.fillRect(size, size, size, size);
+
+  const pattern = ctx.createPattern(tile, "repeat");
+  if (!pattern) return "#202327";
+  checkerPatternCache.set(ctx, pattern);
+  return pattern;
+}
+
+function drawEmptyMark(ctx, width, height) {
+  ctx.save();
+  ctx.globalAlpha = 0.55;
+  ctx.strokeStyle = "rgba(255,255,255,.14)";
+  ctx.setLineDash([8, 8]);
+  roundRect(ctx, width / 2 - 150, height / 2 - 110, 300, 220, 12);
+  ctx.stroke();
+  ctx.fillStyle = "rgba(255,255,255,.72)";
+  ctx.font = "600 16px system-ui";
+  ctx.textAlign = "center";
+  ctx.fillText("Drop a PNG, WebP, or TIFF", width / 2, height / 2 - 4);
+  ctx.font = "12px system-ui";
+  ctx.fillStyle = "rgba(255,255,255,.42)";
+  ctx.fillText("Alpha cleanup preview appears here", width / 2, height / 2 + 22);
+  ctx.restore();
+}
+
+function drawAlphaMask(ctx, imageData, x, y, width, height, cacheRef, fallbackRef) {
+  const canvas = alphaMaskToCachedCanvas(imageData, cacheRef, fallbackRef);
+  ctx.drawImage(canvas, x, y, width, height);
+}
+
+function drawDifference(ctx, original, processed, x, y, width, height, cacheRef, fallbackRef) {
+  const canvas = differenceToCachedCanvas(original, processed, cacheRef, fallbackRef);
+  ctx.drawImage(canvas, x, y, width, height);
+}
+
+function alphaMaskToCachedCanvas(imageData, cacheRef, fallbackRef) {
+  if (!cacheRef.current) {
+    cacheRef.current = {
+      canvas: fallbackRef?.current || document.createElement("canvas"),
+      imageData: null
+    };
+  }
+
+  const cache = cacheRef.current;
+  const canvas = cache.canvas;
+
+  if (cache.imageData !== imageData) {
+    if (canvas.width !== imageData.width || canvas.height !== imageData.height) {
+      canvas.width = imageData.width;
+      canvas.height = imageData.height;
+    }
+    const mask = new ImageData(imageData.width, imageData.height);
+    for (let i = 0; i < imageData.data.length; i += 4) {
+      const alpha = imageData.data[i + 3];
+      mask.data[i] = alpha;
+      mask.data[i + 1] = alpha;
+      mask.data[i + 2] = alpha;
+      mask.data[i + 3] = 255;
+    }
+    canvas.getContext("2d").putImageData(mask, 0, 0);
+    cache.imageData = imageData;
+  }
+
+  return canvas;
+}
+
+function differenceToCachedCanvas(original, processed, cacheRef, fallbackRef) {
+  if (!cacheRef.current) {
+    cacheRef.current = {
+      canvas: fallbackRef?.current || document.createElement("canvas"),
+      original: null,
+      processed: null
+    };
+  }
+
+  const cache = cacheRef.current;
+  const canvas = cache.canvas;
+
+  if (cache.original !== original || cache.processed !== processed) {
+    if (canvas.width !== original.width || canvas.height !== original.height) {
+      canvas.width = original.width;
+      canvas.height = original.height;
+    }
+    const diff = new ImageData(original.width, original.height);
+    for (let i = 0; i < original.data.length; i += 4) {
+      const delta = Math.abs(original.data[i] - processed.data[i]) +
+        Math.abs(original.data[i + 1] - processed.data[i + 1]) +
+        Math.abs(original.data[i + 2] - processed.data[i + 2]) +
+        Math.abs(original.data[i + 3] - processed.data[i + 3]);
+      diff.data[i] = Math.min(255, delta * 2);
+      diff.data[i + 1] = delta > 0 ? 76 : 0;
+      diff.data[i + 2] = delta > 0 ? 140 : 0;
+      diff.data[i + 3] = delta > 0 ? 255 : 28;
+    }
+    canvas.getContext("2d").putImageData(diff, 0, 0);
+    cache.original = original;
+    cache.processed = processed;
+  }
+
+  return canvas;
+}
+
+function drawBadge(ctx, text, x, y) {
+  ctx.save();
+  ctx.font = "700 10px system-ui";
+  ctx.fillStyle = "rgba(0,0,0,.58)";
+  roundRect(ctx, x, y, 56, 22, 5);
+  ctx.fill();
+  ctx.fillStyle = "rgba(255,255,255,.82)";
+  ctx.fillText(text, x + 9, y + 15);
+  ctx.restore();
+}
+
+function drawSplitHandle(ctx, x, y, height) {
+  const handleY = y + height / 2 - 20;
+  ctx.save();
+  ctx.shadowColor = "rgba(0,0,0,.42)";
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = "rgba(10, 11, 13, .82)";
+  ctx.strokeStyle = "rgba(255,255,255,.72)";
+  ctx.lineWidth = 1;
+  roundRect(ctx, x - 12, handleY, 24, 40, 12);
+  ctx.fill();
+  ctx.stroke();
+  ctx.shadowBlur = 0;
+  ctx.strokeStyle = "rgba(255,255,255,.74)";
+  ctx.beginPath();
+  ctx.moveTo(x - 4, handleY + 13);
+  ctx.lineTo(x - 8, handleY + 20);
+  ctx.lineTo(x - 4, handleY + 27);
+  ctx.moveTo(x + 4, handleY + 13);
+  ctx.lineTo(x + 8, handleY + 20);
+  ctx.lineTo(x + 4, handleY + 27);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawBrushCursor(ctx, x, y, radius, active) {
+  ctx.save();
+  ctx.strokeStyle = active ? "rgba(255, 107, 95, .96)" : "rgba(255, 255, 255, .9)";
+  ctx.fillStyle = active ? "rgba(255, 107, 95, .16)" : "rgba(10, 11, 13, .2)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash(active ? [] : [4, 4]);
+  ctx.beginPath();
+  ctx.arc(x, y, radius, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.setLineDash([]);
+  ctx.strokeStyle = "rgba(0, 0, 0, .55)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x - 5, y);
+  ctx.lineTo(x + 5, y);
+  ctx.moveTo(x, y - 5);
+  ctx.lineTo(x, y + 5);
+  ctx.stroke();
+  ctx.restore();
+}
+
+function drawPixelGrid(ctx, x, y, width, height, zoom) {
+  ctx.save();
+  ctx.strokeStyle = "rgba(255,255,255,.12)";
+  ctx.lineWidth = 1;
+  for (let gx = x; gx <= x + width; gx += zoom) {
+    ctx.beginPath();
+    ctx.moveTo(gx, y);
+    ctx.lineTo(gx, y + height);
+    ctx.stroke();
+  }
+  for (let gy = y; gy <= y + height; gy += zoom) {
+    ctx.beginPath();
+    ctx.moveTo(x, gy);
+    ctx.lineTo(x + width, gy);
+    ctx.stroke();
+  }
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, width, height, radius) {
+  ctx.beginPath();
+  ctx.roundRect(x, y, width, height, radius);
+}
+
+function formatBytes(bytes) {
+  if (!bytes) return "0 B";
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function percent(value) {
+  return `${(value * 100).toFixed(1)}%`;
+}
+
+function bgRemoveStageToStatus(stage) {
+  if (stage === "download") return "downloading";
+  if (stage === "warming") return "warming";
+  if (stage === "infer" || stage === "infer-stage1" || stage === "infer-stage2" || stage === "compose") return "inferring";
+  return "inferring";
+}
+
+function getBgRemoveErrorMessage(message = "") {
+  const lower = message.toLowerCase();
+  if (lower.includes("no hugging face token")) {
+    return "No Hugging Face token is available to AlphaKiller. In Electron, launch with HF_TOKEN set. In the browser preview, set localStorage key alphakiller:hf-token.";
+  }
+  if (lower.includes("token was rejected")) {
+    return "The Hugging Face token was rejected for the background-removal model. Make sure the token was created by the account that has model access and includes read permission.";
+  }
+  if (
+    lower.includes("restricted") ||
+    lower.includes("unauthorized") ||
+    lower.includes("authorization") ||
+    lower.includes("authenticate") ||
+    lower.includes("gated") ||
+    lower.includes("access to model") ||
+    lower.includes("401") ||
+    lower.includes("rmbg-2.0")
+  ) {
+    return "The background-removal model is restricted on Hugging Face. Accept the model license and authenticate before retrying.";
+  }
+  if (lower.includes("fetch") || lower.includes("network") || lower.includes("download")) {
+    return "Could not download the background removal model. Check your connection and try again.";
+  }
+  if (lower.includes("memory") || lower.includes("allocation") || lower.includes("out of")) {
+    return "Image too large for background removal at full resolution.";
+  }
+  if (lower.includes("corrupt") || lower.includes("invalid model")) {
+    return "The cached background removal model appears to be invalid. Try clearing the app cache and retrying.";
+  }
+  return message || "Background removal failed.";
+}
+
+async function getHuggingFaceToken() {
+  try {
+    const electronToken = await window.alphaKiller?.getHuggingFaceToken?.();
+    const token = sanitizeToken(electronToken);
+    if (token) return token;
+  } catch {
+    // Browser-only previews do not expose Electron's preload bridge.
+  }
+
+  try {
+    return sanitizeToken(window.localStorage?.getItem("alphakiller:hf-token"));
+  } catch {
+    return "";
+  }
+}
+
+function sanitizeToken(token) {
+  return typeof token === "string" ? token.trim() : "";
+}
+
+function cloneImageData(imageData) {
+  return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
+}
+
+function getCanvasPoint(event, canvas) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: event.clientX - rect.left,
+    y: event.clientY - rect.top
+  };
+}
+
+function getImageFrame(source, zoom, pan, canvasWidth, canvasHeight) {
+  const width = source.width * zoom;
+  const height = source.height * zoom;
+  return {
+    x: Math.round((canvasWidth - width) / 2 + pan.x),
+    y: Math.round((canvasHeight - height) / 2 + pan.y),
+    width,
+    height
+  };
+}
+
+function getImagePoint(point, frame, zoom) {
+  const x = Math.floor((point.x - frame.x) / zoom);
+  const y = Math.floor((point.y - frame.y) / zoom);
+  const sourceWidth = Math.round(frame.width / zoom);
+  const sourceHeight = Math.round(frame.height / zoom);
+
+  if (x < 0 || y < 0 || x >= sourceWidth || y >= sourceHeight) {
+    return null;
+  }
+
+  return { x, y };
+}
+
+function clamp(value, min, max) {
+  return Math.max(min, Math.min(max, value));
+}
+
+function eraseLinePixels(data, width, height, from, to, brushSize) {
+  const distance = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(distance / Math.max(1, brushSize / 3)));
+
+  for (let step = 0; step <= steps; step++) {
+    const t = step / steps;
+    eraseCirclePixels(data, width, height, {
+      x: from.x + (to.x - from.x) * t,
+      y: from.y + (to.y - from.y) * t
+    }, brushSize / 2);
+  }
+}
+
+function eraseLineOnCanvas(canvas, from, to, brushSize) {
+  if (!canvas) return;
+  const ctx = canvas.getContext("2d");
+  const radius = brushSize / 2;
+  const distance = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(distance / Math.max(1, brushSize / 3)));
+
+  ctx.save();
+  ctx.globalCompositeOperation = "destination-out";
+  for (let step = 0; step <= steps; step++) {
+    const t = step / steps;
+    const x = from.x + (to.x - from.x) * t;
+    const y = from.y + (to.y - from.y) * t;
+    ctx.beginPath();
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+    ctx.fill();
+  }
+  ctx.restore();
+}
+
+function eraseCirclePixels(data, width, height, center, radius) {
+  const minX = Math.max(0, Math.floor(center.x - radius));
+  const maxX = Math.min(width - 1, Math.ceil(center.x + radius));
+  const minY = Math.max(0, Math.floor(center.y - radius));
+  const maxY = Math.min(height - 1, Math.ceil(center.y + radius));
+  const radiusSq = radius * radius;
+
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const dx = x - center.x;
+      const dy = y - center.y;
+      if (dx * dx + dy * dy > radiusSq) continue;
+      const index = (y * width + x) * 4;
+      data[index + 3] = 0;
+    }
+  }
+}
+
+function isSupportedImageFile(file) {
+  const name = file.name.toLowerCase();
+  return RASTER_MIME_RE.test(file.type) || SUPPORTED_IMAGE_EXTENSIONS.some((extension) => name.endsWith(extension));
+}
+
+function isTiffFile(file) {
+  const name = file.name.toLowerCase();
+  return file.type === "image/tiff" || file.type === "image/x-tiff" || name.endsWith(".tif") || name.endsWith(".tiff");
+}
+
+async function decodeTiffFile(file) {
+  const buffer = await file.arrayBuffer();
+  const ifds = UTIF.decode(buffer);
+  if (!ifds.length) {
+    throw new Error("TIFF did not contain a decodable image");
+  }
+
+  const image = ifds[0];
+  UTIF.decodeImage(buffer, image);
+  const rgba = UTIF.toRGBA8(image);
+  const imageData = new ImageData(new Uint8ClampedArray(rgba), image.width, image.height);
+  const previewUrl = imageDataToObjectUrl(imageData);
+  return { imageData, previewUrl };
+}
+
+function imageDataToObjectUrl(imageData) {
+  const canvas = document.createElement("canvas");
+  canvas.width = imageData.width;
+  canvas.height = imageData.height;
+  canvas.getContext("2d").putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/png");
+}
