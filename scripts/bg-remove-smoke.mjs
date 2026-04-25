@@ -14,6 +14,7 @@ const APP_PORT = Number(process.env.ALPHAKILLER_SMOKE_PORT || 5174);
 const APP_URL = `http://127.0.0.1:${APP_PORT}/`;
 const BG_REMOVE_TIMEOUT_MS = Number(process.env.BG_REMOVE_SMOKE_TIMEOUT_MS || 180_000);
 const TEST_IMAGE_SIZE = Number(process.env.BG_REMOVE_SMOKE_SIZE || 320);
+const BG_REMOVE_MODEL = process.env.ALPHAKILLER_BG_MODEL || "";
 
 let viteProcess = null;
 
@@ -89,6 +90,7 @@ async function runElectronSmoke() {
     });
 
     await page.waitForLoadState("domcontentloaded");
+    await applyModelPreference(page);
     await settleViteDevReload(page);
     await uploadTestImage(page);
 
@@ -149,6 +151,14 @@ async function uploadTestImage(page) {
     }
   }
   throw lastError;
+}
+
+async function applyModelPreference(page) {
+  if (!BG_REMOVE_MODEL) return;
+  await page.evaluate((model) => {
+    window.localStorage.setItem("alphakiller:bg-remove-model", model);
+  }, BG_REMOVE_MODEL);
+  await page.reload({ waitUntil: "domcontentloaded" });
 }
 
 async function settleViteDevReload(page) {

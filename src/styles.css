@@ -797,6 +797,139 @@ input[type="range"] {
   color: var(--text-2);
 }
 
+.settings-popover {
+  position: fixed;
+  top: 86px;
+  right: 14px;
+  z-index: 18;
+  width: min(390px, calc(100vw - 28px));
+  max-height: calc(100vh - 126px);
+  overflow: auto;
+  padding: 14px;
+  display: grid;
+  gap: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-panel);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, .5);
+}
+
+.settings-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.settings-head strong {
+  font-size: 14px;
+}
+
+.settings-section {
+  display: grid;
+  gap: 8px;
+}
+
+.settings-label {
+  color: var(--text-2);
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.model-options {
+  display: grid;
+  gap: 8px;
+}
+
+.model-option,
+.settings-check {
+  display: grid;
+  grid-template-columns: 16px 1fr;
+  gap: 9px;
+  align-items: flex-start;
+  padding: 10px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #101216;
+}
+
+.model-option.selected {
+  border-color: rgba(95, 227, 142, .48);
+  background: rgba(95, 227, 142, .06);
+}
+
+.model-option.disabled {
+  opacity: .48;
+}
+
+.model-option input,
+.settings-check input {
+  margin-top: 2px;
+  accent-color: var(--accent);
+}
+
+.model-option span,
+.settings-check span {
+  display: grid;
+  gap: 4px;
+}
+
+.model-option strong,
+.settings-check strong {
+  font-size: 12px;
+}
+
+.model-option small,
+.settings-check small,
+.model-option em {
+  color: var(--text-2);
+  font-size: 11px;
+  line-height: 1.35;
+}
+
+.model-option em {
+  color: var(--text-3);
+  font-style: normal;
+}
+
+.token-row {
+  display: grid;
+  grid-template-columns: 18px minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.token-row svg {
+  color: var(--text-3);
+}
+
+.token-row input {
+  min-width: 0;
+  height: 32px;
+  padding: 0 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: #0c0e12;
+  color: var(--text);
+  font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.token-row button,
+.text-button {
+  height: 32px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-panel-2);
+  color: var(--text-2);
+}
+
+.text-button {
+  justify-self: start;
+  height: 28px;
+  background: transparent;
+}
+
 .modal-backdrop {
   position: fixed;
   inset: 0;

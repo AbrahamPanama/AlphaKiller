@@ -26,7 +26,8 @@ the runtime.
 | Model | Current use | Notice |
 |---|---|---|
 | `briaai/RMBG-1.4` | Default Stage 1 background-removal model | Review the Hugging Face model card and BRIA terms before redistribution or commercial use. |
-| `hustvl/ViTMatte-base` | Optional high-quality edge refinement | Review the Hugging Face model card before redistribution or commercial use. |
+| `onnx-community/BEN2-ONNX` | WebGPU-only Quality background-removal model | MIT; downloaded on demand from Hugging Face. |
+| `hustvl/vitmatte-base-distinctions-646` | Investigated high-quality edge refinement | Apache-2.0, but currently not used because the repo has no browser-ready ONNX assets. |
 | `briaai/RMBG-2.0` | Planned/future quality target | Gated on Hugging Face and not the current default implementation. |
 | `ZhengPeng7/BiRefNet_HR` | Investigated future quality tier | MIT-licensed project, but current browser/ORT compatibility is blocked; see `BIREFNET_HR_PLAN.md`. |
 

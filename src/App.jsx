@@ -19,6 +19,7 @@ import {
   RefreshCcw,
   Save,
   Scissors,
+  Settings,
   SlidersHorizontal,
   Sparkles,
   SplitSquareHorizontal,
@@ -29,6 +30,7 @@ import {
 } from "lucide-react";
 import UTIF from "utif";
 import { applyMaskToImage } from "./imageProcessing.js";
+import { SettingsPanel } from "./SettingsPanel.jsx";
 
 const DEFAULT_SETTINGS = {
   threshold: { enabled: false, threshold: 128, softness: 8 },
@@ -95,7 +97,27 @@ const MAX_BRUSH_SIZE = 128;
 const PROCESSING_DEBOUNCE_MS = 80;
 const BG_REMOVE_TIMEOUT_MS = 180000;
 const BG_REMOVE_EMPTY_MASK_LIMIT = 0.02;
+const BG_REMOVE_MODEL_KEY = "alphakiller:bg-remove-model";
+const BG_REMOVE_REFINE_KEY = "alphakiller:bg-remove-refine-default";
+const HF_TOKEN_KEY = "alphakiller:hf-token";
+const BG_REMOVE_REFINE_AVAILABLE = false;
 const checkerPatternCache = new WeakMap();
+
+const BG_REMOVE_MODELS = {
+  "rmbg-1.4": {
+    label: "Fast (RMBG-1.4)",
+    shortLabel: "RMBG",
+    description: "Smaller download, good for previews and most images.",
+    notice: "BRIA model terms apply; review before commercial redistribution."
+  },
+  ben2: {
+    label: "Quality (BEN2)",
+    shortLabel: "BEN2",
+    description: "MIT-licensed background remover with stronger subject matting.",
+    notice: "Requires WebGPU. Slower than Fast but commercial-safe.",
+    requiresWebGpu: true
+  }
+};
 
 const BG_REMOVE_LABELS = {
   idle: "",
@@ -136,7 +158,7 @@ export function App() {
   const pendingBgRemoveJobRef = useRef(null);
   const bgRemoveTimeoutRef = useRef(null);
   const preSegmentationOriginalRef = useRef(null);
-  const bgRemoveNoticeShownRef = useRef(false);
+  const bgRemoveNoticeShownRef = useRef(new Set());
   const [source, setSource] = useState(null);
   const [originalImageData, setOriginalImageData] = useState(null);
   const [processedImageData, setProcessedImageData] = useState(null);
@@ -159,7 +181,10 @@ export function App() {
   const [bgRemoveStatus, setBgRemoveStatus] = useState("idle");
   const [bgRemoveProgress, setBgRemoveProgress] = useState(0);
   const [bgRemoveDevice, setBgRemoveDevice] = useState(null);
-  const [bgRemoveRefine, setBgRemoveRefine] = useState(false);
+  const [bgRemoveModel, setBgRemoveModel] = useState(loadPersistedBgRemoveModel);
+  const [bgRemoveRefine, setBgRemoveRefine] = useState(loadPersistedBgRemoveRefine);
+  const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
+  const [hasWebGpu] = useState(() => Boolean(window.navigator?.gpu));
   const [hasPreSegmentationOriginal, setHasPreSegmentationOriginal] = useState(false);
   const [hfTokenDialogOpen, setHfTokenDialogOpen] = useState(false);
   const [hfTokenDraft, setHfTokenDraft] = useState("");
@@ -420,10 +445,12 @@ export function App() {
       setBgRemoveProgress(0);
       setBgRemoveDevice(message.device);
       setStatus("Background removed");
+      const completedModel = message.modelId || activeJob.modelId || bgRemoveModel;
+      const completedModelLabel = BG_REMOVE_MODELS[completedModel]?.shortLabel || "AI";
       setToast({
         type: "success",
         title: "Background removed",
-        message: `RMBG mask applied in ${(message.durationMs / 1000).toFixed(1)}s${message.device === "cpu" ? " using CPU" : ""}${message.stagesRun?.includes("stage2") ? " with edge refinement" : ""}.`
+        message: `${completedModelLabel} mask applied in ${(message.durationMs / 1000).toFixed(1)}s${message.device === "cpu" ? " using CPU" : ""}${message.stagesRun?.includes("stage2") ? " with edge refinement" : ""}.`
       });
     };
 
@@ -445,7 +472,7 @@ export function App() {
   function startBgRemoveJob(job) {
     const worker = ensureBgRemoveWorker();
     const id = ++bgRemoveJobIdRef.current;
-    activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData };
+    activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData, modelId: job.modelId };
     setBgRemoveStatus("warming");
     setBgRemoveProgress(0);
     setBgRemoveDevice(null);
@@ -472,7 +499,8 @@ export function App() {
       height: job.imageData.height,
       options: {
         tta: true,
-        refine: job.refine,
+        refine: job.refine && BG_REMOVE_REFINE_AVAILABLE,
+        modelId: job.modelId,
         tileThreshold: 2048,
         hfToken: job.hfToken
       }
@@ -483,12 +511,12 @@ export function App() {
     if (!originalImageData || isBackgroundRemoving) return;
 
     const requestId = ++latestBgRemoveRequestRef.current;
-    if (!bgRemoveNoticeShownRef.current) {
-      bgRemoveNoticeShownRef.current = true;
+    if (!bgRemoveNoticeShownRef.current.has(bgRemoveModel)) {
+      bgRemoveNoticeShownRef.current.add(bgRemoveModel);
       setToast({
         type: "info",
         title: "First-time download may be large",
-        message: "BRIA RMBG model assets are cached locally after the first successful download."
+        message: `${BG_REMOVE_MODELS[bgRemoveModel]?.label || "Background removal"} model assets are cached locally after the first successful download.`
       });
     }
     const hfToken = await getHuggingFaceToken();
@@ -497,6 +525,7 @@ export function App() {
       requestId,
       imageData: originalImageData,
       refine: bgRemoveRefine,
+      modelId: bgRemoveModel,
       hfToken
     });
   }
@@ -550,7 +579,7 @@ export function App() {
     if (!token) return;
 
     try {
-      window.localStorage?.setItem("alphakiller:hf-token", token);
+      window.localStorage?.setItem(HF_TOKEN_KEY, token);
     } catch {
       setToast({
         type: "error",
@@ -575,6 +604,44 @@ export function App() {
     setHfTokenDialogOpen(false);
     setHfTokenDraft("");
     setStatus("Ready");
+  }
+
+  function updateBgRemoveModel(modelId) {
+    if (!BG_REMOVE_MODELS[modelId]) return;
+    if (BG_REMOVE_MODELS[modelId].requiresWebGpu && !hasWebGpu) {
+      setToast({
+        type: "warning",
+        title: "WebGPU required",
+        message: `${BG_REMOVE_MODELS[modelId].label} needs WebGPU. Use Fast on this machine.`
+      });
+      return;
+    }
+    setBgRemoveModel(modelId);
+    persistLocalStorage(BG_REMOVE_MODEL_KEY, modelId);
+  }
+
+  function updateBgRemoveRefine(value) {
+    if (value && !BG_REMOVE_REFINE_AVAILABLE) {
+      setToast({
+        type: "warning",
+        title: "Edge refinement unavailable",
+        message: "The ViTMatte refinement model does not ship browser-ready ONNX assets yet."
+      });
+      return;
+    }
+    setBgRemoveRefine(value);
+    persistLocalStorage(BG_REMOVE_REFINE_KEY, value ? "true" : "false");
+  }
+
+  function saveSettingsToken(token) {
+    const clean = sanitizeToken(token);
+    if (clean) {
+      persistLocalStorage(HF_TOKEN_KEY, clean);
+      setToast({ type: "success", title: "Token saved", message: "Hugging Face token stored for this browser profile." });
+    } else {
+      removeLocalStorage(HF_TOKEN_KEY);
+      setToast({ type: "success", title: "Token cleared", message: "Stored Hugging Face token removed from this browser profile." });
+    }
   }
 
   function clearBgRemoveTimeout() {
@@ -1065,12 +1132,12 @@ export function App() {
         >
           <Sparkles size={16} />
         </button>
-        <label className={`hq-toggle ${bgRemoveRefine ? "enabled" : ""}`} title="High-quality edges">
+        <label className={`hq-toggle ${bgRemoveRefine ? "enabled" : ""}`} title={BG_REMOVE_REFINE_AVAILABLE ? "High-quality edges" : "Edge refinement unavailable in the browser build"}>
           <input
             type="checkbox"
             checked={bgRemoveRefine}
-            disabled={!originalImageData || isBackgroundRemoving}
-            onChange={(event) => setBgRemoveRefine(event.target.checked)}
+            disabled={!originalImageData || isBackgroundRemoving || !BG_REMOVE_REFINE_AVAILABLE}
+            onChange={(event) => updateBgRemoveRefine(event.target.checked)}
           />
           <span>High-quality edges</span>
         </label>
@@ -1087,6 +1154,14 @@ export function App() {
           ]}
         />
         <div className="spacer" />
+        <button
+          className={`icon-button ${settingsPanelOpen ? "active" : ""}`}
+          title="Settings"
+          aria-label="Settings"
+          onClick={() => setSettingsPanelOpen((open) => !open)}
+        >
+          <Settings size={16} />
+        </button>
         <button className="primary-button" disabled={!processedImageData} onClick={handleExport}>
           <Download size={15} />
           Export PNG
@@ -1253,9 +1328,25 @@ export function App() {
         <span>{source ? `${source.width} x ${source.height}` : "No image"}</span>
         <span>{cursor ? `Alpha ${cursor.a}` : "Alpha -"}</span>
         <span>{canvasTool === "delete" ? `Delete Pen ${brushSize}px` : "Pan tool"}</span>
-        <span>{isBackgroundRemoving ? `AI ${BG_REMOVE_LABELS[bgRemoveStatus]}${bgRemoveDevice === "cpu" ? " (CPU)" : ""}` : bgRemoveDevice ? `AI ${bgRemoveDevice.toUpperCase()}` : "AI -"}</span>
+        <span>{isBackgroundRemoving ? `AI ${BG_REMOVE_LABELS[bgRemoveStatus]}${bgRemoveDevice === "cpu" ? " (CPU)" : ""}` : `AI ${BG_REMOVE_MODELS[bgRemoveModel]?.shortLabel || "-"}`}</span>
         <span>Bg {background}</span>
       </footer>
+
+      {settingsPanelOpen && (
+        <SettingsPanel
+          models={BG_REMOVE_MODELS}
+          selectedModel={bgRemoveModel}
+          refineDefault={bgRemoveRefine}
+          disabled={isBackgroundRemoving}
+          refineAvailable={BG_REMOVE_REFINE_AVAILABLE}
+          hasWebGpu={hasWebGpu}
+          tokenValue={loadStoredHfToken()}
+          onModelChange={updateBgRemoveModel}
+          onRefineDefaultChange={updateBgRemoveRefine}
+          onTokenSave={saveSettingsToken}
+          onClose={() => setSettingsPanelOpen(false)}
+        />
+      )}
 
       {toast && (
         <div className={`toast ${toast.type}`}>
@@ -1658,7 +1749,7 @@ async function getHuggingFaceToken() {
   }
 
   try {
-    return sanitizeToken(window.localStorage?.getItem("alphakiller:hf-token"));
+    return sanitizeToken(window.localStorage?.getItem(HF_TOKEN_KEY));
   } catch {
     return "";
   }
@@ -1666,6 +1757,51 @@ async function getHuggingFaceToken() {
 
 function sanitizeToken(token) {
   return typeof token === "string" ? token.trim() : "";
+}
+
+function loadPersistedBgRemoveModel() {
+  try {
+    const value = window.localStorage?.getItem(BG_REMOVE_MODEL_KEY);
+    const model = BG_REMOVE_MODELS[value];
+    if (!model) return "rmbg-1.4";
+    if (model.requiresWebGpu && !window.navigator?.gpu) return "rmbg-1.4";
+    return value;
+  } catch {
+    return "rmbg-1.4";
+  }
+}
+
+function loadPersistedBgRemoveRefine() {
+  if (!BG_REMOVE_REFINE_AVAILABLE) return false;
+  try {
+    return window.localStorage?.getItem(BG_REMOVE_REFINE_KEY) === "true";
+  } catch {
+    return false;
+  }
+}
+
+function loadStoredHfToken() {
+  try {
+    return sanitizeToken(window.localStorage?.getItem(HF_TOKEN_KEY));
+  } catch {
+    return "";
+  }
+}
+
+function persistLocalStorage(key, value) {
+  try {
+    window.localStorage?.setItem(key, value);
+  } catch {
+    // Settings remain in memory when browser storage is unavailable.
+  }
+}
+
+function removeLocalStorage(key) {
+  try {
+    window.localStorage?.removeItem(key);
+  } catch {
+    // Settings remain in memory when browser storage is unavailable.
+  }
 }
 
 function cloneImageData(imageData) {

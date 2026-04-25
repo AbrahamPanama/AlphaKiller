@@ -152,7 +152,12 @@ The next high-value step is focused pointer cleanup: move pan, split, cursor sam
 
 ## Background Removal Notes
 
-Background removal now runs in `src/bgRemoveWorker.js`, separate from the cleanup worker. The current integration uses `@huggingface/transformers` with BRIA RMBG-1.4 as the browser-compatible Stage 1 path, 4-pass TTA by default, tile-and-blend above 2048 px, and mask output composed into the current source alpha before the existing cleanup pipeline runs. The optional "High-quality edges" toggle routes the Stage 1 mask through a ViTMatte trimap refinement path. RMBG-2.0 remains the target model, but the currently tested ONNX/browser conversions fail ORT session creation with a shape-rank mismatch.
+Background removal now runs in `src/bgRemoveWorker.js`, separate from the cleanup worker. The current integration uses `@huggingface/transformers` with a model-dispatched Stage 1 path:
+
+- `rmbg-1.4`: Fast mode, using `briaai/RMBG-1.4`.
+- `ben2`: Quality mode, using `onnx-community/BEN2-ONNX` through the Transformers.js `background-removal` pipeline.
+
+Both paths output a single-channel mask that is composed into the current source alpha before the existing cleanup pipeline runs. The "High-quality edges" matting-refinement toggle is disabled for now because the tested ViTMatte repositories expose PyTorch weights but no browser-ready ONNX assets. BEN2 is WebGPU-only in AlphaKiller because its CPU path exceeded the app watchdog in local testing. RMBG-2.0, BiRefNet_HR, and full BiRefNet remain future targets because their currently tested browser/ONNX paths fail runtime or memory checks in Electron.
 
 Build note: Vite worker output is configured as ES modules in `vite.config.js` because Transformers.js and ONNX Runtime Web code-split inside the worker.
 
@@ -186,6 +191,18 @@ Size benchmark harness:
 
 ```text
 npm run benchmark:bg-remove
+npm run benchmark:bg-remove -- --model ben2
+npm run benchmark:bg-remove -- --model all
 ```
 
 The benchmark command runs the same Electron flow for generated 512², 1024², and 2048² inputs. It is intentionally end-to-end rather than a worker-only microbenchmark so it catches model loading, WebGPU selection, worker protocol, source replacement, and Restore Original regressions together.
+
+Recent local smoke checks:
+
+```text
+ALPHAKILLER_BG_MODEL=rmbg-1.4 npm run diagnose:bg-remove
+Background removal smoke passed in 13.2s
+
+ALPHAKILLER_BG_MODEL=ben2 BG_REMOVE_SMOKE_SIZE=256 npm run diagnose:bg-remove
+Background removal smoke passed in 25.5s
+```

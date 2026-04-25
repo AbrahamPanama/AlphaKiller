@@ -1,17 +1,37 @@
 import { buildTrimap } from "./imageProcessing.js";
 
-const STAGE1_MODEL = "briaai/RMBG-1.4";
-const STAGE2_MODEL = "hustvl/ViTMatte-base";
-const STAGE1_CONFIG = { model_type: "segformer" };
+const STAGE2_MODEL = "hustvl/vitmatte-base-distinctions-646";
 const DEFAULT_TILE_THRESHOLD = 2048;
 const SMALL_TILE_SIZE = 1536;
 const LARGE_TILE_SIZE = 1024;
 const TILE_OVERLAP = 128;
+const DEFAULT_STAGE1_MODEL_ID = "rmbg-1.4";
+const STAGE1_MODELS = {
+  "rmbg-1.4": {
+    repoId: "briaai/RMBG-1.4",
+    runtime: "pipeline",
+    task: "image-segmentation",
+    config: { model_type: "segformer" },
+    nativeResolution: DEFAULT_TILE_THRESHOLD,
+    tileSize: SMALL_TILE_SIZE,
+    largeTileSize: LARGE_TILE_SIZE
+  },
+  ben2: {
+    repoId: "onnx-community/BEN2-ONNX",
+    runtime: "pipeline",
+    task: "background-removal",
+    nativeResolution: 1024,
+    tileSize: 1024,
+    largeTileSize: 1024,
+    preferGpu: true,
+    requiresGpu: true
+  }
+};
 
 let transformersPromise = null;
-let stage1Promise = null;
+const stage1Promises = new Map();
 let stage2Promise = null;
-let stage1AccessPromise = null;
+const stage1AccessPromises = new Map();
 let hfToken = "";
 const cancelledJobs = new Set();
 
@@ -35,14 +55,16 @@ self.onmessage = async (event) => {
     const { RawImage } = await getTransformers();
     if (isCancelled(id)) return;
 
+    const modelId = normalizeStage1ModelId(options.modelId);
     const source = new RawImage(new Uint8ClampedArray(buffer), width, height, 4);
-    const stage1 = await getStage1(id);
+    const stage1 = await getStage1(id, modelId);
     if (isCancelled(id)) return;
 
     currentStage = "infer-stage1";
     const mask = await runStage1(source, {
       id,
-      segmenter: stage1.segmenter,
+      stage1,
+      modelId,
       tta: options.tta !== false,
       tileThreshold: options.tileThreshold ?? DEFAULT_TILE_THRESHOLD,
       refine: options.refine === true,
@@ -52,9 +74,13 @@ self.onmessage = async (event) => {
 
     let finalMask = mask;
     if (options.refine === true) {
-      stagesRun.push("stage2");
       currentStage = "infer-stage2";
-      finalMask = await refineMask(source, mask, id, stage1.device);
+      try {
+        finalMask = await refineMask(source, mask, id, stage1.device);
+        stagesRun.push("stage2");
+      } catch (error) {
+        postProgress(id, "compose", 0.9, { device: stage1.device });
+      }
       if (isCancelled(id)) return;
     }
 
@@ -72,6 +98,7 @@ self.onmessage = async (event) => {
       durationMs: performance.now() - startedAt,
       device: stage1.device,
       maskMean,
+      modelId,
       stagesRun
     }, [maskBuffer]);
   } catch (error) {
@@ -103,47 +130,57 @@ function setHuggingFaceToken(token) {
   const nextToken = typeof token === "string" ? token.trim() : "";
   if (nextToken === hfToken) return;
   hfToken = nextToken;
-  stage1AccessPromise = null;
+  stage1AccessPromises.clear();
 }
 
-async function getStage1(id) {
-  if (stage1Promise) return stage1Promise;
+async function getStage1(id, modelId) {
+  if (stage1Promises.has(modelId)) return stage1Promises.get(modelId);
 
-  stage1Promise = loadStage1(id).catch((error) => {
-    stage1Promise = null;
+  const promise = loadStage1(id, modelId).catch((error) => {
+    stage1Promises.delete(modelId);
     throw error;
   });
-  return stage1Promise;
+  stage1Promises.set(modelId, promise);
+  return promise;
 }
 
-async function loadStage1(id) {
+async function loadStage1(id, modelId) {
+  const descriptor = STAGE1_MODELS[modelId] || STAGE1_MODELS[DEFAULT_STAGE1_MODEL_ID];
+  if (descriptor.runtime === "automodel") {
+    return loadAutoModelStage1(id, modelId, descriptor);
+  }
+  return loadPipelineStage1(id, modelId, descriptor);
+}
+
+async function loadPipelineStage1(id, modelId, descriptor) {
   const { pipeline } = await getTransformers();
   const wantsGpu = Boolean(self.navigator?.gpu);
-  await assertStage1Accessible();
+  if (descriptor.requiresGpu && !wantsGpu) {
+    throw new Error(`${descriptor.repoId} requires WebGPU in AlphaKiller.`);
+  }
+  await assertStage1Accessible(descriptor);
 
   const attempts = [];
-  if (wantsGpu) {
-    attempts.push({ runtime: "webgpu", dtype: "fp16", label: "gpu" });
+  if (wantsGpu && descriptor.preferGpu !== false) {
+    attempts.push({ runtime: "webgpu", dtype: descriptor.gpuDtype || "fp16", label: "gpu" });
   }
-  attempts.push(
-    { runtime: "wasm", dtype: "uint8", label: "cpu" },
-    { runtime: "wasm", dtype: "q4", label: "cpu" },
-    { runtime: "wasm", dtype: "q8", label: "cpu" },
-    { runtime: "wasm", dtype: "fp32", label: "cpu" }
-  );
+  const cpuDtypes = descriptor.cpuDtypes || ["uint8", "q4", "q8", "fp32"];
+  if (!descriptor.requiresGpu) {
+    attempts.push(...cpuDtypes.map((dtype) => ({ runtime: "wasm", dtype, label: "cpu" })));
+  }
 
   let lastError = null;
   for (const attempt of attempts) {
     try {
-      const segmenter = await pipeline("image-segmentation", STAGE1_MODEL, {
-        ...(STAGE1_CONFIG ? { config: STAGE1_CONFIG } : {}),
+      const segmenter = await pipeline(descriptor.task, descriptor.repoId, {
+        ...(descriptor.config ? { config: descriptor.config } : {}),
         device: attempt.runtime,
         dtype: attempt.dtype,
         session_options: { graphOptimizationLevel: "disabled" },
         progress_callback: (progress) => postModelProgress(id, progress)
       });
       postProgress(id, "warming", 1, { device: attempt.label });
-      return { segmenter, device: attempt.label };
+      return { runtime: "pipeline", segmenter, device: attempt.label, modelId, descriptor };
     } catch (error) {
       lastError = error;
       if (isModelAccessError(error)) throw error;
@@ -157,25 +194,68 @@ async function loadStage1(id) {
   throw new Error("No background-removal runtime was available.");
 }
 
-async function assertStage1Accessible() {
-  if (stage1AccessPromise) return stage1AccessPromise;
+async function loadAutoModelStage1(id, modelId, descriptor, options = {}) {
+  const { AutoModel, AutoProcessor } = await getTransformers();
+  const wantsGpu = Boolean(self.navigator?.gpu);
+  await assertStage1Accessible(descriptor);
 
-  stage1AccessPromise = fetchWithAuth(`https://huggingface.co/${STAGE1_MODEL}/resolve/main/config.json`)
+  const attempts = [];
+  if (wantsGpu && descriptor.preferGpu !== false && !options.cpuOnly) {
+    attempts.push({ runtime: "webgpu", dtype: "fp16", label: "gpu" });
+  }
+  attempts.push(
+    { runtime: "wasm", dtype: "fp16", label: "cpu" },
+    { runtime: "wasm", dtype: "fp32", label: "cpu" }
+  );
+
+  let lastError = null;
+  for (const attempt of attempts) {
+    try {
+      const modelOptions = {
+        device: attempt.runtime,
+        dtype: attempt.dtype,
+        progress_callback: (progress) => postModelProgress(id, progress)
+      };
+      const [model, processor] = await Promise.all([
+        AutoModel.from_pretrained(descriptor.repoId, modelOptions),
+        AutoProcessor.from_pretrained(descriptor.repoId, {
+          progress_callback: (progress) => postModelProgress(id, progress)
+        })
+      ]);
+      postProgress(id, "warming", 1, { device: attempt.label });
+      return { runtime: "automodel", model, processor, device: attempt.label, modelId, descriptor, cpuOnly: options.cpuOnly === true };
+    } catch (error) {
+      lastError = error;
+      if (isModelAccessError(error)) throw error;
+    }
+  }
+
+  if (lastError) throw lastError;
+  throw new Error("No background-removal runtime was available.");
+}
+
+async function assertStage1Accessible(descriptor) {
+  if (stage1AccessPromises.has(descriptor.repoId)) {
+    return stage1AccessPromises.get(descriptor.repoId);
+  }
+
+  const promise = fetchWithAuth(`https://huggingface.co/${descriptor.repoId}/resolve/main/config.json`)
     .then(async (response) => {
       if (response.ok) return;
       const errorCode = response.headers.get("x-error-code") || "";
       const message = await response.text().catch(() => "");
       if (response.status === 401 || errorCode.toLowerCase() === "gatedrepo" || isModelAccessError(message)) {
-        throw new Error(`The Hugging Face model request was rejected for ${STAGE1_MODEL}. Confirm the token has read permission if this repository becomes gated.`);
+        throw new Error(`The Hugging Face model request was rejected for ${descriptor.repoId}. Confirm the token has read permission if this repository becomes gated.`);
       }
       throw new Error(`Could not download the background removal model (${response.status} ${response.statusText}).`);
     })
     .catch((error) => {
-      stage1AccessPromise = null;
+      stage1AccessPromises.delete(descriptor.repoId);
       throw error;
     });
 
-  return stage1AccessPromise;
+  stage1AccessPromises.set(descriptor.repoId, promise);
+  return promise;
 }
 
 function fetchWithAuth(input, init = {}) {
@@ -236,18 +316,16 @@ async function loadStage2(id, device) {
 }
 
 async function runStage1(source, options) {
-  const maxEdge = Math.max(source.width, source.height);
-  if (maxEdge <= options.tileThreshold) {
+  const strategy = chooseTileStrategy(source.width, source.height, options.stage1.descriptor, options);
+  if (strategy.mode === "native") {
     const passes = getAugmentations(options.tta, 4);
     return segmentWithTta(source, source.width, source.height, passes, options, (done, total) => {
       postProgress(options.id, "infer-stage1", scaledProgress(done / total, options.refine), { device: options.device });
     });
   }
 
-  const huge = maxEdge > 4096;
-  const tileSize = huge ? LARGE_TILE_SIZE : SMALL_TILE_SIZE;
-  const passes = getAugmentations(options.tta, huge ? 2 : 4);
-  const tiles = createTiles(source.width, source.height, tileSize, TILE_OVERLAP);
+  const passes = getAugmentations(options.tta, strategy.maxPasses);
+  const tiles = createTiles(source.width, source.height, strategy.tileSize, TILE_OVERLAP);
   const accum = new Float32Array(source.width * source.height);
   const weights = new Float32Array(source.width * source.height);
   let completed = 0;
@@ -270,6 +348,29 @@ async function runStage1(source, options) {
   return output;
 }
 
+function chooseTileStrategy(width, height, descriptor, options) {
+  const maxEdge = Math.max(width, height);
+  const native = descriptor.nativeResolution || options.tileThreshold || DEFAULT_TILE_THRESHOLD;
+
+  if (maxEdge <= native) {
+    return { mode: "native" };
+  }
+
+  if (maxEdge <= native * 2) {
+    return {
+      mode: "tile",
+      tileSize: descriptor.tileSize || native,
+      maxPasses: descriptor.runtime === "automodel" ? 4 : 4
+    };
+  }
+
+  return {
+    mode: "tile",
+    tileSize: descriptor.largeTileSize || Math.max(1024, Math.floor(native / 2)),
+    maxPasses: 2
+  };
+}
+
 async function segmentWithTta(source, width, height, passes, options, onProgress) {
   const sum = new Float32Array(width * height);
 
@@ -277,7 +378,7 @@ async function segmentWithTta(source, width, height, passes, options, onProgress
     if (isCancelled(options.id)) return new Uint8Array(width * height);
     const pass = passes[i];
     const augmented = pass === "identity" ? source : augmentRawImage(source, pass);
-    const mask = await segmentOnce(options.segmenter, augmented, width, height);
+    const mask = await segmentOnce(options.stage1, augmented, width, height, options);
     const restored = pass === "identity" ? mask : unaugmentMask(mask, width, height, pass);
     for (let pixel = 0; pixel < sum.length; pixel++) {
       sum[pixel] += restored[pixel];
@@ -292,13 +393,79 @@ async function segmentWithTta(source, width, height, passes, options, onProgress
   return output;
 }
 
-async function segmentOnce(segmenter, image, width, height) {
-  const result = await segmenter(image);
+async function segmentOnce(stage1, image, width, height, options) {
+  if (stage1.runtime === "automodel") {
+    return segmentOnceAutoModel(stage1, image, width, height, options);
+  }
+
+  const result = await stage1.segmenter(image);
+  if (stage1.descriptor.task === "background-removal") {
+    const removed = Array.isArray(result) ? result[0] : result;
+    if (!removed) {
+      throw new Error("Background model did not return a removal mask");
+    }
+    return rawMaskToUint8(removed, width, height);
+  }
+
   const first = Array.isArray(result) ? result[0] : result;
   if (!first?.mask) {
     throw new Error("Background model did not return a segmentation mask");
   }
   return rawMaskToUint8(first.mask, width, height);
+}
+
+async function segmentOnceAutoModel(stage1, image, width, height, options) {
+  const { RawImage } = await getTransformers();
+  const inputImage = image.channels === 4 ? toCompositedRgbRawImage(image, RawImage) : image;
+
+  try {
+    const { pixel_values } = await stage1.processor(inputImage);
+    const result = await stage1.model({ [stage1.descriptor.inputName]: pixel_values });
+    const tensor = result?.[stage1.descriptor.outputName] || Object.values(result || {})[0];
+
+    if (!tensor) {
+      throw new Error("BiRefNet did not return an output mask tensor");
+    }
+
+    const maskImage = await tensorToMaskImage(tensor, stage1.descriptor, RawImage);
+    const resized = maskImage.width === width && maskImage.height === height
+      ? maskImage
+      : await maskImage.resize(width, height);
+    return rawMaskToUint8(resized, width, height);
+  } catch (error) {
+    if (!stage1.cpuOnly && isRecoverableGpuError(error)) {
+      stage1.model?.dispose?.();
+      const cpuStage1 = await loadAutoModelStage1(options.id, stage1.modelId, stage1.descriptor, { cpuOnly: true });
+      stage1Promises.set(stage1.modelId, Promise.resolve(cpuStage1));
+      options.stage1 = cpuStage1;
+      postProgress(options.id, "infer-stage1", 0.02, { device: "cpu" });
+      return segmentOnceAutoModel(cpuStage1, image, width, height, options);
+    }
+    throw error;
+  }
+}
+
+async function tensorToMaskImage(tensor, descriptor, RawImage) {
+  const imageTensor = tensor[0] || tensor;
+  if (imageTensor.sigmoid && imageTensor.mul && imageTensor.to && RawImage.fromTensor) {
+    const activated = descriptor.outputActivation === "sigmoid" ? imageTensor.sigmoid() : imageTensor;
+    return RawImage.fromTensor(activated.mul(255).to("uint8"));
+  }
+
+  const dims = imageTensor.dims || tensor.dims;
+  const data = imageTensor.data || tensor.data;
+  const width = dims[dims.length - 1];
+  const height = dims[dims.length - 2];
+  const output = new Uint8Array(width * height);
+  const offset = data.length >= output.length ? data.length - output.length : 0;
+
+  for (let i = 0; i < output.length; i++) {
+    const value = data[offset + i] ?? 0;
+    const normalized = descriptor.outputActivation === "sigmoid" ? sigmoid(value) : value;
+    output[i] = Math.max(0, Math.min(255, Math.round(normalized * 255)));
+  }
+
+  return new RawImage(output, width, height, 1);
 }
 
 async function refineMask(source, mask, id, device) {
@@ -347,6 +514,17 @@ function rawMaskToUint8(mask, width, height) {
       : Math.round((mask.data[index] + mask.data[index + 1] + mask.data[index + 2]) / 3);
   }
   return output;
+}
+
+function toCompositedRgbRawImage(image, RawImage) {
+  const output = new Uint8ClampedArray(image.width * image.height * 3);
+  for (let pixel = 0, sourceIndex = 0, targetIndex = 0; pixel < image.width * image.height; pixel++, sourceIndex += image.channels, targetIndex += 3) {
+    const alpha = image.channels >= 4 ? image.data[sourceIndex + 3] / 255 : 1;
+    output[targetIndex] = Math.round(image.data[sourceIndex] * alpha + 255 * (1 - alpha));
+    output[targetIndex + 1] = Math.round(image.data[sourceIndex + 1] * alpha + 255 * (1 - alpha));
+    output[targetIndex + 2] = Math.round(image.data[sourceIndex + 2] * alpha + 255 * (1 - alpha));
+  }
+  return new RawImage(output, image.width, image.height, 3);
 }
 
 function getAugmentations(tta, maxPasses) {
@@ -465,6 +643,14 @@ function scaledProgress(value, refine) {
   return value * (refine ? 0.74 : 0.9);
 }
 
+function sigmoid(value) {
+  return 1 / (1 + Math.exp(-value));
+}
+
+function normalizeStage1ModelId(modelId) {
+  return STAGE1_MODELS[modelId] ? modelId : DEFAULT_STAGE1_MODEL_ID;
+}
+
 function postModelProgress(id, progress) {
   if (progress?.status === "progress") {
     postProgress(id, "download", progress.progress ? progress.progress / 100 : 0);
@@ -510,6 +696,16 @@ function isModelAccessError(error) {
     message.includes("rmbg-2.0") && (message.includes("restricted") || message.includes("gated") || message.includes("unauthorized"));
 }
 
+function isRecoverableGpuError(error) {
+  const message = String(error?.message || error || "").toLowerCase();
+  return message.includes("webgpu") ||
+    message.includes("storage buffers") ||
+    message.includes("shader") ||
+    message.includes("ort_run") ||
+    message.includes("ortrun") ||
+    message.includes("failed to call");
+}
+
 function normalizeError(error) {
   const message = String(error?.message || error || "Background removal failed");
   const lower = message.toLowerCase();
@@ -517,7 +713,7 @@ function normalizeError(error) {
     return message;
   }
   if (isModelAccessError(message)) {
-    return `The background-removal model ${STAGE1_MODEL} is restricted on Hugging Face. Accept the model license and authenticate before retrying.`;
+    return "The background-removal model is restricted on Hugging Face. Accept the model license and authenticate before retrying.";
   }
   return message;
 }

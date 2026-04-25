@@ -6,6 +6,34 @@ This plan is implementation-ready: file-level changes, worker abstractions, sett
 
 ---
 
+## Revision 2 — Implementation outcome (2026-04-25) — V1 changed to BEN2
+
+After attempting Revision 1's `onnx-community/BiRefNet-ONNX` path in the actual
+Electron/Transformers.js worker, the full model could not be shipped safely:
+
+- WebGPU inference failed with an ONNX Runtime Web shader error:
+  `Too many storage buffers in shader. Current: 11, Max is 10`.
+- WASM/fp16 session creation failed with a roughly 490 MB buffer allocation.
+- `onnx-community/BiRefNet_lite-ONNX` reduced the model size, but still failed
+  under the same WebGPU shader limit and then hit `std::bad_alloc` under WASM.
+
+The V1 quality picker entry therefore changed from BiRefNet to
+`onnx-community/BEN2-ONNX`. BEN2 is MIT-licensed, supported by the
+Transformers.js `background-removal` pipeline, and passed the Electron smoke
+test on WebGPU. It is WebGPU-only in AlphaKiller because its CPU path exceeded
+the app's 180s background-removal watchdog.
+
+Plan of record as implemented:
+
+- `rmbg-1.4` -> Fast compatibility mode.
+- `ben2` -> Quality free/commercial-safe mode, WebGPU required.
+- BiRefNet, BiRefNet Lite, and BiRefNet_HR -> deferred future work.
+
+The original BiRefNet notes below remain useful for future triage, but they are
+not the V1 implementation target anymore.
+
+---
+
 ## Revision 1 — Phase 0 outcome (2026-04-25) — READ THIS FIRST
 
 Phase 0 verification (§15) is complete and produced a blocker for the original BiRefNet_HR path:

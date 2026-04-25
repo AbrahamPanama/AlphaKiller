@@ -8,8 +8,8 @@ export, white-ink printing, compositing, or texture use.
 ## Current MVP
 
 - PNG/WebP/TIFF drag-and-drop or file-picker import.
-- AI background removal with BRIA RMBG-1.4, optional high-quality edge
-  refinement, and a restore-original safety affordance.
+- AI background removal with a Fast RMBG-1.4 path, a WebGPU-only Quality BEN2
+  path, and a restore-original safety affordance.
 - Canvas preview with checker, black, white, gray, and custom backgrounds.
 - Before, after, split, alpha mask, and difference views.
 - Mouse wheel zoom, drag-to-pan, fit/100% zoom controls, and draggable
@@ -80,11 +80,19 @@ downloaded and cached.
 
 ## Background Removal Status
 
-AlphaKiller currently uses the Transformers.js-compatible
-`briaai/RMBG-1.4` path for Stage 1 background removal. `briaai/RMBG-2.0`
-remains the target quality path, but it is not the current default because its
-browser/ONNX route is blocked by ORT session-shape/runtime errors. The optional
-high-quality edge toggle runs a Stage 2 matting refinement path when available.
+AlphaKiller currently ships two Stage 1 background-removal choices:
+
+- **Fast (RMBG-1.4)**: the compatibility default. It is quick and works on
+  WebGPU or WASM fallback, but BRIA model terms apply.
+- **Quality (BEN2)**: the free/commercial-safe option. It uses
+  `onnx-community/BEN2-ONNX` and requires WebGPU in AlphaKiller because the CPU
+  path is too slow for the app watchdog.
+
+`briaai/RMBG-2.0` and BiRefNet_HR remain future quality targets, but they are
+not current defaults because their browser/ONNX paths are blocked by ORT
+runtime issues in this Electron integration. The high-quality edge-refinement
+toggle is currently disabled because the tested ViTMatte repositories do not
+ship browser-ready ONNX assets.
 
 If you need to probe a different Hugging Face model:
 
@@ -119,6 +127,13 @@ them locally. Background removal is powered by `@huggingface/transformers` and
 remote model weights; see `THIRD_PARTY_LICENSES.md` before packaging or
 redistributing builds.
 
+To benchmark a specific background-removal model:
+
+```bash
+npm run benchmark:bg-remove -- --model rmbg-1.4
+npm run benchmark:bg-remove -- --model ben2
+```
+
 ## Security and Licensing
 
 - Application source is licensed under `LICENSE`.
@@ -130,8 +145,9 @@ redistributing builds.
 ## Known Limitations
 
 - Electron packaging/signing is not configured yet.
-- The background-removal model picker described in `BIREFNET_HR_PLAN.md` is not
-  shipped yet; the HR path is blocked pending browser-compatible ONNX assets.
+- BEN2 Quality mode requires WebGPU. CPU-only users should use Fast mode.
+- BiRefNet_HR and full BiRefNet remain deferred pending browser-compatible ONNX
+  and memory/runtime fixes.
 - There is no full undo stack beyond the one-click Restore Original affordance
   after background removal.
 - CI runs lightweight diagnostics only. Full background-removal smoke tests can
