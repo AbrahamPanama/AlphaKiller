@@ -77,6 +77,15 @@ copies it to `%LOCALAPPDATA%\Programs\AlphaKiller\AlphaKiller.exe`, and creates
 Desktop and Start Menu shortcuts. If Node.js is missing, it can install Node.js
 LTS through `winget`.
 
+Build a macOS DMG:
+
+```bash
+npm run dist:mac
+```
+
+For macOS-specific development and packaging notes, see
+[`MACOS_DEV_COMPAT.md`](./MACOS_DEV_COMPAT.md).
+
 Run the core verification suite:
 
 ```bash
