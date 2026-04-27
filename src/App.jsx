@@ -24,20 +24,31 @@ import {
   Sparkles,
   SplitSquareHorizontal,
   Upload,
+  Redo2,
+  Undo2,
   Wand2,
   ZoomIn,
   ZoomOut
 } from "lucide-react";
 import UTIF from "utif";
 import { applyMaskToImage } from "./imageProcessing.js";
+import {
+  applyPngResolution,
+  encodeTiffImageData,
+  formatResolution,
+  readPngResolution,
+  readTiffResolution
+} from "./imageIO.js";
 import { SettingsPanel } from "./SettingsPanel.jsx";
 
 const DEFAULT_SETTINGS = {
   threshold: { enabled: false, threshold: 128, softness: 8 },
-  defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2 },
-  bleed: { enabled: true, radius: 2, iterations: 2, affectSemiTransparent: true },
+  defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2, tolerance: 180 },
+  bleed: { enabled: true, radius: 2, iterations: 2, affectSemiTransparent: true, useCustomColor: false, color: "#ffffff" },
   hardening: { enabled: false, strength: 55, midpoint: 50 }
 };
+
+const APP_VERSION_LABEL = "0.1 beta";
 
 const PRESETS = [
   {
@@ -63,7 +74,7 @@ const PRESETS = [
     description: "Strong white halo removal for exported artwork.",
     settings: {
       ...DEFAULT_SETTINGS,
-      defringe: { enabled: true, matteColor: "#ffffff", strength: 86, radius: 3 }
+      defringe: { enabled: true, matteColor: "#ffffff", strength: 120, radius: 4, tolerance: 230 }
     }
   },
   {
@@ -73,7 +84,7 @@ const PRESETS = [
     settings: {
       ...DEFAULT_SETTINGS,
       defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false },
-      bleed: { enabled: true, radius: 4, iterations: 4, affectSemiTransparent: true }
+      bleed: { ...DEFAULT_SETTINGS.bleed, enabled: true, radius: 4, iterations: 4, affectSemiTransparent: true }
     }
   }
 ];
@@ -94,28 +105,42 @@ const ZOOM_FACTOR = 1.14;
 const SPLIT_HIT_RADIUS = 14;
 const MIN_BRUSH_SIZE = 1;
 const MAX_BRUSH_SIZE = 128;
+const HISTORY_LIMIT = 30;
 const PROCESSING_DEBOUNCE_MS = 80;
 const BG_REMOVE_TIMEOUT_MS = 180000;
 const BG_REMOVE_EMPTY_MASK_LIMIT = 0.02;
 const BG_REMOVE_MODEL_KEY = "alphakiller:bg-remove-model";
 const BG_REMOVE_REFINE_KEY = "alphakiller:bg-remove-refine-default";
+const BRIA_PRESERVE_ALPHA_KEY = "alphakiller:bria-preserve-alpha";
+const BRIA_TOKEN_KEY = "alphakiller:bria-token";
 const HF_TOKEN_KEY = "alphakiller:hf-token";
+const CUSTOM_PRESETS_KEY = "alphakiller:custom-presets";
 const BG_REMOVE_REFINE_AVAILABLE = false;
 const checkerPatternCache = new WeakMap();
 
 const BG_REMOVE_MODELS = {
   "rmbg-1.4": {
     label: "Fast (RMBG-1.4)",
-    shortLabel: "RMBG",
-    description: "Smaller download, good for previews and most images.",
-    notice: "BRIA model terms apply; review before commercial redistribution."
+    shortLabel: "RMBG 1.4",
+    badge: "Recommended",
+    description: "Fast, reliable, and currently the best edge quality in AlphaKiller.",
+    notice: "Local Transformers.js model. No Hugging Face token required."
   },
   ben2: {
-    label: "Quality (BEN2)",
+    label: "Second Best (BEN2)",
     shortLabel: "BEN2",
-    description: "MIT-licensed background remover with stronger subject matting.",
-    notice: "Requires WebGPU. Slower than Fast but commercial-safe.",
+    description: "A useful local fallback for difficult subjects and comparison runs.",
+    notice: "Requires WebGPU. MIT-licensed and commercial-safe.",
     requiresWebGpu: true
+  },
+  "bria-api": {
+    label: "Experimental (BRIA RMBG-2.0)",
+    shortLabel: "BRIA 2.0",
+    badge: "Experimental",
+    description: "Hosted RMBG-2.0. Available for comparison, but current artwork edges are inconsistent.",
+    notice: "Uploads image to BRIA. Requires Electron and a BRIA API token.",
+    requiresElectron: true,
+    remote: true
   }
 };
 
@@ -159,12 +184,18 @@ export function App() {
   const bgRemoveTimeoutRef = useRef(null);
   const preSegmentationOriginalRef = useRef(null);
   const bgRemoveNoticeShownRef = useRef(new Set());
+  const historyRef = useRef({ undo: [], redo: [] });
+  const settingsUndoGroupRef = useRef(null);
   const [source, setSource] = useState(null);
   const [originalImageData, setOriginalImageData] = useState(null);
   const [processedImageData, setProcessedImageData] = useState(null);
   const [stats, setStats] = useState(null);
   const [settings, setSettings] = useState(DEFAULT_SETTINGS);
   const [preset, setPreset] = useState("gentle");
+  const [customPresets, setCustomPresets] = useState(loadCustomPresets);
+  const [presetDialogOpen, setPresetDialogOpen] = useState(false);
+  const [presetNameDraft, setPresetNameDraft] = useState("");
+  const [activePage, setActivePage] = useState("editor");
   const [background, setBackground] = useState("checker");
   const [customBackground, setCustomBackground] = useState("#6f5cff");
   const [compareMode, setCompareMode] = useState("split");
@@ -183,13 +214,21 @@ export function App() {
   const [bgRemoveDevice, setBgRemoveDevice] = useState(null);
   const [bgRemoveModel, setBgRemoveModel] = useState(loadPersistedBgRemoveModel);
   const [bgRemoveRefine, setBgRemoveRefine] = useState(loadPersistedBgRemoveRefine);
+  const [briaPreserveAlpha, setBriaPreserveAlpha] = useState(loadPersistedBriaPreserveAlpha);
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
   const [hasWebGpu] = useState(() => Boolean(window.navigator?.gpu));
+  const [hasElectronBackgroundRemoval] = useState(() => Boolean(window.alphaKiller?.removeBackground));
   const [hasPreSegmentationOriginal, setHasPreSegmentationOriginal] = useState(false);
   const [hfTokenDialogOpen, setHfTokenDialogOpen] = useState(false);
   const [hfTokenDraft, setHfTokenDraft] = useState("");
+  const [historyVersion, setHistoryVersion] = useState(0);
 
   const isBackgroundRemoving = bgRemoveStatus === "downloading" || bgRemoveStatus === "warming" || bgRemoveStatus === "inferring";
+  const canUndo = historyVersion >= 0 && historyRef.current.undo.length > 0;
+  const canRedo = historyVersion >= 0 && historyRef.current.redo.length > 0;
+  const allPresets = [...PRESETS, ...customPresets];
+  const selectedPreset = allPresets.find((item) => item.id === preset);
+  const selectedCustomPreset = customPresets.find((item) => item.id === preset);
 
   const loadFile = useCallback(async (file) => {
     if (!file || !isSupportedImageFile(file)) {
@@ -199,11 +238,12 @@ export function App() {
 
     setStatus("Loading image");
     cancelBackgroundRemoval();
+    resetImageHistory();
     preSegmentationOriginalRef.current = null;
     setHasPreSegmentationOriginal(false);
     if (isTiffFile(file)) {
       try {
-        const { imageData, previewUrl } = await decodeTiffFile(file);
+        const { imageData, previewUrl, resolution } = await decodeTiffFile(file);
         setSource({
           name: file.name,
           size: file.size,
@@ -211,6 +251,7 @@ export function App() {
           format: "TIFF",
           width: imageData.width,
           height: imageData.height,
+          resolution,
           url: previewUrl
         });
         if (sourceObjectUrlRef.current) {
@@ -236,6 +277,7 @@ export function App() {
       return;
     }
 
+    const resolution = await readFileResolution(file);
     const url = URL.createObjectURL(file);
     const image = new Image();
     image.onload = () => {
@@ -257,6 +299,7 @@ export function App() {
         format: file.type.replace("image/", "").toUpperCase(),
         width: canvas.width,
         height: canvas.height,
+        resolution,
         url
       });
       setOriginalImageData(imageData);
@@ -432,19 +475,13 @@ export function App() {
         setHasPreSegmentationOriginal(true);
       }
 
-      if (sourceObjectUrlRef.current) {
-        URL.revokeObjectURL(sourceObjectUrlRef.current);
-        sourceObjectUrlRef.current = null;
-      }
-
-      setOriginalImageData(nextImageData);
-      setProcessedImageData(nextImageData);
-      setStats(null);
-      setSource((current) => current ? { ...current, url: imageDataToObjectUrl(nextImageData) } : current);
+      commitDocumentImageEdit(nextImageData, {
+        undoFrom: activeJob.visibleBefore,
+        statusText: "Background removed"
+      });
       setBgRemoveStatus("idle");
       setBgRemoveProgress(0);
       setBgRemoveDevice(message.device);
-      setStatus("Background removed");
       const completedModel = message.modelId || activeJob.modelId || bgRemoveModel;
       const completedModelLabel = BG_REMOVE_MODELS[completedModel]?.shortLabel || "AI";
       setToast({
@@ -472,7 +509,13 @@ export function App() {
   function startBgRemoveJob(job) {
     const worker = ensureBgRemoveWorker();
     const id = ++bgRemoveJobIdRef.current;
-    activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData, modelId: job.modelId };
+    activeBgRemoveJobRef.current = {
+      id,
+      requestId: job.requestId,
+      imageData: job.imageData,
+      modelId: job.modelId,
+      visibleBefore: job.visibleBefore
+    };
     setBgRemoveStatus("warming");
     setBgRemoveProgress(0);
     setBgRemoveDevice(null);
@@ -511,23 +554,129 @@ export function App() {
     if (!originalImageData || isBackgroundRemoving) return;
 
     const requestId = ++latestBgRemoveRequestRef.current;
+    const inputImageData = preSegmentationOriginalRef.current
+      ? cloneImageData(preSegmentationOriginalRef.current)
+      : originalImageData;
+    const model = BG_REMOVE_MODELS[bgRemoveModel] || BG_REMOVE_MODELS["rmbg-1.4"];
+    if (model.requiresElectron && !hasElectronBackgroundRemoval) {
+      setToast({
+        type: "warning",
+        title: "Electron required",
+        message: `${model.label} runs through the Electron main process so the API token stays out of the browser.`
+      });
+      return;
+    }
+
     if (!bgRemoveNoticeShownRef.current.has(bgRemoveModel)) {
       bgRemoveNoticeShownRef.current.add(bgRemoveModel);
-      setToast({
-        type: "info",
-        title: "First-time download may be large",
-        message: `${BG_REMOVE_MODELS[bgRemoveModel]?.label || "Background removal"} model assets are cached locally after the first successful download.`
-      });
+      if (model.remote) {
+        setToast({
+          type: "info",
+          title: "BRIA API background removal",
+          message: "AlphaKiller sends a normalized PNG to BRIA and applies the returned alpha matte to the cleanup pipeline."
+        });
+      } else {
+        setToast({
+          type: "info",
+          title: "First-time download may be large",
+          message: `${model.label || "Background removal"} model assets are cached locally after the first successful download.`
+        });
+      }
     }
+
+    if (bgRemoveModel === "bria-api") {
+      runBriaApiBackgroundRemoval({
+        requestId,
+        imageData: inputImageData,
+        visibleBefore: originalImageData
+      });
+      return;
+    }
+
     const hfToken = await getHuggingFaceToken();
     if (requestId !== latestBgRemoveRequestRef.current) return;
     startBgRemoveJob({
       requestId,
-      imageData: originalImageData,
+      imageData: inputImageData,
+      visibleBefore: originalImageData,
       refine: bgRemoveRefine,
       modelId: bgRemoveModel,
       hfToken
     });
+  }
+
+  async function runBriaApiBackgroundRemoval(job) {
+    const id = ++bgRemoveJobIdRef.current;
+    activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData, modelId: "bria-api" };
+    setBgRemoveStatus("inferring");
+    setBgRemoveProgress(0.08);
+    setBgRemoveDevice("api");
+    setStatus("Removing background");
+
+    clearBgRemoveTimeout();
+    bgRemoveTimeoutRef.current = window.setTimeout(() => {
+      if (activeBgRemoveJobRef.current?.id !== id) return;
+      latestBgRemoveRequestRef.current += 1;
+      activeBgRemoveJobRef.current = null;
+      finishBgRemoveError("Background removal took too long. Try a smaller image.");
+    }, BG_REMOVE_TIMEOUT_MS);
+
+    try {
+      const pngBytes = await imageDataToPngArrayBuffer(job.imageData);
+      if (!isActiveBgRemoveJob(id, job.requestId)) return;
+      setBgRemoveProgress(0.28);
+
+      const result = await window.alphaKiller.removeBackground({
+        provider: "bria-api",
+        pngBytes,
+        preserveAlpha: briaPreserveAlpha,
+        apiToken: loadStoredBriaToken()
+      });
+      if (!isActiveBgRemoveJob(id, job.requestId)) return;
+      setBgRemoveProgress(0.82);
+
+      const nextImageData = await pngArrayBufferToImageData(result.pngBytes);
+      if (!isActiveBgRemoveJob(id, job.requestId)) return;
+
+      clearBgRemoveTimeout();
+      activeBgRemoveJobRef.current = null;
+
+      if (!preSegmentationOriginalRef.current) {
+        preSegmentationOriginalRef.current = cloneImageData(job.imageData);
+        setHasPreSegmentationOriginal(true);
+      }
+
+      if (sourceObjectUrlRef.current) {
+        URL.revokeObjectURL(sourceObjectUrlRef.current);
+        sourceObjectUrlRef.current = null;
+      }
+
+      commitDocumentImageEdit(nextImageData, {
+        undoFrom: job.visibleBefore,
+        statusText: "Background removed"
+      });
+      setBgRemoveStatus("idle");
+      setBgRemoveProgress(0);
+      setBgRemoveDevice("api");
+      const resultWidth = result.width || nextImageData.width;
+      const resultHeight = result.height || nextImageData.height;
+      setStatus(`Background removed (${job.imageData.width} x ${job.imageData.height} -> ${resultWidth} x ${resultHeight})`);
+      setToast({
+        type: "success",
+        title: "Background removed",
+        message: `BRIA sent ${job.imageData.width} x ${job.imageData.height} (${formatBytes(pngBytes.byteLength)}) and returned ${resultWidth} x ${resultHeight} in ${((result.durationMs || 0) / 1000).toFixed(1)}s${result.requestId ? ` (request ${result.requestId})` : ""}.`
+      });
+    } catch (error) {
+      if (!isActiveBgRemoveJob(id, job.requestId)) return;
+      clearBgRemoveTimeout();
+      activeBgRemoveJobRef.current = null;
+      finishBgRemoveError(error?.message || "BRIA API background removal failed.");
+    }
+  }
+
+  function isActiveBgRemoveJob(id, requestId) {
+    const activeJob = activeBgRemoveJobRef.current;
+    return Boolean(activeJob && activeJob.id === id && activeJob.requestId === requestId && requestId === latestBgRemoveRequestRef.current);
   }
 
   function restoreOriginal() {
@@ -537,14 +686,13 @@ export function App() {
     const restored = cloneImageData(snapshot);
     preSegmentationOriginalRef.current = null;
     setHasPreSegmentationOriginal(false);
-    setOriginalImageData(restored);
-    setProcessedImageData(restored);
-    setStats(null);
-    setSource((current) => current ? { ...current, url: imageDataToObjectUrl(restored) } : current);
+    commitDocumentImageEdit(restored, {
+      undoFrom: originalImageData,
+      statusText: "Original restored"
+    });
     setBgRemoveStatus("idle");
     setBgRemoveProgress(0);
     setToast(null);
-    setStatus("Original restored");
   }
 
   function cancelBackgroundRemoval() {
@@ -616,6 +764,14 @@ export function App() {
       });
       return;
     }
+    if (BG_REMOVE_MODELS[modelId].requiresElectron && !hasElectronBackgroundRemoval) {
+      setToast({
+        type: "warning",
+        title: "Electron required",
+        message: `${BG_REMOVE_MODELS[modelId].label} is available in the Electron app, not the browser preview.`
+      });
+      return;
+    }
     setBgRemoveModel(modelId);
     persistLocalStorage(BG_REMOVE_MODEL_KEY, modelId);
   }
@@ -633,21 +789,195 @@ export function App() {
     persistLocalStorage(BG_REMOVE_REFINE_KEY, value ? "true" : "false");
   }
 
+  function updateBriaPreserveAlpha(value) {
+    setBriaPreserveAlpha(value);
+    persistLocalStorage(BRIA_PRESERVE_ALPHA_KEY, value ? "true" : "false");
+  }
+
   function saveSettingsToken(token) {
     const clean = sanitizeToken(token);
     if (clean) {
-      persistLocalStorage(HF_TOKEN_KEY, clean);
-      setToast({ type: "success", title: "Token saved", message: "Hugging Face token stored for this browser profile." });
+      persistLocalStorage(BRIA_TOKEN_KEY, clean);
+      setToast({ type: "success", title: "Token saved", message: "BRIA API token stored for this browser profile." });
     } else {
-      removeLocalStorage(HF_TOKEN_KEY);
-      setToast({ type: "success", title: "Token cleared", message: "Stored Hugging Face token removed from this browser profile." });
+      removeLocalStorage(BRIA_TOKEN_KEY);
+      setToast({ type: "success", title: "Token cleared", message: "Stored BRIA API token removed from this browser profile." });
     }
+  }
+
+  function openPresetDialog() {
+    setPresetNameDraft(selectedCustomPreset?.name || "");
+    setPresetDialogOpen(true);
+  }
+
+  function closePresetDialog() {
+    setPresetDialogOpen(false);
+    setPresetNameDraft("");
+  }
+
+  function saveCurrentPreset(event) {
+    event.preventDefault();
+    const name = sanitizePresetName(presetNameDraft);
+    if (!name) return;
+
+    const existingByName = customPresets.find((item) => item.name.toLowerCase() === name.toLowerCase());
+    const id = selectedCustomPreset?.id || existingByName?.id || `custom:${Date.now().toString(36)}`;
+    const nextPreset = {
+      id,
+      name,
+      description: "Saved cleanup settings.",
+      custom: true,
+      settings: structuredClone(settings)
+    };
+    const nextCustomPresets = [
+      ...customPresets.filter((item) => item.id !== id),
+      nextPreset
+    ].sort((a, b) => a.name.localeCompare(b.name));
+
+    setCustomPresets(nextCustomPresets);
+    persistCustomPresets(nextCustomPresets);
+    setPreset(id);
+    closePresetDialog();
+    setToast({
+      type: "success",
+      title: "Preset saved",
+      message: `${name} is available in the Preset dropdown.`
+    });
+  }
+
+  function deleteSelectedCustomPreset() {
+    if (!selectedCustomPreset) return;
+    const nextCustomPresets = customPresets.filter((item) => item.id !== selectedCustomPreset.id);
+    setCustomPresets(nextCustomPresets);
+    persistCustomPresets(nextCustomPresets);
+    setPreset("gentle");
+    setToast({
+      type: "success",
+      title: "Preset deleted",
+      message: `${selectedCustomPreset.name} was removed.`
+    });
   }
 
   function clearBgRemoveTimeout() {
     if (!bgRemoveTimeoutRef.current) return;
     window.clearTimeout(bgRemoveTimeoutRef.current);
     bgRemoveTimeoutRef.current = null;
+  }
+
+  function resetImageHistory() {
+    clearSettingsUndoGroup();
+    historyRef.current = { undo: [], redo: [] };
+    setHistoryVersion((version) => version + 1);
+  }
+
+  function makeHistorySnapshot({ imageData = originalImageData, includeImage = false } = {}) {
+    return {
+      imageData: includeImage && imageData ? cloneImageData(imageData) : null,
+      settings: structuredClone(settings),
+      preset
+    };
+  }
+
+  function pushUndoSnapshot(snapshot) {
+    if (!snapshot) return;
+    const history = historyRef.current;
+    history.undo.push(snapshot);
+    if (history.undo.length > HISTORY_LIMIT) {
+      history.undo.shift();
+    }
+    history.redo = [];
+    setHistoryVersion((version) => version + 1);
+  }
+
+  function clearSettingsUndoGroup() {
+    const group = settingsUndoGroupRef.current;
+    if (group?.timer) {
+      window.clearTimeout(group.timer);
+    }
+    settingsUndoGroupRef.current = null;
+  }
+
+  function pushSettingsUndoSnapshot({ forceNew = false } = {}) {
+    if (!originalImageData) return;
+    if (forceNew) {
+      clearSettingsUndoGroup();
+    }
+
+    if (!settingsUndoGroupRef.current) {
+      pushUndoSnapshot(makeHistorySnapshot({ includeImage: false }));
+      settingsUndoGroupRef.current = { timer: null };
+    }
+
+    if (settingsUndoGroupRef.current.timer) {
+      window.clearTimeout(settingsUndoGroupRef.current.timer);
+    }
+
+    settingsUndoGroupRef.current.timer = window.setTimeout(() => {
+      settingsUndoGroupRef.current = null;
+    }, 700);
+  }
+
+  function replaceDocumentImage(imageData, statusText = "Ready") {
+    if (sourceObjectUrlRef.current) {
+      URL.revokeObjectURL(sourceObjectUrlRef.current);
+      sourceObjectUrlRef.current = null;
+    }
+
+    setOriginalImageData(imageData);
+    setProcessedImageData(imageData);
+    setStats(null);
+    setSource((current) => current ? {
+      ...current,
+      width: imageData.width,
+      height: imageData.height,
+      url: imageDataToObjectUrl(imageData)
+    } : current);
+    setStatus(statusText);
+  }
+
+  function commitDocumentImageEdit(imageData, { undoFrom = originalImageData, statusText = "Ready" } = {}) {
+    clearSettingsUndoGroup();
+    pushUndoSnapshot(makeHistorySnapshot({ imageData: undoFrom, includeImage: true }));
+    replaceDocumentImage(imageData, statusText);
+  }
+
+  function applyHistorySnapshot(snapshot, statusText) {
+    if (snapshot.imageData) {
+      replaceDocumentImage(cloneImageData(snapshot.imageData), statusText);
+    } else {
+      setStatus(statusText);
+    }
+
+    setSettings(structuredClone(snapshot.settings));
+    setPreset(snapshot.preset);
+  }
+
+  function undoImageEdit() {
+    clearSettingsUndoGroup();
+    const history = historyRef.current;
+    const previous = history.undo.pop();
+    if (!previous) return;
+
+    history.redo.push(makeHistorySnapshot({ includeImage: Boolean(previous.imageData) }));
+    if (history.redo.length > HISTORY_LIMIT) {
+      history.redo.shift();
+    }
+    applyHistorySnapshot(previous, "Undo");
+    setHistoryVersion((version) => version + 1);
+  }
+
+  function redoImageEdit() {
+    clearSettingsUndoGroup();
+    const history = historyRef.current;
+    const next = history.redo.pop();
+    if (!next) return;
+
+    history.undo.push(makeHistorySnapshot({ includeImage: Boolean(next.imageData) }));
+    if (history.undo.length > HISTORY_LIMIT) {
+      history.undo.shift();
+    }
+    applyHistorySnapshot(next, "Redo");
+    setHistoryVersion((version) => version + 1);
   }
 
   useEffect(() => {
@@ -755,6 +1085,39 @@ export function App() {
   }, [renderCanvas]);
 
   useEffect(() => {
+    const onKeyDown = (event) => {
+      const key = event.key.toLowerCase();
+      const isUndoRedoKey = (event.metaKey || event.ctrlKey) && (key === "z" || key === "y");
+      if (!isUndoRedoKey) return;
+
+      const target = event.target;
+      const isTyping = target instanceof HTMLElement &&
+        (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable);
+      if (isTyping) return;
+
+      if (key === "z" && event.shiftKey) {
+        event.preventDefault();
+        redoImageEdit();
+        return;
+      }
+
+      if (key === "z") {
+        event.preventDefault();
+        undoImageEdit();
+        return;
+      }
+
+      if (key === "y") {
+        event.preventDefault();
+        redoImageEdit();
+      }
+    };
+
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  });
+
+  useEffect(() => {
     renderCanvas();
   }, [renderCanvas]);
 
@@ -784,6 +1147,9 @@ export function App() {
   }, []);
 
   const updateSetting = (group, key, value) => {
+    if (settings[group]?.[key] === value) return;
+
+    pushSettingsUndoSnapshot();
     setSettings((current) => ({
       ...current,
       [group]: {
@@ -794,29 +1160,61 @@ export function App() {
   };
 
   const choosePreset = (id) => {
-    const next = PRESETS.find((item) => item.id === id);
+    if (id === preset) return;
+
+    const next = allPresets.find((item) => item.id === id);
     if (!next) return;
+    pushSettingsUndoSnapshot({ forceNew: true });
     setPreset(id);
     setSettings(structuredClone(next.settings));
   };
 
   const handleExport = async () => {
     if (!processedImageData || !source) return;
+    if (!window.alphaKiller?.chooseExportTarget || !window.alphaKiller?.writeExport) {
+      setToast({
+        type: "warning",
+        title: "Open Electron to export",
+        message: "Native PNG and TIFF export uses Electron's save dialog."
+      });
+      return;
+    }
 
-    const canvas = document.createElement("canvas");
-    canvas.width = processedImageData.width;
-    canvas.height = processedImageData.height;
-    canvas.getContext("2d").putImageData(processedImageData, 0, 0);
-    const blob = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
-    const bytes = new Uint8Array(await blob.arrayBuffer());
     const baseName = source.name.replace(/\.[^.]+$/, "");
-    const result = await window.alphaKiller?.savePng({
-      bytes: Array.from(bytes),
-      defaultPath: `${baseName}-cleaned.png`
-    });
+    const defaultFormat = source.format === "TIFF" ? "tiff" : "png";
+    try {
+      const target = await window.alphaKiller.chooseExportTarget({
+        defaultPath: `${baseName}-cleaned.${defaultFormat === "tiff" ? "tiff" : "png"}`,
+        defaultFormat
+      });
 
-    if (result?.canceled) return;
-    setToast({ type: "success", title: "Export complete", message: result?.filePath || "Cleaned PNG saved." });
+      if (target?.canceled || !target?.exportId) return;
+
+      const bytes = target.format === "tiff"
+        ? encodeTiffImageData(processedImageData, source.resolution)
+        : await imageDataToPngArrayBuffer(processedImageData, source.resolution);
+
+      const result = await window.alphaKiller.writeExport({
+        exportId: target.exportId,
+        bytes
+      });
+
+      if (result?.canceled) return;
+      const formatLabel = target.format === "tiff" ? "TIFF" : "PNG";
+      const dpiLabel = source.resolution ? `, ${formatResolution(source.resolution)}` : "";
+      setToast({
+        type: "success",
+        title: "Export complete",
+        message: `${formatLabel} saved at ${processedImageData.width} x ${processedImageData.height}${dpiLabel}.`
+      });
+    } catch (error) {
+      console.error(error);
+      setToast({
+        type: "error",
+        title: "Export failed",
+        message: error?.message || "AlphaKiller could not save the image."
+      });
+    }
   };
 
   const onDrop = (event) => {
@@ -869,6 +1267,7 @@ export function App() {
       interaction.brushSize
     );
     interaction.lastImagePoint = imagePoint;
+    interaction.changed = true;
     scheduleCanvasRender();
   };
 
@@ -967,8 +1366,10 @@ export function App() {
       frame,
       width: originalImageData.width,
       height: originalImageData.height,
+      undoImageData: kind === "delete" ? cloneImageData(originalImageData) : null,
       draftData: kind === "delete" ? new Uint8ClampedArray(originalImageData.data) : null,
       lastImagePoint: null,
+      changed: false,
       brushSize
     };
     canvasRef.current.setPointerCapture(event.pointerId);
@@ -1037,16 +1438,30 @@ export function App() {
       canvasRef.current.releasePointerCapture(event.pointerId);
     }
     if (interaction?.kind === "delete") {
-      setOriginalImageData(new ImageData(new Uint8ClampedArray(interaction.draftData), interaction.width, interaction.height));
-      setStatus("Ready");
+      if (interaction.changed) {
+        commitDocumentImageEdit(
+          new ImageData(new Uint8ClampedArray(interaction.draftData), interaction.width, interaction.height),
+          {
+            undoFrom: interaction.undoImageData,
+            statusText: "Delete Pen applied"
+          }
+        );
+      } else {
+        setStatus("Ready");
+      }
     }
     interactionRef.current = null;
     setCanvasMode("idle");
   };
 
+  const showPage = (page) => {
+    setActivePage(page);
+    setSettingsPanelOpen(false);
+  };
+
   return (
     <div
-      className={`app ${dragging ? "is-dragging" : ""}`}
+      className={`app ${dragging ? "is-dragging" : ""} ${activePage === "about" ? "is-about-page" : ""}`}
       onDragEnter={(event) => {
         event.preventDefault();
         dragDepthRef.current += 1;
@@ -1074,21 +1489,29 @@ export function App() {
         <div className="brand">
           <Scissors size={15} />
           <strong>AlphaKiller</strong>
+          <small>{APP_VERSION_LABEL}</small>
           <span>{source ? source.name : "No image loaded"}</span>
         </div>
         <nav>
-          <button className="nav-active">Editor</button>
-          <button>Batch</button>
-          <button>Presets</button>
+          <button className={activePage === "editor" ? "nav-active" : ""} onClick={() => showPage("editor")}>Editor</button>
+          <button className={activePage === "about" ? "nav-active" : ""} onClick={() => showPage("about")}>About</button>
         </nav>
       </header>
 
+      {activePage === "editor" && (
       <div className="toolbar">
         <button className="icon-button" title="Open image" onClick={() => fileInputRef.current?.click()}>
           <FolderOpen size={16} />
         </button>
-        <button className="icon-button" title="Save preset">
+        <button className="icon-button" title="Save preset" aria-label="Save preset" onClick={openPresetDialog}>
           <Save size={16} />
+        </button>
+        <span className="divider" />
+        <button className="icon-button" title="Undo" aria-label="Undo" disabled={!canUndo || isBackgroundRemoving} onClick={undoImageEdit}>
+          <Undo2 size={16} />
+        </button>
+        <button className="icon-button" title="Redo" aria-label="Redo" disabled={!canRedo || isBackgroundRemoving} onClick={redoImageEdit}>
+          <Redo2 size={16} />
         </button>
         <span className="divider" />
         <button className="icon-button" title="Zoom out" onClick={() => zoomAroundCanvasCenter(zoom / ZOOM_FACTOR)}>
@@ -1164,10 +1587,14 @@ export function App() {
         </button>
         <button className="primary-button" disabled={!processedImageData} onClick={handleExport}>
           <Download size={15} />
-          Export PNG
+          Export
         </button>
       </div>
+      )}
 
+      {activePage === "about" ? (
+        <AboutPage version={APP_VERSION_LABEL} />
+      ) : (
       <main className="workspace">
         <aside className="sidebar left">
           <PanelTitle title="Source" action={<Upload size={14} />} />
@@ -1179,6 +1606,7 @@ export function App() {
               <strong>{source.name}</strong>
               <dl>
                 <dt>Size</dt><dd>{source.width} x {source.height}</dd>
+                <dt>DPI</dt><dd>{formatResolution(source.resolution)}</dd>
                 <dt>Bytes</dt><dd>{formatBytes(source.size)}</dd>
                 <dt>Type</dt><dd>{source.format || source.type.replace("image/", "").toUpperCase()}</dd>
                 <dt>Alpha</dt><dd><span className="pill good">Detected</span></dd>
@@ -1271,11 +1699,23 @@ export function App() {
             <label className="field-label">Preset</label>
             <div className="select-wrap">
               <select value={preset} onChange={(event) => choosePreset(event.target.value)}>
-                {PRESETS.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                <optgroup label="Built-in">
+                  {PRESETS.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                </optgroup>
+                {customPresets.length > 0 && (
+                  <optgroup label="Saved">
+                    {customPresets.map((item) => <option key={item.id} value={item.id}>{item.name}</option>)}
+                  </optgroup>
+                )}
               </select>
               <ChevronDown size={14} />
             </div>
-            <p>{PRESETS.find((item) => item.id === preset)?.description}</p>
+            <p>{selectedPreset?.description || "Unsaved cleanup settings."}</p>
+            {selectedCustomPreset && (
+              <button className="text-button preset-delete" onClick={deleteSelectedCustomPreset}>
+                Delete saved preset
+              </button>
+            )}
           </section>
 
           <ToolSection
@@ -1285,7 +1725,8 @@ export function App() {
             onToggle={(value) => updateSetting("defringe", "enabled", value)}
           >
             <ColorControl label="Matte" value={settings.defringe.matteColor} onChange={(value) => updateSetting("defringe", "matteColor", value)} />
-            <RangeControl label="Strength" value={settings.defringe.strength} min={0} max={100} unit="%" onChange={(value) => updateSetting("defringe", "strength", value)} />
+            <RangeControl label="Strength" value={settings.defringe.strength} min={0} max={200} unit="%" onChange={(value) => updateSetting("defringe", "strength", value)} />
+            <RangeControl label="Matte tolerance" value={settings.defringe.tolerance ?? 255} min={0} max={255} onChange={(value) => updateSetting("defringe", "tolerance", value)} />
             <RangeControl label="Edge radius" value={settings.defringe.radius} min={1} max={6} unit="px" onChange={(value) => updateSetting("defringe", "radius", value)} />
           </ToolSection>
 
@@ -1297,6 +1738,8 @@ export function App() {
           >
             <RangeControl label="Radius" value={settings.bleed.radius} min={1} max={8} unit="px" onChange={(value) => updateSetting("bleed", "radius", value)} />
             <RangeControl label="Iterations" value={settings.bleed.iterations} min={1} max={6} onChange={(value) => updateSetting("bleed", "iterations", value)} />
+            <ToggleRow label="Use bleed color" checked={settings.bleed.useCustomColor ?? false} onChange={(value) => updateSetting("bleed", "useCustomColor", value)} />
+            <ColorControl label="Bleed color" value={settings.bleed.color ?? "#ffffff"} onChange={(value) => updateSetting("bleed", "color", value)} />
             <ToggleRow label="Affect semi-alpha" checked={settings.bleed.affectSemiTransparent} onChange={(value) => updateSetting("bleed", "affectSemiTransparent", value)} />
           </ToolSection>
 
@@ -1321,6 +1764,7 @@ export function App() {
           </ToolSection>
         </aside>
       </main>
+      )}
 
       <footer className="statusbar">
         <span><Check size={12} /> {status}</span>
@@ -1328,7 +1772,7 @@ export function App() {
         <span>{source ? `${source.width} x ${source.height}` : "No image"}</span>
         <span>{cursor ? `Alpha ${cursor.a}` : "Alpha -"}</span>
         <span>{canvasTool === "delete" ? `Delete Pen ${brushSize}px` : "Pan tool"}</span>
-        <span>{isBackgroundRemoving ? `AI ${BG_REMOVE_LABELS[bgRemoveStatus]}${bgRemoveDevice === "cpu" ? " (CPU)" : ""}` : `AI ${BG_REMOVE_MODELS[bgRemoveModel]?.shortLabel || "-"}`}</span>
+        <span>{isBackgroundRemoving ? `AI ${BG_REMOVE_LABELS[bgRemoveStatus]}${bgRemoveDevice === "cpu" ? " (CPU)" : bgRemoveDevice === "api" ? " (API)" : ""}` : `AI ${BG_REMOVE_MODELS[bgRemoveModel]?.shortLabel || "-"}`}</span>
         <span>Bg {background}</span>
       </footer>
 
@@ -1337,12 +1781,15 @@ export function App() {
           models={BG_REMOVE_MODELS}
           selectedModel={bgRemoveModel}
           refineDefault={bgRemoveRefine}
+          briaPreserveAlpha={briaPreserveAlpha}
           disabled={isBackgroundRemoving}
           refineAvailable={BG_REMOVE_REFINE_AVAILABLE}
           hasWebGpu={hasWebGpu}
-          tokenValue={loadStoredHfToken()}
+          hasElectronBackgroundRemoval={hasElectronBackgroundRemoval}
+          tokenValue={loadStoredBriaToken()}
           onModelChange={updateBgRemoveModel}
           onRefineDefaultChange={updateBgRemoveRefine}
+          onBriaPreserveAlphaChange={updateBriaPreserveAlpha}
           onTokenSave={saveSettingsToken}
           onClose={() => setSettingsPanelOpen(false)}
         />
@@ -1352,6 +1799,27 @@ export function App() {
         <div className={`toast ${toast.type}`}>
           <strong>{toast.title}</strong>
           <span>{toast.message}</span>
+        </div>
+      )}
+
+      {presetDialogOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <form className="preset-dialog" onSubmit={saveCurrentPreset}>
+            <strong>Save Slider Settings</strong>
+            <span>Store the current cleanup controls as a reusable preset on this computer.</span>
+            <input
+              autoFocus
+              type="text"
+              value={presetNameDraft}
+              onChange={(event) => setPresetNameDraft(event.target.value)}
+              placeholder="Preset name"
+              maxLength={48}
+            />
+            <div className="dialog-actions">
+              <button type="button" onClick={closePresetDialog}>Cancel</button>
+              <button type="submit" className="primary-button" disabled={!sanitizePresetName(presetNameDraft)}>Save preset</button>
+            </div>
+          </form>
         </div>
       )}
 
@@ -1448,6 +1916,59 @@ function Switch({ checked, onChange }) {
     <button className={`switch ${checked ? "on" : ""}`} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}>
       <span />
     </button>
+  );
+}
+
+function AboutPage({ version }) {
+  return (
+    <main className="about-page">
+      <section className="about-hero">
+        <div className="about-mark">
+          <Scissors size={30} />
+        </div>
+        <div>
+          <p className="eyebrow">Desktop alpha cleanup</p>
+          <h1>AlphaKiller</h1>
+          <span>{version}</span>
+        </div>
+      </section>
+
+      <section className="about-grid">
+        <article className="about-panel">
+          <h2>What It Does</h2>
+          <p>
+            AlphaKiller prepares transparent artwork for production by removing matte halos,
+            cleaning hidden RGB, refining semi-transparent edges, and exporting clean PNG or TIFF files.
+          </p>
+        </article>
+
+        <article className="about-panel">
+          <h2>Current Beta</h2>
+          <ul>
+            <li>PNG, WebP, TIFF import</li>
+            <li>Transparent PNG and TIFF export</li>
+            <li>DPI preservation for PNG and TIFF sources</li>
+            <li>Undo/redo and locally saved cleanup presets</li>
+          </ul>
+        </article>
+
+        <article className="about-panel">
+          <h2>Background Removal</h2>
+          <p>
+            Fast mode uses local RMBG-1.4. BEN2 is available as a WebGPU quality fallback.
+            BRIA RMBG-2.0 remains experimental for comparison.
+          </p>
+        </article>
+
+        <article className="about-panel">
+          <h2>Notes</h2>
+          <p>
+            This beta is built for local review and iteration. Packaging, signing,
+            batch workflows, and advanced model management are still future work.
+          </p>
+        </article>
+      </section>
+    </main>
   );
 }
 
@@ -1709,6 +2230,23 @@ function bgRemoveStageToStatus(stage) {
 
 function getBgRemoveErrorMessage(message = "") {
   const lower = message.toLowerCase();
+  if (lower.includes("no handler registered") || lower.includes("background-removal:run")) {
+    return "Electron needs to be restarted so the background-removal IPC handler is registered. Stop the current dev app and launch it again with BRIA_API_TOKEN set.";
+  }
+  if (lower.includes("bria")) {
+    if (lower.includes("missing bria_api_token")) {
+      return "Missing BRIA_API_TOKEN. Launch the Electron app with BRIA_API_TOKEN set in the main-process environment.";
+    }
+    if (lower.includes("token") || lower.includes("401") || lower.includes("403")) {
+      return "The BRIA API token was rejected. Check BRIA_API_TOKEN and the account's API access.";
+    }
+    if (lower.includes("415") || lower.includes("png")) {
+      return "BRIA rejected the input image format. AlphaKiller expected a normalized PNG upload.";
+    }
+  }
+  if (lower.includes("rate limit") || lower.includes("429")) {
+    return "The background-removal provider is rate limited. Wait a moment and try again.";
+  }
   if (lower.includes("no hugging face token")) {
     return "No Hugging Face token is available to AlphaKiller. In Electron, launch with HF_TOKEN set. In the browser preview, set localStorage key alphakiller:hf-token.";
   }
@@ -1759,12 +2297,17 @@ function sanitizeToken(token) {
   return typeof token === "string" ? token.trim() : "";
 }
 
+function sanitizePresetName(name) {
+  return typeof name === "string" ? name.trim().replace(/\s+/g, " ").slice(0, 48) : "";
+}
+
 function loadPersistedBgRemoveModel() {
   try {
     const value = window.localStorage?.getItem(BG_REMOVE_MODEL_KEY);
     const model = BG_REMOVE_MODELS[value];
     if (!model) return "rmbg-1.4";
     if (model.requiresWebGpu && !window.navigator?.gpu) return "rmbg-1.4";
+    if (model.requiresElectron && !window.alphaKiller?.removeBackground) return "rmbg-1.4";
     return value;
   } catch {
     return "rmbg-1.4";
@@ -1780,9 +2323,82 @@ function loadPersistedBgRemoveRefine() {
   }
 }
 
+function loadPersistedBriaPreserveAlpha() {
+  try {
+    const value = window.localStorage?.getItem(BRIA_PRESERVE_ALPHA_KEY);
+    return value === null ? true : value === "true";
+  } catch {
+    return true;
+  }
+}
+
+function loadCustomPresets() {
+  try {
+    const raw = window.localStorage?.getItem(CUSTOM_PRESETS_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map(normalizeCustomPreset)
+      .filter(Boolean)
+      .sort((a, b) => a.name.localeCompare(b.name));
+  } catch {
+    return [];
+  }
+}
+
+function persistCustomPresets(presets) {
+  persistLocalStorage(CUSTOM_PRESETS_KEY, JSON.stringify(presets.map((item) => ({
+    id: item.id,
+    name: item.name,
+    description: item.description,
+    settings: item.settings
+  }))));
+}
+
+function normalizeCustomPreset(preset) {
+  const name = sanitizePresetName(preset?.name);
+  if (!name || !preset?.settings) return null;
+  return {
+    id: typeof preset.id === "string" && preset.id.startsWith("custom:") ? preset.id : `custom:${Date.now().toString(36)}:${name}`,
+    name,
+    description: "Saved cleanup settings.",
+    custom: true,
+    settings: normalizePresetSettings(preset.settings)
+  };
+}
+
+function normalizePresetSettings(settings) {
+  return {
+    threshold: {
+      ...DEFAULT_SETTINGS.threshold,
+      ...(settings?.threshold || {})
+    },
+    defringe: {
+      ...DEFAULT_SETTINGS.defringe,
+      ...(settings?.defringe || {})
+    },
+    bleed: {
+      ...DEFAULT_SETTINGS.bleed,
+      ...(settings?.bleed || {})
+    },
+    hardening: {
+      ...DEFAULT_SETTINGS.hardening,
+      ...(settings?.hardening || {})
+    }
+  };
+}
+
 function loadStoredHfToken() {
   try {
     return sanitizeToken(window.localStorage?.getItem(HF_TOKEN_KEY));
+  } catch {
+    return "";
+  }
+}
+
+function loadStoredBriaToken() {
+  try {
+    return sanitizeToken(window.localStorage?.getItem(BRIA_TOKEN_KEY));
   } catch {
     return "";
   }
@@ -1917,7 +2533,21 @@ async function decodeTiffFile(file) {
   const rgba = UTIF.toRGBA8(image);
   const imageData = new ImageData(new Uint8ClampedArray(rgba), image.width, image.height);
   const previewUrl = imageDataToObjectUrl(imageData);
-  return { imageData, previewUrl };
+  return { imageData, previewUrl, resolution: readTiffResolution(image) };
+}
+
+async function readFileResolution(file) {
+  if (!isPngFile(file)) return null;
+  try {
+    return readPngResolution(await file.arrayBuffer());
+  } catch {
+    return null;
+  }
+}
+
+function isPngFile(file) {
+  const name = file.name.toLowerCase();
+  return file.type === "image/png" || name.endsWith(".png");
 }
 
 function imageDataToObjectUrl(imageData) {
@@ -1926,4 +2556,64 @@ function imageDataToObjectUrl(imageData) {
   canvas.height = imageData.height;
   canvas.getContext("2d").putImageData(imageData, 0, 0);
   return canvas.toDataURL("image/png");
+}
+
+async function imageDataToPngArrayBuffer(imageData, resolution = null) {
+  const canvas = document.createElement("canvas");
+  canvas.width = imageData.width;
+  canvas.height = imageData.height;
+  canvas.getContext("2d").putImageData(imageData, 0, 0);
+  const blob = await new Promise((resolve, reject) => {
+    canvas.toBlob((nextBlob) => {
+      if (nextBlob) {
+        resolve(nextBlob);
+      } else {
+        reject(new Error("Could not encode source image as PNG."));
+      }
+    }, "image/png");
+  });
+  return applyPngResolution(await blob.arrayBuffer(), resolution);
+}
+
+async function pngArrayBufferToImageData(pngBytes) {
+  const bytes = pngBytes instanceof ArrayBuffer
+    ? pngBytes
+    : pngBytes?.buffer?.slice(pngBytes.byteOffset, pngBytes.byteOffset + pngBytes.byteLength);
+
+  if (!(bytes instanceof ArrayBuffer)) {
+    throw new Error("Background-removal result did not include PNG bytes.");
+  }
+
+  const blob = new Blob([bytes], { type: "image/png" });
+  if (window.createImageBitmap) {
+    const bitmap = await createImageBitmap(blob);
+    try {
+      const canvas = document.createElement("canvas");
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(bitmap, 0, 0);
+      return ctx.getImageData(0, 0, bitmap.width, bitmap.height);
+    } finally {
+      bitmap.close?.();
+    }
+  }
+
+  const objectUrl = URL.createObjectURL(blob);
+  try {
+    const img = await new Promise((resolve, reject) => {
+      const image = new Image();
+      image.onload = () => resolve(image);
+      image.onerror = () => reject(new Error("Could not decode background-removal PNG result."));
+      image.src = objectUrl;
+    });
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(img, 0, 0);
+    return ctx.getImageData(0, 0, img.naturalWidth, img.naturalHeight);
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
 }

@@ -146,6 +146,9 @@ const BLEED_DISTANCE_INF = 65535;
 const BLEED_ORTHOGONAL_WEIGHT = 10;
 const BLEED_DIAGONAL_WEIGHT = 14;
 const BLEED_DISTANCE_SCALE = 10;
+const BLEED_REACH_POTENCY = 3;
+const DEFRINGE_STRENGTH_POTENCY = 2;
+const MATTE_TOLERANCE_POTENCY = 6;
 
 function cloneImageData(imageData) {
   return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
@@ -187,10 +190,11 @@ function alphaHarden(imageData, { strength, midpoint }) {
   }
 }
 
-function defringe(imageData, { matteColor, strength, radius }) {
+function defringe(imageData, { matteColor, strength, radius, tolerance }) {
   const data = imageData.data;
   const matte = hexToRgb(matteColor);
-  const amount = strength / 100;
+  const amount = (Math.max(0, strength) / 100) * DEFRINGE_STRENGTH_POTENCY;
+  const matteTolerance = Math.max(0, tolerance ?? 255) * MATTE_TOLERANCE_POTENCY;
   const alphaLimit = Math.min(254, 80 + radius * 45);
 
   for (let i = 0; i < data.length; i += 4) {
@@ -198,19 +202,35 @@ function defringe(imageData, { matteColor, strength, radius }) {
     if (a === 0 || a === 255 || a > alphaLimit) continue;
 
     const alpha = Math.max(1 / 255, a / 255);
-    data[i] = clampByte(data[i] + ((data[i] - matte.r) * (1 - alpha) * amount));
-    data[i + 1] = clampByte(data[i + 1] + ((data[i + 1] - matte.g) * (1 - alpha) * amount));
-    data[i + 2] = clampByte(data[i + 2] + ((data[i + 2] - matte.b) * (1 - alpha) * amount));
+    const match = getMatteMatch(data[i], data[i + 1], data[i + 2], matte, matteTolerance);
+    if (match <= 0) continue;
+
+    const correction = (1 - alpha) * amount * match;
+    data[i] = clampByte(data[i] + ((data[i] - matte.r) * correction));
+    data[i + 1] = clampByte(data[i + 1] + ((data[i + 1] - matte.g) * correction));
+    data[i + 2] = clampByte(data[i + 2] + ((data[i + 2] - matte.b) * correction));
   }
 }
 
-function colorBleed(imageData, { radius, iterations, affectSemiTransparent }) {
+function getMatteMatch(r, g, b, matte, tolerance) {
+  const distance = Math.max(
+    Math.abs(r - matte.r),
+    Math.abs(g - matte.g),
+    Math.abs(b - matte.b)
+  );
+  if (distance === 0) return 1;
+  if (tolerance <= 0 || distance >= tolerance) return 0;
+  return 1 - smoothstep(distance / tolerance);
+}
+
+function colorBleed(imageData, { radius, iterations, affectSemiTransparent, useCustomColor, color }) {
   const { width, height } = imageData;
   const data = imageData.data;
   const pixelCount = width * height;
+  const bleedColor = useCustomColor ? hexToRgb(color || "#ffffff") : null;
   const maxDistance = Math.min(
     BLEED_DISTANCE_INF - 1,
-    Math.max(1, radius) * Math.max(1, iterations) * BLEED_DISTANCE_SCALE
+    Math.max(1, radius) * Math.max(1, iterations) * BLEED_DISTANCE_SCALE * BLEED_REACH_POTENCY
   );
   const distances = new Uint16Array(pixelCount);
   distances.fill(BLEED_DISTANCE_INF);
@@ -224,19 +244,19 @@ function colorBleed(imageData, { radius, iterations, affectSemiTransparent }) {
   for (let y = 0; y < height; y++) {
     const row = y * width;
     for (let x = 0; x < width; x++) {
-      relaxBleedPixel(data, distances, row + x, x, y, width, height, maxDistance, affectSemiTransparent, -1);
+      relaxBleedPixel(data, distances, row + x, x, y, width, height, maxDistance, affectSemiTransparent, bleedColor, -1);
     }
   }
 
   for (let y = height - 1; y >= 0; y--) {
     const row = y * width;
     for (let x = width - 1; x >= 0; x--) {
-      relaxBleedPixel(data, distances, row + x, x, y, width, height, maxDistance, affectSemiTransparent, 1);
+      relaxBleedPixel(data, distances, row + x, x, y, width, height, maxDistance, affectSemiTransparent, bleedColor, 1);
     }
   }
 }
 
-function relaxBleedPixel(data, distances, pixel, x, y, width, height, maxDistance, affectSemiTransparent, direction) {
+function relaxBleedPixel(data, distances, pixel, x, y, width, height, maxDistance, affectSemiTransparent, bleedColor, direction) {
   const index = pixel * 4;
   if (!shouldBleedPixel(data[index + 3], affectSemiTransparent)) return;
 
@@ -313,9 +333,9 @@ function relaxBleedPixel(data, distances, pixel, x, y, width, height, maxDistanc
 
   const sourceIndex = sourcePixel * 4;
   distances[pixel] = bestDistance;
-  data[index] = data[sourceIndex];
-  data[index + 1] = data[sourceIndex + 1];
-  data[index + 2] = data[sourceIndex + 2];
+  data[index] = bleedColor ? bleedColor.r : data[sourceIndex];
+  data[index + 1] = bleedColor ? bleedColor.g : data[sourceIndex + 1];
+  data[index + 2] = bleedColor ? bleedColor.b : data[sourceIndex + 2];
 }
 
 function shouldBleedPixel(alpha, affectSemiTransparent) {

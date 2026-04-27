@@ -154,10 +154,11 @@ The next high-value step is focused pointer cleanup: move pan, split, cursor sam
 
 Background removal now runs in `src/bgRemoveWorker.js`, separate from the cleanup worker. The current integration uses `@huggingface/transformers` with a model-dispatched Stage 1 path:
 
-- `rmbg-1.4`: Fast mode, using `briaai/RMBG-1.4`.
-- `ben2`: Quality mode, using `onnx-community/BEN2-ONNX` through the Transformers.js `background-removal` pipeline.
+- `rmbg-1.4`: recommended Fast mode, using `briaai/RMBG-1.4`. It currently produces the best AlphaKiller edge quality in local testing.
+- `ben2`: second-best local mode, using `onnx-community/BEN2-ONNX` through the Transformers.js `background-removal` pipeline.
+- `bria-api`: experimental hosted RMBG-2.0 path through Electron main-process IPC. It sends a normalized PNG to BRIA and applies the returned PNG alpha matte to the existing cleanup pipeline. The Settings panel can preserve existing source alpha or ask BRIA to rebuild the alpha from the image content. It avoids the local ONNX/WebGPU memory issues seen with RMBG-2.0 in the browser, but edge quality has been inconsistent on AlphaKiller artwork.
 
-Both paths output a single-channel mask that is composed into the current source alpha before the existing cleanup pipeline runs. The "High-quality edges" matting-refinement toggle is disabled for now because the tested ViTMatte repositories expose PyTorch weights but no browser-ready ONNX assets. BEN2 is WebGPU-only in AlphaKiller because its CPU path exceeded the app watchdog in local testing. RMBG-2.0, BiRefNet_HR, and full BiRefNet remain future targets because their currently tested browser/ONNX paths fail runtime or memory checks in Electron.
+The local paths output a single-channel mask that is composed into the current source alpha before the existing cleanup pipeline runs. The hosted BRIA path returns a PNG with alpha and replaces the current source image before the cleanup pipeline runs. The "High-quality edges" matting-refinement toggle is disabled for now because the tested ViTMatte repositories expose PyTorch weights but no browser-ready ONNX assets. BEN2 is WebGPU-only in AlphaKiller because its CPU path exceeded the app watchdog in local testing. Local RMBG-2.0, BiRefNet_HR, and full BiRefNet remain future targets because their currently tested browser/ONNX paths fail runtime or memory checks in Electron.
 
 Build note: Vite worker output is configured as ES modules in `vite.config.js` because Transformers.js and ONNX Runtime Web code-split inside the worker.
 
@@ -187,6 +188,13 @@ npm run diagnose:hf
 HF_MODEL_ID=briaai/RMBG-2.0 HF_TOKEN=your_hugging_face_read_token npm run diagnose:hf
 ```
 
+Hosted RMBG-2.0 API smoke:
+
+```text
+BRIA_API_TOKEN=your_bria_api_token npm run diagnose:rmbg2:api
+BRIA_API_TOKEN=your_bria_api_token BRIA_PRESERVE_ALPHA=false npm run diagnose:rmbg2:api
+```
+
 Size benchmark harness:
 
 ```text
@@ -201,8 +209,14 @@ Recent local smoke checks:
 
 ```text
 ALPHAKILLER_BG_MODEL=rmbg-1.4 npm run diagnose:bg-remove
-Background removal smoke passed in 13.2s
+Background removal smoke passed in 9.0s
 
 ALPHAKILLER_BG_MODEL=ben2 BG_REMOVE_SMOKE_SIZE=256 npm run diagnose:bg-remove
 Background removal smoke passed in 25.5s
+
+BRIA_API_TOKEN=... npm run diagnose:rmbg2:api
+BRIA RMBG-2.0 API smoke passed in 3.6s
+
+ALPHAKILLER_BG_MODEL=bria-api BRIA_API_TOKEN=... npm run diagnose:bg-remove
+Background removal smoke passed in 10.0s
 ```

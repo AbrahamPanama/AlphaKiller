@@ -9,7 +9,7 @@ bridge.
 - `contextIsolation` is enabled.
 - `nodeIntegration` is disabled.
 - The preload bridge exposes only theme lookup, optional Hugging Face token
-  lookup, and PNG export.
+  lookup, main-process background-removal IPC, and native PNG/TIFF export.
 - IPC handlers validate their caller and payload shape before handling requests.
 - WebGPU is enabled because background removal depends on ONNX Runtime Web.
 
@@ -22,6 +22,16 @@ development convenience, not a production credential strategy.
 
 Do not commit tokens, screenshots containing tokens, exported browser profiles,
 or cache folders containing private model artifacts.
+
+## BRIA API tokens
+
+Hosted RMBG-2.0 uses `BRIA_API_TOKEN` or `ALPHAKILLER_BRIA_API_TOKEN` from the
+Electron main-process environment. The renderer sends PNG bytes over IPC and
+does not receive the environment token. The Settings panel also supports a
+local BRIA token override for development; that token is stored in the browser
+profile and sent to the main process only for BRIA requests. Prefer environment
+tokens for production-style runs. Do not store BRIA tokens in source files,
+screenshots, logs, or packaged renderer assets.
 
 ## Reporting issues
 

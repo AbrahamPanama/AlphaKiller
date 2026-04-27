@@ -1,6 +1,6 @@
 {
   "name": "alphakiller",
-  "version": "0.1.0",
+  "version": "0.1.0-beta.0",
   "description": "Desktop image cleanup tool for transparent pixel and anti-aliasing artifacts.",
   "main": "electron/main.js",
   "type": "module",
@@ -11,10 +11,36 @@
     "diagnose:perf": "node scripts/perf-benchmark.mjs",
     "diagnose:hf": "node scripts/hf-access-check.mjs",
     "diagnose:bg-remove": "node scripts/bg-remove-smoke.mjs",
+    "diagnose:rmbg2:api": "node scripts/rmbg2-api-smoke.mjs",
     "benchmark:bg-remove": "node scripts/bg-remove-benchmark.mjs",
     "build": "vite build",
+    "dist:win": "npm run build && electron-builder --win portable --x64",
     "preview": "vite preview --host 127.0.0.1",
     "electron": "electron ."
+  },
+  "build": {
+    "appId": "com.alphakiller.app",
+    "productName": "AlphaKiller",
+    "asar": false,
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**",
+      "electron/**",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "AlphaKiller-${version}-${arch}.${ext}"
+    }
   },
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
@@ -28,6 +54,7 @@
   "devDependencies": {
     "concurrently": "^9.2.1",
     "electron": "^39.2.4",
+    "electron-builder": "^26.8.1",
     "playwright-core": "^1.59.1",
     "wait-on": "^9.0.1"
   }
