@@ -4,16 +4,21 @@ import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
 import { randomUUID } from "node:crypto";
 import { removeBackground } from "./backgroundRemoval/index.js";
+import { superScaleImage } from "./imageEnhancement/index.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isDev = !app.isPackaged;
 const devServerUrl = process.env.ALPHAKILLER_DEV_URL || "http://127.0.0.1:5173";
+const windowsIconPath = path.join(__dirname, "../build/icon.ico");
 
 let mainWindow;
 const pendingExportTargets = new Map();
 
 app.commandLine.appendSwitch("enable-features", "Vulkan,WebGPU");
 app.commandLine.appendSwitch("enable-unsafe-webgpu");
+if (process.platform === "win32") {
+  app.setAppUserModelId("com.alphakiller.app");
+}
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -21,7 +26,8 @@ function createWindow() {
     height: 900,
     minWidth: 1040,
     minHeight: 680,
-    title: "AlphaKiller 0.1 beta",
+    title: "AlphaKiller 0.1 beta 1",
+    icon: process.platform === "win32" ? windowsIconPath : undefined,
     backgroundColor: "#0d0e10",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
     trafficLightPosition: { x: 14, y: 13 },
@@ -76,28 +82,7 @@ ipcMain.handle("app:get-huggingface-token", (event) => {
     "";
 });
 
-ipcMain.handle("image:save-png", async (event, payload) => {
-  assertTrustedSender(event);
-  if (!payload || !isBytePayload(payload.bytes)) {
-    throw new Error("Invalid PNG export payload");
-  }
-
-  const { bytes, defaultPath } = payload;
-  const result = await dialog.showSaveDialog(mainWindow, {
-    title: "Export cleaned PNG",
-    defaultPath: typeof defaultPath === "string" ? defaultPath : "image-cleaned.png",
-    filters: [{ name: "PNG Image", extensions: ["png"] }]
-  });
-
-  if (result.canceled || !result.filePath) {
-    return { canceled: true };
-  }
-
-  await fs.writeFile(result.filePath, bufferFromBytePayload(bytes));
-  return { canceled: false, filePath: result.filePath };
-});
-
-ipcMain.handle("image:choose-export-target", async (event, payload) => {
+ipcMain.handle("app:choose-export-target", async (event, payload) => {
   assertTrustedSender(event);
   const defaultFormat = normalizeExportFormat(payload?.defaultFormat);
   const fallbackName = `image-cleaned.${defaultFormat === "tiff" ? "tiff" : "png"}`;
@@ -124,7 +109,7 @@ ipcMain.handle("image:choose-export-target", async (event, payload) => {
   return { canceled: false, exportId, filePath, format };
 });
 
-ipcMain.handle("image:write-export", async (event, payload) => {
+ipcMain.handle("app:write-export", async (event, payload) => {
   assertTrustedSender(event);
   const exportId = typeof payload?.exportId === "string" ? payload.exportId : "";
   const target = pendingExportTargets.get(exportId);
@@ -152,6 +137,23 @@ ipcMain.handle("background-removal:run", async (event, payload) => {
   return removeBackground({
     provider,
     pngBytes,
+    preserveAlpha: preserveAlpha !== false,
+    apiToken: typeof apiToken === "string" ? apiToken.trim() : ""
+  });
+});
+
+ipcMain.handle("super-scale:run", async (event, payload) => {
+  assertTrustedSender(event);
+
+  const { provider, pngBytes, scale, preserveAlpha, apiToken } = payload || {};
+  if (!(pngBytes instanceof ArrayBuffer) && !ArrayBuffer.isView(pngBytes)) {
+    throw new Error("super-scale:run expected pngBytes ArrayBuffer.");
+  }
+
+  return superScaleImage({
+    provider,
+    pngBytes,
+    scale,
     preserveAlpha: preserveAlpha !== false,
     apiToken: typeof apiToken === "string" ? apiToken.trim() : ""
   });

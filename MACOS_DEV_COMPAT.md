@@ -91,6 +91,15 @@ Build a macOS DMG:
 npm run dist:mac
 ```
 
+By policy, the default macOS build targets Apple Silicon (`arm64`). Windows x86
+compatibility is handled by the Windows build scripts, not the macOS build.
+
+For an explicit Apple Silicon test build:
+
+```bash
+npm run dist:mac:arm64
+```
+
 The current beta uses Electron's default app icon. A custom macOS `.icns` icon
 can be added later under the electron-builder `mac.icon` setting.
 
@@ -102,11 +111,31 @@ The repo includes:
 npm run dist:win
 ```
 
-On macOS this can produce an unsigned portable Windows executable through
-electron-builder's cross-build helpers, but the more reliable Windows release
+By policy, the default Windows build produces both:
+
+- `x64` for modern 64-bit Windows.
+- `ia32` for 32-bit x86 Windows compatibility.
+
+For single-architecture test builds:
+
+```bash
+npm run dist:win:x64
+npm run dist:win:ia32
+```
+
+On macOS this can produce unsigned Windows NSIS installers through
+electron-builder's cross-build helpers, but the most reliable Windows release
 path is to build on a Windows machine or a `windows-latest` GitHub Actions
 runner. The included `install-windows.bat` is intended to be run on Windows from
-inside a clean clone.
+inside a clean clone and launches the matching installer for that machine.
+Portable Windows executables are still available with:
+
+```bash
+npm run dist:win:portable
+```
+
+Use portable builds only when a no-install executable is specifically needed.
+They can launch slowly because the app has to unpack itself before running.
 
 Unsigned Windows builds can trigger SmartScreen. That is expected until the app
 has code-signing certificates and a formal release pipeline.

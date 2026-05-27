@@ -15,6 +15,7 @@ import {
   Layers,
   Maximize,
   Moon,
+  Paintbrush,
   Pipette,
   RefreshCcw,
   Save,
@@ -27,6 +28,7 @@ import {
   Redo2,
   Undo2,
   Wand2,
+  X,
   ZoomIn,
   ZoomOut
 } from "lucide-react";
@@ -48,7 +50,7 @@ const DEFAULT_SETTINGS = {
   hardening: { enabled: false, strength: 55, midpoint: 50 }
 };
 
-const APP_VERSION_LABEL = "0.1 beta";
+const APP_VERSION_LABEL = "0.1 beta 1";
 
 const PRESETS = [
   {
@@ -108,6 +110,7 @@ const MAX_BRUSH_SIZE = 128;
 const HISTORY_LIMIT = 30;
 const PROCESSING_DEBOUNCE_MS = 80;
 const BG_REMOVE_TIMEOUT_MS = 180000;
+const SUPER_SCALE_TIMEOUT_MS = 180000;
 const BG_REMOVE_EMPTY_MASK_LIMIT = 0.02;
 const BG_REMOVE_MODEL_KEY = "alphakiller:bg-remove-model";
 const BG_REMOVE_REFINE_KEY = "alphakiller:bg-remove-refine-default";
@@ -117,6 +120,27 @@ const HF_TOKEN_KEY = "alphakiller:hf-token";
 const CUSTOM_PRESETS_KEY = "alphakiller:custom-presets";
 const BG_REMOVE_REFINE_AVAILABLE = false;
 const checkerPatternCache = new WeakMap();
+
+const DEFAULT_COMPARE_BEFORE = {
+  bgr: false,
+  alpha: false,
+  manual: false,
+  ss: false
+};
+
+const DEFAULT_COMPARE_AFTER = {
+  bgr: true,
+  alpha: true,
+  manual: true,
+  ss: false
+};
+
+const COMPARE_FEATURES = [
+  { id: "bgr", label: "BGR", title: "Background removal" },
+  { id: "alpha", label: "Alpha", title: "Defringe, color bleed, threshold, and hardening" },
+  { id: "manual", label: "Manual", title: "Delete and Reconstruct pen edits" },
+  { id: "ss", label: "SS", title: "Super Scale" }
+];
 
 const BG_REMOVE_MODELS = {
   "rmbg-1.4": {
@@ -152,6 +176,8 @@ const BG_REMOVE_LABELS = {
   error: "Background removal failed"
 };
 
+const BRUSH_TOOLS = new Set(["delete", "restore"]);
+
 export function App() {
   const fileInputRef = useRef(null);
   const canvasRef = useRef(null);
@@ -182,7 +208,15 @@ export function App() {
   const activeBgRemoveJobRef = useRef(null);
   const pendingBgRemoveJobRef = useRef(null);
   const bgRemoveTimeoutRef = useRef(null);
+  const superScaleTimeoutRef = useRef(null);
+  const superScaleJobIdRef = useRef(0);
+  const latestSuperScaleRequestRef = useRef(0);
   const preSegmentationOriginalRef = useRef(null);
+  const importedOriginalImageRef = useRef(null);
+  const backgroundRemovedImageRef = useRef(null);
+  const preSuperScaleOriginalRef = useRef(null);
+  const preSuperScaleProcessedRef = useRef(null);
+  const superScaledImageRef = useRef(null);
   const bgRemoveNoticeShownRef = useRef(new Set());
   const historyRef = useRef({ undo: [], redo: [] });
   const settingsUndoGroupRef = useRef(null);
@@ -215,17 +249,48 @@ export function App() {
   const [bgRemoveModel, setBgRemoveModel] = useState(loadPersistedBgRemoveModel);
   const [bgRemoveRefine, setBgRemoveRefine] = useState(loadPersistedBgRemoveRefine);
   const [briaPreserveAlpha, setBriaPreserveAlpha] = useState(loadPersistedBriaPreserveAlpha);
+  const [superScaleDialogOpen, setSuperScaleDialogOpen] = useState(false);
+  const [superScaleFactor, setSuperScaleFactor] = useState(2);
+  const [superScaleKeepPrintSize, setSuperScaleKeepPrintSize] = useState(true);
+  const [superScaleStatus, setSuperScaleStatus] = useState("idle");
+  const [superScaleProgress, setSuperScaleProgress] = useState(0);
+  const [hasBackgroundRemovedStage, setHasBackgroundRemovedStage] = useState(false);
+  const [hasSuperScaleStage, setHasSuperScaleStage] = useState(false);
+  const [compareBeforeLayers, setCompareBeforeLayers] = useState(DEFAULT_COMPARE_BEFORE);
+  const [compareAfterLayers, setCompareAfterLayers] = useState(DEFAULT_COMPARE_AFTER);
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
   const [hasWebGpu] = useState(() => Boolean(window.navigator?.gpu));
   const [hasElectronBackgroundRemoval] = useState(() => Boolean(window.alphaKiller?.removeBackground));
+  const [hasElectronSuperScale] = useState(() => Boolean(window.alphaKiller?.superScale));
   const [hasPreSegmentationOriginal, setHasPreSegmentationOriginal] = useState(false);
   const [hfTokenDialogOpen, setHfTokenDialogOpen] = useState(false);
   const [hfTokenDraft, setHfTokenDraft] = useState("");
   const [historyVersion, setHistoryVersion] = useState(0);
 
   const isBackgroundRemoving = bgRemoveStatus === "downloading" || bgRemoveStatus === "warming" || bgRemoveStatus === "inferring";
+  const isSuperScaling = superScaleStatus === "running";
   const canUndo = historyVersion >= 0 && historyRef.current.undo.length > 0;
   const canRedo = historyVersion >= 0 && historyRef.current.redo.length > 0;
+  const reconstructionSource = preSegmentationOriginalRef.current;
+  const canReconstruct = Boolean(
+    hasPreSegmentationOriginal &&
+    reconstructionSource &&
+    originalImageData &&
+    reconstructionSource.width === originalImageData.width &&
+    reconstructionSource.height === originalImageData.height
+  );
+  const isBrushTool = BRUSH_TOOLS.has(canvasTool);
+  const compareFeatureAvailability = {
+    bgr: hasBackgroundRemovedStage,
+    alpha: Boolean(processedImageData),
+    manual: Boolean(originalImageData),
+    ss: hasSuperScaleStage
+  };
+  const superScaleOutputWidth = source ? source.width * superScaleFactor : 0;
+  const superScaleOutputHeight = source ? source.height * superScaleFactor : 0;
+  const superScaleOutputResolution = superScaleKeepPrintSize
+    ? scaleResolution(source?.resolution, superScaleFactor)
+    : source?.resolution;
   const allPresets = [...PRESETS, ...customPresets];
   const selectedPreset = allPresets.find((item) => item.id === preset);
   const selectedCustomPreset = customPresets.find((item) => item.id === preset);
@@ -240,7 +305,16 @@ export function App() {
     cancelBackgroundRemoval();
     resetImageHistory();
     preSegmentationOriginalRef.current = null;
+    importedOriginalImageRef.current = null;
+    backgroundRemovedImageRef.current = null;
+    preSuperScaleOriginalRef.current = null;
+    preSuperScaleProcessedRef.current = null;
+    superScaledImageRef.current = null;
     setHasPreSegmentationOriginal(false);
+    setHasBackgroundRemovedStage(false);
+    setHasSuperScaleStage(false);
+    setCompareBeforeLayers(DEFAULT_COMPARE_BEFORE);
+    setCompareAfterLayers(DEFAULT_COMPARE_AFTER);
     if (isTiffFile(file)) {
       try {
         const { imageData, previewUrl, resolution } = await decodeTiffFile(file);
@@ -260,6 +334,7 @@ export function App() {
         }
         setOriginalImageData(imageData);
         setProcessedImageData(imageData);
+        importedOriginalImageRef.current = cloneImageData(imageData);
         setStats(null);
         setZoom(imageData.width < 300 ? 3 : 1);
         setPan({ x: 0, y: 0 });
@@ -304,6 +379,7 @@ export function App() {
       });
       setOriginalImageData(imageData);
       setProcessedImageData(imageData);
+      importedOriginalImageRef.current = cloneImageData(imageData);
       setStats(null);
       setZoom(canvas.width < 300 ? 3 : 1);
       setPan({ x: 0, y: 0 });
@@ -474,6 +550,8 @@ export function App() {
         preSegmentationOriginalRef.current = cloneImageData(activeJob.imageData);
         setHasPreSegmentationOriginal(true);
       }
+      backgroundRemovedImageRef.current = cloneImageData(nextImageData);
+      setHasBackgroundRemovedStage(true);
 
       commitDocumentImageEdit(nextImageData, {
         undoFrom: activeJob.visibleBefore,
@@ -645,6 +723,8 @@ export function App() {
         preSegmentationOriginalRef.current = cloneImageData(job.imageData);
         setHasPreSegmentationOriginal(true);
       }
+      backgroundRemovedImageRef.current = cloneImageData(nextImageData);
+      setHasBackgroundRemovedStage(true);
 
       if (sourceObjectUrlRef.current) {
         URL.revokeObjectURL(sourceObjectUrlRef.current);
@@ -671,6 +751,96 @@ export function App() {
       clearBgRemoveTimeout();
       activeBgRemoveJobRef.current = null;
       finishBgRemoveError(error?.message || "BRIA API background removal failed.");
+    }
+  }
+
+  async function runBriaSuperScale() {
+    if (!originalImageData || isSuperScaling) return;
+    if (!hasElectronSuperScale) {
+      setToast({
+        type: "warning",
+        title: "Electron required",
+        message: "BRIA Super Scale runs through Electron so the API token stays out of the browser."
+      });
+      return;
+    }
+
+    const requestId = ++latestSuperScaleRequestRef.current;
+    const id = ++superScaleJobIdRef.current;
+    const inputImageData = cloneImageData(originalImageData);
+    const beforeProcessed = processedImageData ? cloneImageData(processedImageData) : cloneImageData(originalImageData);
+    const nextResolution = superScaleKeepPrintSize
+      ? scaleResolution(source?.resolution, superScaleFactor)
+      : cloneResolution(source?.resolution);
+
+    setSuperScaleDialogOpen(false);
+    setSuperScaleStatus("running");
+    setSuperScaleProgress(0.08);
+    setStatus("Super scaling");
+    clearSuperScaleTimeout();
+    superScaleTimeoutRef.current = window.setTimeout(() => {
+      if (requestId !== latestSuperScaleRequestRef.current) return;
+      latestSuperScaleRequestRef.current += 1;
+      setSuperScaleStatus("idle");
+      setSuperScaleProgress(0);
+      setStatus("Ready");
+      setToast({
+        type: "error",
+        title: "Super Scale failed",
+        message: "BRIA Super Scale took too long. Try a smaller image or 2x."
+      });
+    }, SUPER_SCALE_TIMEOUT_MS);
+
+    try {
+      const pngBytes = await imageDataToPngArrayBuffer(inputImageData, source?.resolution);
+      if (requestId !== latestSuperScaleRequestRef.current) return;
+      setSuperScaleProgress(0.3);
+
+      const result = await window.alphaKiller.superScale({
+        provider: "bria-api",
+        pngBytes,
+        scale: superScaleFactor,
+        preserveAlpha: true,
+        apiToken: loadStoredBriaToken()
+      });
+      if (requestId !== latestSuperScaleRequestRef.current) return;
+      setSuperScaleProgress(0.82);
+
+      const nextImageData = await pngArrayBufferToImageData(result.pngBytes);
+      if (requestId !== latestSuperScaleRequestRef.current) return;
+
+      clearSuperScaleTimeout();
+      preSuperScaleOriginalRef.current = inputImageData;
+      preSuperScaleProcessedRef.current = beforeProcessed;
+      superScaledImageRef.current = cloneImageData(nextImageData);
+      setHasSuperScaleStage(true);
+      setCompareBeforeLayers({ ...DEFAULT_COMPARE_AFTER, ss: false });
+      setCompareAfterLayers({ ...DEFAULT_COMPARE_AFTER, ss: true });
+
+      commitDocumentImageEdit(nextImageData, {
+        undoFrom: inputImageData,
+        statusText: "Super scaled",
+        resolution: nextResolution
+      });
+      setSuperScaleStatus("idle");
+      setSuperScaleProgress(0);
+      const dpiLabel = nextResolution ? `, ${formatResolution(nextResolution)}` : "";
+      setToast({
+        type: "success",
+        title: "Super Scale complete",
+        message: `BRIA ${result.scale || superScaleFactor}x returned ${nextImageData.width} x ${nextImageData.height}${dpiLabel} in ${((result.durationMs || 0) / 1000).toFixed(1)}s${result.requestId ? ` (request ${result.requestId})` : ""}.`
+      });
+    } catch (error) {
+      if (requestId !== latestSuperScaleRequestRef.current) return;
+      clearSuperScaleTimeout();
+      setSuperScaleStatus("idle");
+      setSuperScaleProgress(0);
+      setStatus("Ready");
+      setToast({
+        type: "error",
+        title: "Super Scale failed",
+        message: getSuperScaleErrorMessage(error?.message)
+      });
     }
   }
 
@@ -864,6 +1034,12 @@ export function App() {
     bgRemoveTimeoutRef.current = null;
   }
 
+  function clearSuperScaleTimeout() {
+    if (!superScaleTimeoutRef.current) return;
+    window.clearTimeout(superScaleTimeoutRef.current);
+    superScaleTimeoutRef.current = null;
+  }
+
   function resetImageHistory() {
     clearSettingsUndoGroup();
     historyRef.current = { undo: [], redo: [] };
@@ -873,6 +1049,7 @@ export function App() {
   function makeHistorySnapshot({ imageData = originalImageData, includeImage = false } = {}) {
     return {
       imageData: includeImage && imageData ? cloneImageData(imageData) : null,
+      resolution: cloneResolution(source?.resolution),
       settings: structuredClone(settings),
       preset
     };
@@ -917,7 +1094,8 @@ export function App() {
     }, 700);
   }
 
-  function replaceDocumentImage(imageData, statusText = "Ready") {
+  function replaceDocumentImage(imageData, statusText = "Ready", options = {}) {
+    const nextResolution = options.resolution === undefined ? source?.resolution : options.resolution;
     if (sourceObjectUrlRef.current) {
       URL.revokeObjectURL(sourceObjectUrlRef.current);
       sourceObjectUrlRef.current = null;
@@ -930,20 +1108,21 @@ export function App() {
       ...current,
       width: imageData.width,
       height: imageData.height,
+      resolution: cloneResolution(nextResolution),
       url: imageDataToObjectUrl(imageData)
     } : current);
     setStatus(statusText);
   }
 
-  function commitDocumentImageEdit(imageData, { undoFrom = originalImageData, statusText = "Ready" } = {}) {
+  function commitDocumentImageEdit(imageData, { undoFrom = originalImageData, statusText = "Ready", resolution } = {}) {
     clearSettingsUndoGroup();
     pushUndoSnapshot(makeHistorySnapshot({ imageData: undoFrom, includeImage: true }));
-    replaceDocumentImage(imageData, statusText);
+    replaceDocumentImage(imageData, statusText, { resolution });
   }
 
   function applyHistorySnapshot(snapshot, statusText) {
     if (snapshot.imageData) {
-      replaceDocumentImage(cloneImageData(snapshot.imageData), statusText);
+      replaceDocumentImage(cloneImageData(snapshot.imageData), statusText, { resolution: snapshot.resolution });
     } else {
       setStatus(statusText);
     }
@@ -1000,6 +1179,7 @@ export function App() {
       sourceObjectUrlRef.current = null;
     }
     clearBgRemoveTimeout();
+    clearSuperScaleTimeout();
     processingWorkerRef.current?.terminate();
     bgRemoveWorkerRef.current?.terminate();
   }, []);
@@ -1009,6 +1189,38 @@ export function App() {
     const id = window.setTimeout(() => setToast(null), 3600);
     return () => window.clearTimeout(id);
   }, [toast]);
+
+  useEffect(() => {
+    if (canvasTool === "restore" && !canReconstruct) {
+      setCanvasTool("pan");
+    }
+  }, [canvasTool, canReconstruct]);
+
+  function updateCompareLayer(side, feature, value) {
+    const setter = side === "before" ? setCompareBeforeLayers : setCompareAfterLayers;
+    setter((current) => ({
+      ...current,
+      [feature]: value
+    }));
+  }
+
+  function resolveComparisonImage(layers) {
+    if (!originalImageData || !processedImageData) return null;
+
+    const usePreSuperScale = hasSuperScaleStage && !layers.ss;
+    const currentOriginal = usePreSuperScale && preSuperScaleOriginalRef.current
+      ? preSuperScaleOriginalRef.current
+      : originalImageData;
+    const currentProcessed = usePreSuperScale && preSuperScaleProcessedRef.current
+      ? preSuperScaleProcessedRef.current
+      : processedImageData;
+
+    if (layers.alpha) return currentProcessed;
+    if (layers.manual) return currentOriginal;
+    if (layers.bgr && backgroundRemovedImageRef.current) return backgroundRemovedImageRef.current;
+    if (layers.ss && superScaledImageRef.current) return superScaledImageRef.current;
+    return importedOriginalImageRef.current || preSegmentationOriginalRef.current || currentOriginal;
+  }
 
   const renderCanvas = useCallback(() => {
     const canvas = canvasRef.current;
@@ -1032,32 +1244,35 @@ export function App() {
       return;
     }
 
-    const frame = getImageFrame(source, zoom, pan, rect.width, rect.height);
+    const beforeImageData = resolveComparisonImage(compareBeforeLayers) || originalImageData;
+    const afterImageData = resolveComparisonImage(compareAfterLayers) || processedImageData;
+    const frameImageData = afterImageData || processedImageData;
+    const frame = getImageFrame(frameImageData, zoom, pan, rect.width, rect.height);
     const { x, y, width: displayWidth, height: displayHeight } = frame;
 
-    const originalCanvas = imageDataToCachedCanvas(originalImageData, originalCanvasCacheRef, originalCanvasRef);
-    const processedCanvas = imageDataToCachedCanvas(processedImageData, processedCanvasCacheRef, processedCanvasRef);
+    const beforeCanvas = imageDataToCachedCanvas(beforeImageData, originalCanvasCacheRef, originalCanvasRef);
+    const afterCanvas = imageDataToCachedCanvas(afterImageData, processedCanvasCacheRef, processedCanvasRef);
 
     ctx.imageSmoothingEnabled = zoom < 3;
     if (compareMode === "before") {
-      ctx.drawImage(originalCanvas, x, y, displayWidth, displayHeight);
+      ctx.drawImage(beforeCanvas, x, y, displayWidth, displayHeight);
     } else if (compareMode === "mask") {
-      drawAlphaMask(ctx, processedImageData, x, y, displayWidth, displayHeight, maskCanvasCacheRef, maskCanvasRef);
+      drawAlphaMask(ctx, afterImageData, x, y, displayWidth, displayHeight, maskCanvasCacheRef, maskCanvasRef);
     } else if (compareMode === "diff") {
-      drawDifference(ctx, originalImageData, processedImageData, x, y, displayWidth, displayHeight, diffCanvasCacheRef, diffCanvasRef);
+      drawDifference(ctx, beforeImageData, afterImageData, x, y, displayWidth, displayHeight, diffCanvasCacheRef, diffCanvasRef);
     } else if (compareMode === "split") {
       const cut = x + displayWidth * (split / 100);
       ctx.save();
       ctx.beginPath();
       ctx.rect(x, y, cut - x, displayHeight);
       ctx.clip();
-      ctx.drawImage(originalCanvas, x, y, displayWidth, displayHeight);
+      ctx.drawImage(beforeCanvas, x, y, displayWidth, displayHeight);
       ctx.restore();
       ctx.save();
       ctx.beginPath();
       ctx.rect(cut, y, x + displayWidth - cut, displayHeight);
       ctx.clip();
-      ctx.drawImage(processedCanvas, x, y, displayWidth, displayHeight);
+      ctx.drawImage(afterCanvas, x, y, displayWidth, displayHeight);
       ctx.restore();
       ctx.strokeStyle = "rgba(255,255,255,.85)";
       ctx.lineWidth = 1;
@@ -1069,16 +1284,23 @@ export function App() {
       drawBadge(ctx, "BEFORE", x + 10, y + 12);
       drawBadge(ctx, "AFTER", x + displayWidth - 66, y + 12);
     } else {
-      ctx.drawImage(processedCanvas, x, y, displayWidth, displayHeight);
+      ctx.drawImage(afterCanvas, x, y, displayWidth, displayHeight);
     }
 
     if (zoom >= 6) drawPixelGrid(ctx, x, y, displayWidth, displayHeight, zoom);
 
     const brushPoint = brushPointRef.current;
-    if (canvasTool === "delete" && brushPoint) {
-      drawBrushCursor(ctx, brushPoint.x, brushPoint.y, Math.max(3, (brushSize * zoom) / 2), canvasMode === "delete");
+    if (isBrushTool && brushPoint) {
+      drawBrushCursor(
+        ctx,
+        brushPoint.x,
+        brushPoint.y,
+        Math.max(3, (brushSize * zoom) / 2),
+        canvasMode === "delete" || canvasMode === "restore",
+        canvasTool
+      );
     }
-  }, [source, originalImageData, processedImageData, compareMode, split, zoom, pan, background, customBackground, canvasTool, brushSize, canvasMode]);
+  }, [source, originalImageData, processedImageData, compareMode, compareBeforeLayers, compareAfterLayers, split, zoom, pan, background, customBackground, canvasTool, brushSize, canvasMode, isBrushTool, hasSuperScaleStage]);
 
   useEffect(() => {
     renderCanvasRef.current = renderCanvas;
@@ -1271,6 +1493,42 @@ export function App() {
     scheduleCanvasRender();
   };
 
+  const reconstructAtCanvasPoint = (point, interaction) => {
+    const imagePoint = getImagePoint(point, interaction.frame, zoom);
+    if (!imagePoint) {
+      interaction.lastImagePoint = null;
+      return;
+    }
+
+    const from = interaction.lastImagePoint || imagePoint;
+    reconstructLinePixels(
+      interaction.draftData,
+      interaction.restoreSourceData,
+      interaction.width,
+      interaction.height,
+      from,
+      imagePoint,
+      interaction.brushSize
+    );
+    reconstructLineOnCanvas(
+      originalCanvasCacheRef.current?.canvas,
+      interaction.restoreSourceCanvas,
+      from,
+      imagePoint,
+      interaction.brushSize
+    );
+    reconstructLineOnCanvas(
+      processedCanvasCacheRef.current?.canvas,
+      interaction.restoreSourceCanvas,
+      from,
+      imagePoint,
+      interaction.brushSize
+    );
+    interaction.lastImagePoint = imagePoint;
+    interaction.changed = true;
+    scheduleCanvasRender();
+  };
+
   const zoomAtPoint = (nextZoom, point) => {
     const clampedZoom = clamp(nextZoom, MIN_ZOOM, MAX_ZOOM);
 
@@ -1354,7 +1612,10 @@ export function App() {
       point.y >= frame.y - SPLIT_HIT_RADIUS &&
       point.y <= frame.y + frame.height + SPLIT_HIT_RADIUS &&
       Math.abs(point.x - splitX) <= SPLIT_HIT_RADIUS;
-    const kind = overSplit ? "split" : event.button === 1 || canvasTool === "pan" ? "pan" : "delete";
+    const requestedBrushTool = canvasTool === "restore" && !canReconstruct ? "pan" : canvasTool;
+    const kind = overSplit ? "split" : event.button === 1 || requestedBrushTool === "pan" ? "pan" : requestedBrushTool;
+    const isBrushInteraction = BRUSH_TOOLS.has(kind);
+    const restoreSourceImageData = kind === "restore" ? preSegmentationOriginalRef.current : null;
 
     interactionRef.current = {
       kind,
@@ -1366,8 +1627,10 @@ export function App() {
       frame,
       width: originalImageData.width,
       height: originalImageData.height,
-      undoImageData: kind === "delete" ? cloneImageData(originalImageData) : null,
-      draftData: kind === "delete" ? new Uint8ClampedArray(originalImageData.data) : null,
+      undoImageData: isBrushInteraction ? cloneImageData(originalImageData) : null,
+      draftData: isBrushInteraction ? new Uint8ClampedArray(originalImageData.data) : null,
+      restoreSourceData: restoreSourceImageData?.data || null,
+      restoreSourceCanvas: restoreSourceImageData ? imageDataToCanvas(restoreSourceImageData) : null,
       lastImagePoint: null,
       changed: false,
       brushSize
@@ -1382,6 +1645,10 @@ export function App() {
       eraseAtCanvasPoint(point, interactionRef.current);
       updateCursorFromPoint(point);
       setStatus("Deleting pixels");
+    } else if (kind === "restore") {
+      reconstructAtCanvasPoint(point, interactionRef.current);
+      updateCursorFromPoint(point);
+      setStatus("Reconstructing pixels");
     }
 
     event.preventDefault();
@@ -1413,6 +1680,13 @@ export function App() {
       return;
     }
 
+    if (interaction?.kind === "restore") {
+      brushPointRef.current = point;
+      reconstructAtCanvasPoint(point, interaction);
+      updateCursorFromPoint(point);
+      return;
+    }
+
     if (source) {
       const rect = canvasRef.current.getBoundingClientRect();
       const frame = getImageFrame(source, zoom, pan, rect.width, rect.height);
@@ -1425,7 +1699,7 @@ export function App() {
     }
 
     brushPointRef.current = point;
-    if (canvasTool === "delete") {
+    if (isBrushTool) {
       scheduleCanvasRender();
     }
     updateCursorFromPoint(point);
@@ -1437,13 +1711,13 @@ export function App() {
     if (interactionRef.current && canvasRef.current?.hasPointerCapture?.(event.pointerId)) {
       canvasRef.current.releasePointerCapture(event.pointerId);
     }
-    if (interaction?.kind === "delete") {
+    if (interaction?.kind === "delete" || interaction?.kind === "restore") {
       if (interaction.changed) {
         commitDocumentImageEdit(
           new ImageData(new Uint8ClampedArray(interaction.draftData), interaction.width, interaction.height),
           {
             undoFrom: interaction.undoImageData,
-            statusText: "Delete Pen applied"
+            statusText: interaction.kind === "restore" ? "Reconstruct Pen applied" : "Delete Pen applied"
           }
         );
       } else {
@@ -1507,10 +1781,10 @@ export function App() {
           <Save size={16} />
         </button>
         <span className="divider" />
-        <button className="icon-button" title="Undo" aria-label="Undo" disabled={!canUndo || isBackgroundRemoving} onClick={undoImageEdit}>
+        <button className="icon-button" title="Undo" aria-label="Undo" disabled={!canUndo || isBackgroundRemoving || isSuperScaling} onClick={undoImageEdit}>
           <Undo2 size={16} />
         </button>
-        <button className="icon-button" title="Redo" aria-label="Redo" disabled={!canRedo || isBackgroundRemoving} onClick={redoImageEdit}>
+        <button className="icon-button" title="Redo" aria-label="Redo" disabled={!canRedo || isBackgroundRemoving || isSuperScaling} onClick={redoImageEdit}>
           <Redo2 size={16} />
         </button>
         <span className="divider" />
@@ -1534,7 +1808,16 @@ export function App() {
         <button className={`icon-button ${canvasTool === "delete" ? "active" : ""}`} title="Delete Pen" onClick={() => setCanvasTool("delete")}>
           <Eraser size={16} />
         </button>
-        <label className={`toolbar-slider ${canvasTool === "delete" ? "enabled" : ""}`}>
+        <button
+          className={`icon-button ${canvasTool === "restore" ? "active" : ""}`}
+          title={canReconstruct ? "Reconstruct Pen: paint back pixels from the original image" : "Run background removal before using Reconstruct Pen"}
+          aria-label="Reconstruct Pen"
+          disabled={!canReconstruct}
+          onClick={() => setCanvasTool("restore")}
+        >
+          <Paintbrush size={16} />
+        </button>
+        <label className={`toolbar-slider ${isBrushTool ? "enabled" : ""}`}>
           <span>Size</span>
           <input
             type="range"
@@ -1542,7 +1825,7 @@ export function App() {
             max={MAX_BRUSH_SIZE}
             value={brushSize}
             onChange={(event) => setBrushSize(Number(event.target.value))}
-            disabled={canvasTool !== "delete"}
+            disabled={!isBrushTool}
           />
           <output>{brushSize}px</output>
         </label>
@@ -1550,10 +1833,19 @@ export function App() {
           className="icon-button bg-remove-button"
           title="Remove Background"
           aria-label="Remove Background"
-          disabled={!originalImageData || isBackgroundRemoving}
+          disabled={!originalImageData || isBackgroundRemoving || isSuperScaling}
           onClick={runBackgroundRemoval}
         >
           <Sparkles size={16} />
+        </button>
+        <button
+          className="icon-button super-scale-button"
+          title="Super Scale"
+          aria-label="Super Scale"
+          disabled={!originalImageData || isBackgroundRemoving || isSuperScaling}
+          onClick={() => setSuperScaleDialogOpen(true)}
+        >
+          <Layers size={16} />
         </button>
         <label className={`hq-toggle ${bgRemoveRefine ? "enabled" : ""}`} title={BG_REMOVE_REFINE_AVAILABLE ? "High-quality edges" : "Edge refinement unavailable in the browser build"}>
           <input
@@ -1585,7 +1877,7 @@ export function App() {
         >
           <Settings size={16} />
         </button>
-        <button className="primary-button" disabled={!processedImageData} onClick={handleExport}>
+        <button className="primary-button" disabled={!processedImageData || isSuperScaling} onClick={handleExport}>
           <Download size={15} />
           Export
         </button>
@@ -1636,7 +1928,7 @@ export function App() {
           </div>
         </aside>
 
-        <section className={`canvas-shell ${source ? "has-image" : ""} ${canvasTool === "delete" ? "is-eraser" : ""} ${canvasMode === "pan" ? "is-panning" : ""} ${canvasMode === "split" ? "is-splitting" : ""} ${canvasMode === "delete" ? "is-deleting" : ""} ${canvasMode === "hover-split" ? "can-split" : ""}`}>
+        <section className={`canvas-shell ${source ? "has-image" : ""} ${canvasTool === "delete" ? "is-eraser" : ""} ${canvasTool === "restore" ? "is-reconstruct" : ""} ${canvasMode === "pan" ? "is-panning" : ""} ${canvasMode === "split" ? "is-splitting" : ""} ${canvasMode === "delete" ? "is-deleting" : ""} ${canvasMode === "restore" ? "is-restoring" : ""} ${canvasMode === "hover-split" ? "can-split" : ""}`}>
           {isBackgroundRemoving && (
             <div className="bg-remove-progress">
               <span>{BG_REMOVE_LABELS[bgRemoveStatus]}</span>
@@ -1644,32 +1936,55 @@ export function App() {
               <div><i style={{ width: `${Math.round(bgRemoveProgress * 100)}%` }} /></div>
             </div>
           )}
+          {isSuperScaling && (
+            <div className="bg-remove-progress">
+              <span>Super scaling with BRIA</span>
+              <strong>{Math.round(superScaleProgress * 100)}%</strong>
+              <div><i style={{ width: `${Math.round(superScaleProgress * 100)}%` }} /></div>
+            </div>
+          )}
           <div className="canvas-tools">
-            <div className="swatches" role="group" aria-label="Preview background">
-              {BACKGROUNDS.map((item) => (
-                <button
-                  key={item.id}
-                  className={`swatch ${item.id} ${background === item.id ? "active" : ""}`}
-                  title={item.label}
-                  onClick={() => setBackground(item.id)}
+            <div className="canvas-tools-left">
+              <div className="swatches" role="group" aria-label="Preview background">
+                {BACKGROUNDS.map((item) => (
+                  <button
+                    key={item.id}
+                    className={`swatch ${item.id} ${background === item.id ? "active" : ""}`}
+                    title={item.label}
+                    onClick={() => setBackground(item.id)}
+                  />
+                ))}
+                <input
+                  type="color"
+                  value={customBackground}
+                  onChange={(event) => {
+                    setCustomBackground(event.target.value);
+                    setBackground("custom");
+                  }}
+                  aria-label="Custom preview color"
                 />
-              ))}
-              <input
-                type="color"
-                value={customBackground}
-                onChange={(event) => {
-                  setCustomBackground(event.target.value);
-                  setBackground("custom");
-                }}
-                aria-label="Custom preview color"
+              </div>
+              {compareMode === "split" && (
+                <label className="split-control">
+                  <SplitSquareHorizontal size={14} />
+                  <input type="range" min="0" max="100" value={split} onChange={(event) => setSplit(Number(event.target.value))} />
+                </label>
+              )}
+            </div>
+            <div className="compare-layers" aria-label="Comparison feature layers">
+              <CompareLayerRow
+                label="Before"
+                layers={compareBeforeLayers}
+                availability={compareFeatureAvailability}
+                onChange={(feature, value) => updateCompareLayer("before", feature, value)}
+              />
+              <CompareLayerRow
+                label="After"
+                layers={compareAfterLayers}
+                availability={compareFeatureAvailability}
+                onChange={(feature, value) => updateCompareLayer("after", feature, value)}
               />
             </div>
-            {compareMode === "split" && (
-              <label className="split-control">
-                <SplitSquareHorizontal size={14} />
-                <input type="range" min="0" max="100" value={split} onChange={(event) => setSplit(Number(event.target.value))} />
-              </label>
-            )}
           </div>
           <canvas
             ref={canvasRef}
@@ -1771,8 +2086,8 @@ export function App() {
         <span>Zoom {Math.round(zoom * 100)}%</span>
         <span>{source ? `${source.width} x ${source.height}` : "No image"}</span>
         <span>{cursor ? `Alpha ${cursor.a}` : "Alpha -"}</span>
-        <span>{canvasTool === "delete" ? `Delete Pen ${brushSize}px` : "Pan tool"}</span>
-        <span>{isBackgroundRemoving ? `AI ${BG_REMOVE_LABELS[bgRemoveStatus]}${bgRemoveDevice === "cpu" ? " (CPU)" : bgRemoveDevice === "api" ? " (API)" : ""}` : `AI ${BG_REMOVE_MODELS[bgRemoveModel]?.shortLabel || "-"}`}</span>
+        <span>{canvasTool === "delete" ? `Delete Pen ${brushSize}px` : canvasTool === "restore" ? `Reconstruct Pen ${brushSize}px` : "Pan tool"}</span>
+        <span>{isSuperScaling ? `SS BRIA ${Math.round(superScaleProgress * 100)}%` : isBackgroundRemoving ? `AI ${BG_REMOVE_LABELS[bgRemoveStatus]}${bgRemoveDevice === "cpu" ? " (CPU)" : bgRemoveDevice === "api" ? " (API)" : ""}` : `AI ${BG_REMOVE_MODELS[bgRemoveModel]?.shortLabel || "-"}`}</span>
         <span>Bg {background}</span>
       </footer>
 
@@ -1793,6 +2108,63 @@ export function App() {
           onTokenSave={saveSettingsToken}
           onClose={() => setSettingsPanelOpen(false)}
         />
+      )}
+
+      {superScaleDialogOpen && (
+        <div className="modal-backdrop" role="presentation">
+          <form className="super-scale-dialog" onSubmit={(event) => {
+            event.preventDefault();
+            runBriaSuperScale();
+          }}>
+            <div className="dialog-title-row">
+              <strong>Super Scale</strong>
+              <button className="icon-button" type="button" aria-label="Close Super Scale" onClick={() => setSuperScaleDialogOpen(false)}>
+                <X size={15} />
+              </button>
+            </div>
+            <span>Upscale through BRIA Increase Resolution while keeping transparency. Print size stays unchanged when DPI is scaled with the pixels.</span>
+            <fieldset className="scale-options">
+              <legend>Scale</legend>
+              {[2, 4].map((factor) => (
+                <label key={factor} className={superScaleFactor === factor ? "selected" : ""}>
+                  <input
+                    type="radio"
+                    name="super-scale-factor"
+                    value={factor}
+                    checked={superScaleFactor === factor}
+                    onChange={() => setSuperScaleFactor(factor)}
+                  />
+                  <b>{factor}x</b>
+                  <small>{source ? `${source.width} x ${source.height} -> ${source.width * factor} x ${source.height * factor}` : "No image loaded"}</small>
+                </label>
+              ))}
+            </fieldset>
+            <label className="settings-check">
+              <input
+                type="checkbox"
+                checked={superScaleKeepPrintSize}
+                onChange={(event) => setSuperScaleKeepPrintSize(event.target.checked)}
+              />
+              <span>
+                <strong>Keep same print size</strong>
+                <small>Increase DPI by the same factor so the physical dimensions stay unchanged.</small>
+              </span>
+            </label>
+            <div className="scale-summary">
+              <span>Output</span>
+              <strong>{superScaleOutputWidth} x {superScaleOutputHeight}</strong>
+              <span>DPI</span>
+              <strong>{formatResolution(superScaleOutputResolution)}</strong>
+            </div>
+            {!hasElectronSuperScale && (
+              <p className="dialog-warning">Open the Electron app or restart it so the Super Scale IPC handler is available.</p>
+            )}
+            <div className="dialog-actions">
+              <button type="button" onClick={() => setSuperScaleDialogOpen(false)}>Cancel</button>
+              <button type="submit" className="primary-button" disabled={!source || isSuperScaling || !hasElectronSuperScale}>Run BRIA Super Scale</button>
+            </div>
+          </form>
+        </div>
       )}
 
       {toast && (
@@ -1867,6 +2239,28 @@ function Segmented({ value, onChange, options }) {
       {options.map(([id, label]) => (
         <button key={id} className={value === id ? "active" : ""} onClick={() => onChange(id)}>{label}</button>
       ))}
+    </div>
+  );
+}
+
+function CompareLayerRow({ label, layers, availability, onChange }) {
+  return (
+    <div className="compare-layer-row">
+      <span>{label}</span>
+      {COMPARE_FEATURES.map((feature) => {
+        const disabled = !availability[feature.id] && feature.id !== "alpha" && feature.id !== "manual";
+        return (
+          <label key={feature.id} title={feature.title} className={disabled ? "disabled" : ""}>
+            <input
+              type="checkbox"
+              checked={Boolean(layers[feature.id])}
+              disabled={disabled}
+              onChange={(event) => onChange(feature.id, event.target.checked)}
+            />
+            <b>{feature.label}</b>
+          </label>
+        );
+      })}
     </div>
   );
 }
@@ -2004,6 +2398,14 @@ function imageDataToCachedCanvas(imageData, cacheRef, fallbackRef) {
   return canvas;
 }
 
+function imageDataToCanvas(imageData) {
+  const canvas = document.createElement("canvas");
+  canvas.width = imageData.width;
+  canvas.height = imageData.height;
+  canvas.getContext("2d").putImageData(imageData, 0, 0);
+  return canvas;
+}
+
 function drawBackground(ctx, width, height, background, customBackground) {
   if (background === "checker") {
     ctx.fillStyle = getCheckerPattern(ctx);
@@ -2106,16 +2508,22 @@ function differenceToCachedCanvas(original, processed, cacheRef, fallbackRef) {
   const canvas = cache.canvas;
 
   if (cache.original !== original || cache.processed !== processed) {
-    if (canvas.width !== original.width || canvas.height !== original.height) {
-      canvas.width = original.width;
-      canvas.height = original.height;
+    const width = processed.width;
+    const height = processed.height;
+    const originalData = original.width === width && original.height === height
+      ? original
+      : resizeImageDataForComparison(original, width, height);
+
+    if (canvas.width !== width || canvas.height !== height) {
+      canvas.width = width;
+      canvas.height = height;
     }
-    const diff = new ImageData(original.width, original.height);
-    for (let i = 0; i < original.data.length; i += 4) {
-      const delta = Math.abs(original.data[i] - processed.data[i]) +
-        Math.abs(original.data[i + 1] - processed.data[i + 1]) +
-        Math.abs(original.data[i + 2] - processed.data[i + 2]) +
-        Math.abs(original.data[i + 3] - processed.data[i + 3]);
+    const diff = new ImageData(width, height);
+    for (let i = 0; i < processed.data.length; i += 4) {
+      const delta = Math.abs(originalData.data[i] - processed.data[i]) +
+        Math.abs(originalData.data[i + 1] - processed.data[i + 1]) +
+        Math.abs(originalData.data[i + 2] - processed.data[i + 2]) +
+        Math.abs(originalData.data[i + 3] - processed.data[i + 3]);
       diff.data[i] = Math.min(255, delta * 2);
       diff.data[i + 1] = delta > 0 ? 76 : 0;
       diff.data[i + 2] = delta > 0 ? 140 : 0;
@@ -2127,6 +2535,18 @@ function differenceToCachedCanvas(original, processed, cacheRef, fallbackRef) {
   }
 
   return canvas;
+}
+
+function resizeImageDataForComparison(imageData, width, height) {
+  const sourceCanvas = imageDataToCachedCanvas(imageData, { current: null });
+  const canvas = document.createElement("canvas");
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext("2d", { willReadFrequently: true });
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(sourceCanvas, 0, 0, width, height);
+  return ctx.getImageData(0, 0, width, height);
 }
 
 function drawBadge(ctx, text, x, y) {
@@ -2164,10 +2584,15 @@ function drawSplitHandle(ctx, x, y, height) {
   ctx.restore();
 }
 
-function drawBrushCursor(ctx, x, y, radius, active) {
+function drawBrushCursor(ctx, x, y, radius, active, tool = "delete") {
+  const restoring = tool === "restore";
   ctx.save();
-  ctx.strokeStyle = active ? "rgba(255, 107, 95, .96)" : "rgba(255, 255, 255, .9)";
-  ctx.fillStyle = active ? "rgba(255, 107, 95, .16)" : "rgba(10, 11, 13, .2)";
+  ctx.strokeStyle = active
+    ? restoring ? "rgba(95, 227, 142, .96)" : "rgba(255, 107, 95, .96)"
+    : "rgba(255, 255, 255, .9)";
+  ctx.fillStyle = active
+    ? restoring ? "rgba(95, 227, 142, .16)" : "rgba(255, 107, 95, .16)"
+    : "rgba(10, 11, 13, .2)";
   ctx.lineWidth = 1.5;
   ctx.setLineDash(active ? [] : [4, 4]);
   ctx.beginPath();
@@ -2275,6 +2700,29 @@ function getBgRemoveErrorMessage(message = "") {
     return "The cached background removal model appears to be invalid. Try clearing the app cache and retrying.";
   }
   return message || "Background removal failed.";
+}
+
+function getSuperScaleErrorMessage(message = "") {
+  const lower = String(message || "").toLowerCase();
+  if (lower.includes("no handler registered") || lower.includes("super-scale:run")) {
+    return "Electron needs to be restarted so the Super Scale IPC handler is registered.";
+  }
+  if (lower.includes("missing bria")) {
+    return "Missing BRIA_API_TOKEN. Add a BRIA token in Settings or launch Electron with BRIA_API_TOKEN set.";
+  }
+  if (lower.includes("401") || lower.includes("403") || lower.includes("token")) {
+    return "The BRIA API token was rejected. Check the token and account access.";
+  }
+  if (lower.includes("8192")) {
+    return "BRIA Super Scale supports output up to 8192 x 8192 pixels. Try 2x or start from a smaller image.";
+  }
+  if (lower.includes("rate limit") || lower.includes("429")) {
+    return "The BRIA API is rate limited. Wait a moment and try again.";
+  }
+  if (lower.includes("format") || lower.includes("415")) {
+    return "BRIA rejected the input image format. AlphaKiller expected a normalized PNG upload.";
+  }
+  return message || "Super Scale failed.";
 }
 
 async function getHuggingFaceToken() {
@@ -2424,6 +2872,20 @@ function cloneImageData(imageData) {
   return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
 }
 
+function cloneResolution(resolution) {
+  return resolution ? { ...resolution } : null;
+}
+
+function scaleResolution(resolution, factor) {
+  if (!resolution) return null;
+  return {
+    ...resolution,
+    xDpi: resolution.xDpi * factor,
+    yDpi: resolution.yDpi * factor,
+    source: resolution.source || "metadata"
+  };
+}
+
 function getCanvasPoint(event, canvas) {
   const rect = canvas.getBoundingClientRect();
   return {
@@ -2473,6 +2935,20 @@ function eraseLinePixels(data, width, height, from, to, brushSize) {
   }
 }
 
+function reconstructLinePixels(data, sourceData, width, height, from, to, brushSize) {
+  if (!sourceData || sourceData.length !== data.length) return;
+  const distance = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(distance / Math.max(1, brushSize / 3)));
+
+  for (let step = 0; step <= steps; step++) {
+    const t = step / steps;
+    reconstructCirclePixels(data, sourceData, width, height, {
+      x: from.x + (to.x - from.x) * t,
+      y: from.y + (to.y - from.y) * t
+    }, brushSize / 2);
+  }
+}
+
 function eraseLineOnCanvas(canvas, from, to, brushSize) {
   if (!canvas) return;
   const ctx = canvas.getContext("2d");
@@ -2493,6 +2969,27 @@ function eraseLineOnCanvas(canvas, from, to, brushSize) {
   ctx.restore();
 }
 
+function reconstructLineOnCanvas(canvas, sourceCanvas, from, to, brushSize) {
+  if (!canvas || !sourceCanvas || canvas.width !== sourceCanvas.width || canvas.height !== sourceCanvas.height) return;
+  const ctx = canvas.getContext("2d");
+  const radius = brushSize / 2;
+  const distance = Math.hypot(to.x - from.x, to.y - from.y);
+  const steps = Math.max(1, Math.ceil(distance / Math.max(1, brushSize / 3)));
+
+  ctx.save();
+  ctx.beginPath();
+  for (let step = 0; step <= steps; step++) {
+    const t = step / steps;
+    const x = from.x + (to.x - from.x) * t;
+    const y = from.y + (to.y - from.y) * t;
+    ctx.moveTo(x + radius, y);
+    ctx.arc(x, y, radius, 0, Math.PI * 2);
+  }
+  ctx.clip();
+  ctx.drawImage(sourceCanvas, 0, 0);
+  ctx.restore();
+}
+
 function eraseCirclePixels(data, width, height, center, radius) {
   const minX = Math.max(0, Math.floor(center.x - radius));
   const maxX = Math.min(width - 1, Math.ceil(center.x + radius));
@@ -2507,6 +3004,27 @@ function eraseCirclePixels(data, width, height, center, radius) {
       if (dx * dx + dy * dy > radiusSq) continue;
       const index = (y * width + x) * 4;
       data[index + 3] = 0;
+    }
+  }
+}
+
+function reconstructCirclePixels(data, sourceData, width, height, center, radius) {
+  const minX = Math.max(0, Math.floor(center.x - radius));
+  const maxX = Math.min(width - 1, Math.ceil(center.x + radius));
+  const minY = Math.max(0, Math.floor(center.y - radius));
+  const maxY = Math.min(height - 1, Math.ceil(center.y + radius));
+  const radiusSq = radius * radius;
+
+  for (let y = minY; y <= maxY; y++) {
+    for (let x = minX; x <= maxX; x++) {
+      const dx = x - center.x;
+      const dy = y - center.y;
+      if (dx * dx + dy * dy > radiusSq) continue;
+      const index = (y * width + x) * 4;
+      data[index] = sourceData[index];
+      data[index + 1] = sourceData[index + 1];
+      data[index + 2] = sourceData[index + 2];
+      data[index + 3] = sourceData[index + 3];
     }
   }
 }

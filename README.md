@@ -1,6 +1,6 @@
 # AlphaKiller
 
-Current version: **0.1 beta** (`0.1.0-beta.0`).
+Current version: **0.1 beta 1** (`0.1.0-beta.1`).
 
 AlphaKiller is an Electron image editor for cleaning transparent-pixel artifacts:
 anti-aliased edges, matte halos, and hidden RGB bleed around transparent pixels.
@@ -72,16 +72,22 @@ Build and install on Windows:
 install-windows.bat
 ```
 
-The batch file installs dependencies, builds a Windows portable executable,
-copies it to `%LOCALAPPDATA%\Programs\AlphaKiller\AlphaKiller.exe`, and creates
-Desktop and Start Menu shortcuts. If Node.js is missing, it can install Node.js
-LTS through `winget`.
+The batch file installs dependencies, builds Windows NSIS installers for both
+`x64` and `ia32` 32-bit x86, then launches the installer that matches the
+current machine. This is the recommended Windows path because the installed app
+launches directly instead of unpacking itself on every run like a portable EXE.
+If Node.js is missing, the batch file can install Node.js LTS through `winget`.
 
 Build a macOS DMG:
 
 ```bash
 npm run dist:mac
 ```
+
+The default macOS build targets Apple Silicon (`arm64`). Windows compatibility
+is handled separately by `npm run dist:win`, which produces both `x64` and
+`ia32` 32-bit x86 installers. Portable Windows executables are still available
+with `npm run dist:win:portable` for troubleshooting or no-install scenarios.
 
 For macOS-specific development and packaging notes, see
 [`MACOS_DEV_COMPAT.md`](./MACOS_DEV_COMPAT.md).

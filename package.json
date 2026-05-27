@@ -1,6 +1,6 @@
 {
   "name": "alphakiller",
-  "version": "0.1.0-beta.0",
+  "version": "0.1.0-beta.1",
   "description": "Desktop image cleanup tool for transparent pixel and anti-aliasing artifacts.",
   "main": "electron/main.js",
   "type": "module",
@@ -15,8 +15,12 @@
     "diagnose:rmbg2:api": "node scripts/rmbg2-api-smoke.mjs",
     "benchmark:bg-remove": "node scripts/bg-remove-benchmark.mjs",
     "build": "vite build",
-    "dist:mac": "npm run build && electron-builder --mac dmg",
-    "dist:win": "npm run build && electron-builder --win portable --x64",
+    "dist:mac": "npm run build && electron-builder --mac dmg --arm64",
+    "dist:mac:arm64": "npm run build && electron-builder --mac dmg --arm64",
+    "dist:win": "npm run build && electron-builder --win nsis --x64 --ia32",
+    "dist:win:x64": "npm run build && electron-builder --win nsis --x64",
+    "dist:win:ia32": "npm run build && electron-builder --win nsis --ia32",
+    "dist:win:portable": "npm run build && electron-builder --win portable --x64 --ia32",
     "preview": "vite preview --host 127.0.0.1",
     "electron": "electron ."
   },
@@ -24,28 +28,53 @@
     "appId": "com.alphakiller.app",
     "productName": "AlphaKiller",
     "asar": false,
+    "afterPack": "scripts/after-pack.cjs",
     "directories": {
+      "buildResources": "build",
       "output": "release"
     },
     "files": [
       "dist/**",
       "electron/**",
+      "build/icon.ico",
+      "build/icon.icns",
+      "!**/._*",
       "package.json"
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         {
-          "target": "portable",
+          "target": "nsis",
           "arch": [
-            "x64"
+            "x64",
+            "ia32"
           ]
         }
-      ],
+      ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "AlphaKiller",
+      "artifactName": "AlphaKiller-Setup-${version}-${arch}.${ext}"
+    },
+    "portable": {
       "artifactName": "AlphaKiller-${version}-${arch}.${ext}"
     },
     "mac": {
+      "icon": "build/icon.icns",
+      "identity": null,
       "target": [
-        "dmg"
+        {
+          "target": "dmg",
+          "arch": [
+            "arm64"
+          ]
+        }
       ],
       "category": "public.app-category.graphics-design",
       "artifactName": "AlphaKiller-${version}-${arch}.${ext}"

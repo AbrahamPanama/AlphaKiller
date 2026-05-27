@@ -1,18 +1,20 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-title AlphaKiller 0.1 beta Windows Installer
+title AlphaKiller 0.1 beta 1 Windows Installer
 
 set "APP_NAME=AlphaKiller"
-set "INSTALL_DIR=%LOCALAPPDATA%\Programs\AlphaKiller"
-set "INSTALL_EXE=%INSTALL_DIR%\AlphaKiller.exe"
-set "START_MENU_DIR=%APPDATA%\Microsoft\Windows\Start Menu\Programs\AlphaKiller"
-set "DESKTOP_SHORTCUT=%USERPROFILE%\Desktop\AlphaKiller.lnk"
-set "START_SHORTCUT=%START_MENU_DIR%\AlphaKiller.lnk"
+set "APP_VERSION=0.1.0-beta.1"
+set "TARGET_ARCH=ia32"
+
+if /I "%PROCESSOR_ARCHITECTURE%"=="AMD64" set "TARGET_ARCH=x64"
+if /I "%PROCESSOR_ARCHITEW6432%"=="AMD64" set "TARGET_ARCH=x64"
+if /I "%PROCESSOR_ARCHITECTURE%"=="ARM64" set "TARGET_ARCH=x64"
 
 echo.
-echo AlphaKiller 0.1 beta Windows installer
+echo AlphaKiller 0.1 beta 1 Windows installer
 echo ======================================
+echo Target architecture: %TARGET_ARCH%
 echo.
 
 cd /d "%~dp0"
@@ -91,59 +93,35 @@ if errorlevel 1 (
   exit /b 1
 )
 
-set "BUILT_EXE="
-for /f "delims=" %%F in ('dir /b /a:-d /o:-d "release\AlphaKiller-*.exe" 2^>nul') do (
-  set "BUILT_EXE=release\%%F"
-  goto :found_exe
-)
+set "INSTALLER_EXE=release\AlphaKiller-Setup-%APP_VERSION%-%TARGET_ARCH%.exe"
 
-:found_exe
-if not defined BUILT_EXE (
-  echo ERROR: Could not find release\AlphaKiller-*.exe after the build.
+if not exist "%INSTALLER_EXE%" (
+  echo ERROR: Could not find the %TARGET_ARCH% Windows installer:
+  echo %INSTALLER_EXE%
+  echo.
+  echo Files found in release:
+  dir /b "release\AlphaKiller-*.exe" 2>nul
   pause
   exit /b 1
 )
 
 echo.
-echo Installing to:
-echo %INSTALL_DIR%
+echo Launching the AlphaKiller installer:
+echo %INSTALLER_EXE%
+echo.
+echo This creates a normal Windows app install with Start Menu and Desktop
+echo shortcuts. It should launch much faster than the old portable EXE,
+echo which had to unpack itself on every run.
 echo.
 
-if not exist "%INSTALL_DIR%" mkdir "%INSTALL_DIR%"
+start "" /wait "%INSTALLER_EXE%"
 if errorlevel 1 (
-  echo ERROR: Could not create the install folder.
+  echo ERROR: AlphaKiller installer exited with an error.
   pause
   exit /b 1
 )
 
-copy /Y "%BUILT_EXE%" "%INSTALL_EXE%" >nul
-if errorlevel 1 (
-  echo ERROR: Could not copy AlphaKiller.exe into the install folder.
-  pause
-  exit /b 1
-)
-
-if not exist "%START_MENU_DIR%" mkdir "%START_MENU_DIR%"
-
-powershell -NoProfile -ExecutionPolicy Bypass -Command "$ErrorActionPreference='Stop'; $shell=New-Object -ComObject WScript.Shell; $shortcut=$shell.CreateShortcut('%DESKTOP_SHORTCUT%'); $shortcut.TargetPath='%INSTALL_EXE%'; $shortcut.WorkingDirectory='%INSTALL_DIR%'; $shortcut.IconLocation='%INSTALL_EXE%,0'; $shortcut.Save(); $shortcut=$shell.CreateShortcut('%START_SHORTCUT%'); $shortcut.TargetPath='%INSTALL_EXE%'; $shortcut.WorkingDirectory='%INSTALL_DIR%'; $shortcut.IconLocation='%INSTALL_EXE%,0'; $shortcut.Save()"
-if errorlevel 1 (
-  echo WARNING: AlphaKiller was installed, but shortcut creation failed.
-  echo You can run it directly from:
-  echo %INSTALL_EXE%
-) else (
-  echo Shortcuts created on the Desktop and Start Menu.
-)
-
 echo.
-echo AlphaKiller was installed successfully.
-echo Installed executable:
-echo %INSTALL_EXE%
-echo.
-choice /M "Launch AlphaKiller now"
-if errorlevel 2 (
-  echo Done.
-  exit /b 0
-)
-
-start "" "%INSTALL_EXE%"
+echo AlphaKiller installer finished.
+pause
 exit /b 0
