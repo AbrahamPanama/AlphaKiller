@@ -9,7 +9,7 @@ bridge.
 - `contextIsolation` is enabled.
 - `nodeIntegration` is disabled.
 - The preload bridge exposes only theme lookup, optional Hugging Face token
-  lookup, main-process background-removal IPC, and native PNG/TIFF export.
+  lookup, main-process background-removal IPC, and native PNG/JPEG/TIFF/PDF/SVG export.
 - IPC handlers validate their caller and payload shape before handling requests.
 - WebGPU is enabled because background removal depends on ONNX Runtime Web.
 

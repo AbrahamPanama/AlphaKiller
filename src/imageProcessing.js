@@ -47,6 +47,56 @@ export function affectedPixelStats(original, processed) {
   };
 }
 
+export function findVisibleAlphaBounds(imageData, options = {}) {
+  const threshold = Math.max(0, Math.min(255, Number(options.threshold ?? 0)));
+  const padding = Math.max(0, Math.floor(Number(options.padding ?? 0)));
+  let minX = imageData.width;
+  let minY = imageData.height;
+  let maxX = -1;
+  let maxY = -1;
+
+  for (let y = 0; y < imageData.height; y += 1) {
+    for (let x = 0; x < imageData.width; x += 1) {
+      const alpha = imageData.data[(y * imageData.width + x) * 4 + 3];
+      if (alpha <= threshold) continue;
+      minX = Math.min(minX, x);
+      minY = Math.min(minY, y);
+      maxX = Math.max(maxX, x);
+      maxY = Math.max(maxY, y);
+    }
+  }
+
+  if (maxX < minX || maxY < minY) return null;
+
+  minX = Math.max(0, minX - padding);
+  minY = Math.max(0, minY - padding);
+  maxX = Math.min(imageData.width - 1, maxX + padding);
+  maxY = Math.min(imageData.height - 1, maxY + padding);
+
+  return {
+    x: minX,
+    y: minY,
+    width: maxX - minX + 1,
+    height: maxY - minY + 1
+  };
+}
+
+export function cropImageDataToBounds(imageData, bounds) {
+  const x = Math.max(0, Math.floor(Number(bounds?.x ?? 0)));
+  const y = Math.max(0, Math.floor(Number(bounds?.y ?? 0)));
+  const width = Math.min(imageData.width - x, Math.max(1, Math.floor(Number(bounds?.width ?? imageData.width))));
+  const height = Math.min(imageData.height - y, Math.max(1, Math.floor(Number(bounds?.height ?? imageData.height))));
+  const output = new ImageData(new Uint8ClampedArray(width * height * 4), width, height);
+
+  for (let row = 0; row < height; row += 1) {
+    const sourceStart = ((y + row) * imageData.width + x) * 4;
+    const sourceEnd = sourceStart + width * 4;
+    output.data.set(imageData.data.slice(sourceStart, sourceEnd), row * width * 4);
+  }
+
+  return output;
+}
+
 export function applyMaskToImage(originalImageData, maskBuffer, options = {}) {
   const output = cloneImageData(originalImageData);
   const mask = maskBuffer instanceof Uint8Array ? maskBuffer : new Uint8Array(maskBuffer);

@@ -1,15 +1,15 @@
 # AlphaKiller
 
-Current version: **0.1 beta 1** (`0.1.0-beta.1`).
+Current version: **0.1 beta 2** (`0.1.0-beta.2`).
 
 AlphaKiller is an Electron image editor for cleaning transparent-pixel artifacts:
 anti-aliased edges, matte halos, and hidden RGB bleed around transparent pixels.
-It is built for artwork and production files that need clean alpha before PNG
-or TIFF export, white-ink printing, compositing, or texture use.
+It is built for artwork and production files that need clean alpha before PNG,
+JPEG, TIFF, PDF, or SVG export, white-ink printing, compositing, or texture use.
 
 ## Current MVP
 
-- PNG/WebP/TIFF drag-and-drop or file-picker import.
+- PNG/JPEG/WebP/TIFF drag-and-drop or file-picker import.
 - AI background removal with BRIA API RMBG-2.0, a Fast local RMBG-1.4 path,
   a WebGPU-only Quality BEN2 path, and a restore-original safety affordance.
 - Canvas preview with checker, black, white, gray, and custom backgrounds.
@@ -18,9 +18,12 @@ or TIFF export, white-ink printing, compositing, or texture use.
   before/after split handle.
 - Delete Pen tool with variable brush size for manually removing unwanted
   pixels.
+- Toolbar trim command that crops transparent padding from the current cleaned
+  alpha.
 - Defringe, color bleed, alpha threshold, and alpha hardening controls.
 - Source metadata, DPI, and pixel inspection.
-- PNG or transparent TIFF export through Electron's native save dialog.
+- PNG, flattened JPEG, transparent TIFF, transparent PDF, or vector contour SVG
+  export through Electron's native save dialog.
 
 ## Repository Layout
 
@@ -36,13 +39,23 @@ Releases instead.
 
 ## Import and Export Metadata
 
-AlphaKiller does not scale images during cleanup. Exported PNG and TIFF files
-therefore keep the current pixel dimensions. When the imported file contains
+AlphaKiller does not scale images during cleanup. Exported PNG, JPEG, TIFF, PDF,
+and SVG files therefore keep the current pixel dimensions. When the imported file contains
 print-resolution metadata, AlphaKiller preserves that DPI on export:
 
 - PNG `pHYs` metadata is read and written back on PNG export.
+- JPEG JFIF/EXIF resolution metadata is read and written back as JFIF density
+  on JPEG export. JPEG does not support transparency, so transparent pixels are
+  flattened onto the selected solid preview background, or white when the
+  checker preview is active.
 - TIFF X/Y resolution metadata is read and written back on TIFF export.
 - Transparent TIFF export uses RGBA with straight alpha.
+- PDF export embeds the cleaned bitmap with a soft alpha mask at the current
+  working DPI, including DPI changes from Super Scale. If Vector Contour is
+  enabled, the contour is added as vector stroke data on top of the bitmap. If
+  the source has no DPI metadata, PDF export uses a 300 DPI fallback page size.
+- SVG export writes the current vector contour, generated from the cleaned
+  preview alpha after all active filters and pen edits.
 - WebP import preserves pixel dimensions; DPI is only preserved when a source
   format exposes readable resolution metadata.
 
@@ -111,6 +124,7 @@ npm run diagnose:perf
 npm run diagnose:hf
 npm run diagnose:bg-remove
 npm run diagnose:rmbg2:api
+npm run diagnose:pdf
 npm run benchmark:bg-remove
 ```
 
@@ -118,6 +132,9 @@ npm run benchmark:bg-remove
 Background toolbar flow, verifies the Restore Original affordance, and then
 restores the image. The first run may take longer while model assets are
 downloaded and cached.
+
+`diagnose:pdf` writes a real PDF export smoke file under `.tmp/` and verifies
+that the output includes a PDF header and alpha soft mask.
 
 ## Background Removal Status
 

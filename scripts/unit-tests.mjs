@@ -12,15 +12,24 @@ globalThis.ImageData = class ImageData {
 const {
   applyMaskToImage,
   buildTrimap,
+  cropImageDataToBounds,
   dilateBand,
+  findVisibleAlphaBounds,
   applyProcessing
 } = await import("../src/imageProcessing.js");
 const {
+  applyJpegResolution,
   applyPngResolution,
+  encodePdfImageData,
   encodeTiffImageData,
+  readJpegResolution,
   readPngResolution,
   readTiffResolution
 } = await import("../src/imageIO.js");
+const {
+  contourToSvg,
+  traceVectorContour
+} = await import("../src/vectorTrace.js");
 
 function makeImageData(width, height, pixels) {
   return new ImageData(new Uint8ClampedArray(pixels), width, height);
@@ -77,6 +86,27 @@ function testDilateBand() {
     128, 128, 128,
     128, 128, 128,
     128, 128, 128
+  ]);
+}
+
+function testFindVisibleAlphaBoundsAndCrop() {
+  const image = makeImageData(4, 3, [
+    0, 0, 0, 0,      0, 0, 0, 0,      0, 0, 0, 0,      0, 0, 0, 0,
+    0, 0, 0, 0,      10, 20, 30, 255, 40, 50, 60, 128, 0, 0, 0, 0,
+    0, 0, 0, 0,      70, 80, 90, 64,  1, 2, 3, 0,      0, 0, 0, 0
+  ]);
+
+  const bounds = findVisibleAlphaBounds(image);
+  assert.deepEqual(bounds, { x: 1, y: 1, width: 2, height: 2 });
+
+  const cropped = cropImageDataToBounds(image, bounds);
+  assert.equal(cropped.width, 2);
+  assert.equal(cropped.height, 2);
+  assert.deepEqual(Array.from(cropped.data), [
+    10, 20, 30, 255,
+    40, 50, 60, 128,
+    70, 80, 90, 64,
+    1, 2, 3, 0
   ]);
 }
 
@@ -187,6 +217,15 @@ function testPngResolutionMetadata() {
   assert.equal(Math.round(resolution.yDpi), 150);
 }
 
+function testJpegResolutionMetadata() {
+  const jpeg = minimalJpeg();
+  const output = applyJpegResolution(jpeg, { xDpi: 300, yDpi: 150 });
+  const resolution = readJpegResolution(output);
+
+  assert.equal(Math.round(resolution.xDpi), 300);
+  assert.equal(Math.round(resolution.yDpi), 150);
+}
+
 function testTiffExportPreservesAlphaAndResolution() {
   const image = makeImageData(2, 1, [
     10, 20, 30, 255,
@@ -210,6 +249,118 @@ function testTiffExportPreservesAlphaAndResolution() {
   ]);
 }
 
+function testPdfExportUsesWorkingResolutionAndAlpha() {
+  const image = makeImageData(2, 1, [
+    10, 20, 30, 255,
+    40, 50, 60, 64
+  ]);
+  const pdf = encodePdfImageData(image, {
+    resolution: { xDpi: 300, yDpi: 150 }
+  });
+  const text = new TextDecoder("latin1").decode(pdf);
+
+  assert.ok(text.startsWith("%PDF-1.4"));
+  assert.ok(text.includes("/SMask"));
+  assert.ok(text.includes("/Width 2 /Height 1"));
+  assert.ok(text.includes("/MediaBox [0 0 0.48 0.48]"));
+}
+
+function testPdfExportCanIncludeVectorContour() {
+  const image = makeImageData(1, 1, [255, 255, 255, 255]);
+  const contour = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 0 });
+  const pdf = encodePdfImageData(image, {
+    resolution: { xDpi: 72, yDpi: 72 },
+    contour,
+    contourStroke: "#112233"
+  });
+  const text = new TextDecoder("latin1").decode(pdf);
+
+  assert.ok(text.includes("0.06667 0.13333 0.2 RG"));
+  assert.ok(text.includes(" m\n"));
+  assert.ok(text.includes(" l\n"));
+  assert.ok(text.includes("\nh\nS\nQ"));
+}
+
+function testPdfExportCanIncludeCurvedVectorContour() {
+  const image = makeImageData(2, 2, [
+    255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255
+  ]);
+  const contour = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 6 });
+  const pdf = encodePdfImageData(image, {
+    resolution: { xDpi: 72, yDpi: 72 },
+    contour,
+    contourStroke: "#112233"
+  });
+  const text = new TextDecoder("latin1").decode(pdf);
+
+  assert.ok(contour.paths[0].curves.length > 0);
+  assert.ok(contour.paths[0].d.includes(" C "));
+  assert.ok(text.includes(" c\n"));
+}
+
+function testVectorContourSinglePixel() {
+  const image = makeImageData(3, 3, [
+    0, 0, 0, 0,    0, 0, 0, 0,      0, 0, 0, 0,
+    0, 0, 0, 0,    255, 255, 255, 255, 0, 0, 0, 0,
+    0, 0, 0, 0,    0, 0, 0, 0,      0, 0, 0, 0
+  ]);
+
+  const contour = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 0 });
+  assert.equal(contour.pathCount, 1);
+  assert.equal(contour.paths[0].area, 1);
+  assert.deepEqual(boundsForPoints(contour.paths[0].points), { minX: 1, minY: 1, maxX: 2, maxY: 2 });
+}
+
+function testVectorContourUsesThreshold() {
+  const image = makeImageData(2, 1, [
+    255, 255, 255, 16,
+    255, 255, 255, 17
+  ]);
+
+  const contour = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 0 });
+  assert.equal(contour.pathCount, 1);
+  assert.deepEqual(boundsForPoints(contour.paths[0].points), { minX: 1, minY: 0, maxX: 2, maxY: 1 });
+}
+
+function testVectorContourSvg() {
+  const image = makeImageData(1, 1, [255, 255, 255, 255]);
+  const contour = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 0 });
+  const svg = contourToSvg(contour, { stroke: "#112233", title: "Test contour" });
+  assert.ok(svg.includes('viewBox="0 0 1 1"'));
+  assert.ok(svg.includes('stroke="#112233"'));
+  assert.ok(svg.includes("<path"));
+}
+
+function testVectorContourSvgUsesCurvesWhenSmoothed() {
+  const image = makeImageData(2, 2, [
+    255, 255, 255, 255, 255, 255, 255, 255,
+    255, 255, 255, 255, 255, 255, 255, 255
+  ]);
+  const contour = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 6 });
+  const svg = contourToSvg(contour, { stroke: "#112233", title: "Curved contour" });
+
+  assert.ok(contour.paths[0].curves.length > 0);
+  assert.ok(svg.includes(" C "));
+}
+
+function testVectorContourOffset() {
+  const image = makeImageData(5, 5, [
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0,
+    0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0,
+    0, 0, 0, 0, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 255, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+  ]);
+
+  const base = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 0 });
+  const expanded = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 0, offsetPixels: 1 });
+  const contracted = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 0, offsetPixels: -1 });
+
+  assert.ok(expanded.paths[0].area > base.paths[0].area);
+  assert.ok(contracted.paths[0].area < base.paths[0].area);
+}
+
 function minimalPng() {
   return new Uint8Array([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
@@ -225,9 +376,26 @@ function minimalPng() {
   ]);
 }
 
+function boundsForPoints(points) {
+  return points.reduce((bounds, point) => ({
+    minX: Math.min(bounds.minX, point.x),
+    minY: Math.min(bounds.minY, point.y),
+    maxX: Math.max(bounds.maxX, point.x),
+    maxY: Math.max(bounds.maxY, point.y)
+  }), { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity });
+}
+
+function minimalJpeg() {
+  return new Uint8Array([
+    0xff, 0xd8,
+    0xff, 0xd9
+  ]);
+}
+
 testApplyMaskToImage();
 testBuildTrimap();
 testDilateBand();
+testFindVisibleAlphaBoundsAndCrop();
 testAlphaThresholdProcessing();
 testDefringeTolerance();
 testDefringeTolerancePotency();
@@ -235,6 +403,15 @@ testDefringeStrengthPotency();
 testColorBleedReachPotency();
 testColorBleedCustomColor();
 testPngResolutionMetadata();
+testJpegResolutionMetadata();
 testTiffExportPreservesAlphaAndResolution();
+testPdfExportUsesWorkingResolutionAndAlpha();
+testPdfExportCanIncludeVectorContour();
+testPdfExportCanIncludeCurvedVectorContour();
+testVectorContourSinglePixel();
+testVectorContourUsesThreshold();
+testVectorContourSvg();
+testVectorContourSvgUsesCurvesWhenSmoothed();
+testVectorContourOffset();
 
 console.log("Unit tests passed.");

@@ -2,7 +2,7 @@
 
 ## 1. Product Overview
 
-AlphaKiller is a desktop image editing app for cleaning problematic transparent and semi-transparent pixels in PNG, WebP, and TIFF assets. Its primary use case is fixing anti-aliased edges, halos, dirty mattes, and texture bleed issues in graphics, icons, sprites, UI assets, and exported artwork.
+AlphaKiller is a desktop image editing app for cleaning problematic transparent and semi-transparent pixels in PNG, JPEG, WebP, and TIFF assets. Its primary use case is fixing anti-aliased edges, halos, dirty mattes, and texture bleed issues in graphics, icons, sprites, UI assets, and exported artwork.
 
 The interface should feel like a precise, modern production tool: fast, focused, visual, and confidence-building. Users should be able to load an image, immediately see the transparency problem, adjust cleanup tools, compare before and after, and export the result without navigating through unnecessary panels.
 
@@ -30,13 +30,14 @@ The UI should support both casual one-off fixes and repeated professional workfl
 
 ### 4.1 Single Image Cleanup
 
-1. User opens or drags in a PNG, WebP, TIF, or TIFF file.
+1. User opens or drags in a PNG, JPEG, WebP, TIF, or TIFF file.
 2. App displays the image on a checkerboard canvas.
 3. User switches preview background between checkerboard, black, white, gray, and custom color.
 4. User selects a cleanup tool.
 5. User adjusts sliders and sees live preview.
 6. User toggles before/after, split view, or difference view.
-7. User exports the cleaned image.
+7. User optionally trims transparent padding from the cleaned alpha.
+8. User exports the cleaned image.
 
 ### 4.2 Batch Cleanup
 
@@ -79,7 +80,7 @@ Required elements:
 - App name: AlphaKiller.
 - Primary action: Open Image.
 - Secondary action: Open Folder / Batch.
-- Supported formats shown compactly: PNG, WebP, TIFF.
+- Supported formats shown compactly: PNG, JPEG, WebP, TIFF.
 - Recent files list if available.
 
 Avoid marketing copy. The empty state should feel like a tool waiting for work.
@@ -292,6 +293,10 @@ For batch mode, each row should show:
 Required options:
 
 - Export as PNG.
+- Export as JPEG.
+- Export as TIFF.
+- Export as PDF, with the bitmap placed at the current working DPI.
+- Export as SVG, using the current vector contour.
 - Export as WebP if supported.
 - Choose destination.
 - Overwrite warning.
@@ -577,7 +582,11 @@ The first build should include:
 - Color Bleed.
 - Before/after toggle.
 - Split view.
+- Trim transparent padding.
 - Export PNG.
+- Export JPEG, flattened against a solid preview background because JPEG has no alpha channel.
+- Export PDF with the cleaned bitmap embedded at the current working DPI.
+- Export SVG vector contours from the current cleaned preview alpha.
 - Basic presets.
 - Dark theme.
 

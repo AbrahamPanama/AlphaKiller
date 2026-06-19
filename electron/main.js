@@ -26,7 +26,7 @@ function createWindow() {
     height: 900,
     minWidth: 1040,
     minHeight: 680,
-    title: "AlphaKiller 0.1 beta 1",
+    title: "AlphaKiller 0.1 beta 2",
     icon: process.platform === "win32" ? windowsIconPath : undefined,
     backgroundColor: "#0d0e10",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
@@ -85,7 +85,7 @@ ipcMain.handle("app:get-huggingface-token", (event) => {
 ipcMain.handle("app:choose-export-target", async (event, payload) => {
   assertTrustedSender(event);
   const defaultFormat = normalizeExportFormat(payload?.defaultFormat);
-  const fallbackName = `image-cleaned.${defaultFormat === "tiff" ? "tiff" : "png"}`;
+  const fallbackName = `image-cleaned.${extensionForExportFormat(defaultFormat)}`;
   const defaultPath = typeof payload?.defaultPath === "string" && payload.defaultPath.trim()
     ? payload.defaultPath.trim()
     : fallbackName;
@@ -93,10 +93,7 @@ ipcMain.handle("app:choose-export-target", async (event, payload) => {
   const result = await dialog.showSaveDialog(mainWindow, {
     title: "Export cleaned image",
     defaultPath,
-    filters: [
-      { name: "PNG Image", extensions: ["png"] },
-      { name: "TIFF Image", extensions: ["tif", "tiff"] }
-    ]
+    filters: [filterForExportFormat(defaultFormat)]
   });
 
   if (result.canceled || !result.filePath) {
@@ -160,23 +157,37 @@ ipcMain.handle("super-scale:run", async (event, payload) => {
 });
 
 function normalizeExportFormat(format) {
-  return format === "tiff" ? "tiff" : "png";
+  return format === "tiff" || format === "jpeg" || format === "pdf" || format === "svg" ? format : "png";
 }
 
 function normalizeExportPath(filePath, defaultFormat) {
-  const extension = path.extname(filePath).toLowerCase();
-  if (extension === ".tif" || extension === ".tiff") {
-    return { filePath, format: "tiff" };
-  }
-  if (extension === ".png") {
-    return { filePath, format: "png" };
+  const format = normalizeExportFormat(defaultFormat);
+  const extension = extensionForExportFormat(format);
+  const parsed = path.parse(filePath);
+  if (parsed.ext.toLowerCase() === `.${extension}`) {
+    return { filePath, format };
   }
 
-  const format = normalizeExportFormat(defaultFormat);
   return {
-    filePath: `${filePath}.${format === "tiff" ? "tiff" : "png"}`,
+    filePath: path.join(parsed.dir, `${parsed.name}.${extension}`),
     format
   };
+}
+
+function filterForExportFormat(format) {
+  if (format === "jpeg") return { name: "JPEG Image", extensions: ["jpg", "jpeg"] };
+  if (format === "tiff") return { name: "TIFF Image", extensions: ["tif", "tiff"] };
+  if (format === "pdf") return { name: "PDF File", extensions: ["pdf"] };
+  if (format === "svg") return { name: "SVG Vector Contour", extensions: ["svg"] };
+  return { name: "PNG Image", extensions: ["png"] };
+}
+
+function extensionForExportFormat(format) {
+  if (format === "tiff") return "tiff";
+  if (format === "jpeg") return "jpg";
+  if (format === "pdf") return "pdf";
+  if (format === "svg") return "svg";
+  return "png";
 }
 
 function isBytePayload(bytes) {

@@ -1,9 +1,10 @@
-import React, { useCallback, useEffect, useRef, useState } from "react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Activity,
   Blend,
   Check,
   ChevronDown,
+  Crop,
   Download,
   Eraser,
   Eye,
@@ -33,15 +34,19 @@ import {
   ZoomOut
 } from "lucide-react";
 import UTIF from "utif";
-import { applyMaskToImage } from "./imageProcessing.js";
+import { applyMaskToImage, cropImageDataToBounds, findVisibleAlphaBounds } from "./imageProcessing.js";
 import {
+  applyJpegResolution,
   applyPngResolution,
+  encodePdfImageData,
   encodeTiffImageData,
   formatResolution,
+  readJpegResolution,
   readPngResolution,
   readTiffResolution
 } from "./imageIO.js";
 import { SettingsPanel } from "./SettingsPanel.jsx";
+import { contourToSvg, traceVectorContour } from "./vectorTrace.js";
 
 const DEFAULT_SETTINGS = {
   threshold: { enabled: false, threshold: 128, softness: 8 },
@@ -50,7 +55,7 @@ const DEFAULT_SETTINGS = {
   hardening: { enabled: false, strength: 55, midpoint: 50 }
 };
 
-const APP_VERSION_LABEL = "0.1 beta 1";
+const APP_VERSION_LABEL = "0.1 beta 2";
 
 const PRESETS = [
   {
@@ -99,8 +104,8 @@ const BACKGROUNDS = [
   { id: "custom", label: "Custom" }
 ];
 
-const SUPPORTED_IMAGE_EXTENSIONS = [".png", ".webp", ".tif", ".tiff"];
-const RASTER_MIME_RE = /^image\/(png|webp|tiff|x-tiff)$/;
+const SUPPORTED_IMAGE_EXTENSIONS = [".png", ".webp", ".jpg", ".jpeg", ".tif", ".tiff"];
+const RASTER_MIME_RE = /^image\/(png|webp|jpeg|pjpeg|tiff|x-tiff)$/;
 const MIN_ZOOM = 0.1;
 const MAX_ZOOM = 32;
 const ZOOM_FACTOR = 1.14;
@@ -111,6 +116,7 @@ const HISTORY_LIMIT = 30;
 const PROCESSING_DEBOUNCE_MS = 80;
 const BG_REMOVE_TIMEOUT_MS = 180000;
 const SUPER_SCALE_TIMEOUT_MS = 180000;
+const PDF_FALLBACK_DPI = 300;
 const BG_REMOVE_EMPTY_MASK_LIMIT = 0.02;
 const BG_REMOVE_MODEL_KEY = "alphakiller:bg-remove-model";
 const BG_REMOVE_REFINE_KEY = "alphakiller:bg-remove-refine-default";
@@ -118,7 +124,15 @@ const BRIA_PRESERVE_ALPHA_KEY = "alphakiller:bria-preserve-alpha";
 const BRIA_TOKEN_KEY = "alphakiller:bria-token";
 const HF_TOKEN_KEY = "alphakiller:hf-token";
 const CUSTOM_PRESETS_KEY = "alphakiller:custom-presets";
+const EXPORT_SETTINGS_KEY = "alphakiller:export-settings";
 const BG_REMOVE_REFINE_AVAILABLE = false;
+const DEFAULT_CONTOUR_OPTIONS = {
+  visible: false,
+  alphaThreshold: 16,
+  simplifyTolerance: 2,
+  offsetPixels: 0,
+  color: "#ff4fd8"
+};
 const checkerPatternCache = new WeakMap();
 
 const DEFAULT_COMPARE_BEFORE = {
@@ -177,6 +191,20 @@ const BG_REMOVE_LABELS = {
 };
 
 const BRUSH_TOOLS = new Set(["delete", "restore"]);
+
+const EXPORT_FORMATS = [
+  { id: "png", label: "PNG", description: "Lossless, transparent raster" },
+  { id: "jpeg", label: "JPG", description: "Flattened raster for opaque previews" },
+  { id: "tiff", label: "TIFF", description: "Production raster with straight alpha" },
+  { id: "pdf", label: "PDF", description: "Bitmap plus optional vector contour" },
+  { id: "svg", label: "SVG", description: "Editable vector contour only" }
+];
+
+const DEFAULT_EXPORT_SETTINGS = {
+  format: "png",
+  includeContour: true,
+  jpegMatte: "#ffffff"
+};
 
 export function App() {
   const fileInputRef = useRef(null);
@@ -258,6 +286,11 @@ export function App() {
   const [hasSuperScaleStage, setHasSuperScaleStage] = useState(false);
   const [compareBeforeLayers, setCompareBeforeLayers] = useState(DEFAULT_COMPARE_BEFORE);
   const [compareAfterLayers, setCompareAfterLayers] = useState(DEFAULT_COMPARE_AFTER);
+  const [contourOptions, setContourOptions] = useState(DEFAULT_CONTOUR_OPTIONS);
+  const [vectorContour, setVectorContour] = useState(null);
+  const [vectorContourStale, setVectorContourStale] = useState(false);
+  const [exportDialogOpen, setExportDialogOpen] = useState(false);
+  const [exportSettings, setExportSettings] = useState(loadPersistedExportSettings);
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
   const [hasWebGpu] = useState(() => Boolean(window.navigator?.gpu));
   const [hasElectronBackgroundRemoval] = useState(() => Boolean(window.alphaKiller?.removeBackground));
@@ -294,10 +327,18 @@ export function App() {
   const allPresets = [...PRESETS, ...customPresets];
   const selectedPreset = allPresets.find((item) => item.id === preset);
   const selectedCustomPreset = customPresets.find((item) => item.id === preset);
+  const exportPreviewUrl = useMemo(() => processedImageData ? imageDataToObjectUrl(processedImageData) : "", [processedImageData]);
+  const hasCurrentVectorContour = Boolean(
+    vectorContour &&
+    !vectorContourStale &&
+    processedImageData &&
+    vectorContour.width === processedImageData.width &&
+    vectorContour.height === processedImageData.height
+  );
 
   const loadFile = useCallback(async (file) => {
     if (!file || !isSupportedImageFile(file)) {
-      setToast({ type: "error", title: "Unsupported file", message: "AlphaKiller currently accepts PNG, WebP, TIFF, and TIF images." });
+      setToast({ type: "error", title: "Unsupported file", message: "AlphaKiller currently accepts PNG, JPEG, WebP, TIFF, and TIF images." });
       return;
     }
 
@@ -313,6 +354,8 @@ export function App() {
     setHasPreSegmentationOriginal(false);
     setHasBackgroundRemovedStage(false);
     setHasSuperScaleStage(false);
+    setVectorContour(null);
+    setVectorContourStale(false);
     setCompareBeforeLayers(DEFAULT_COMPARE_BEFORE);
     setCompareAfterLayers(DEFAULT_COMPARE_AFTER);
     if (isTiffFile(file)) {
@@ -326,6 +369,7 @@ export function App() {
           width: imageData.width,
           height: imageData.height,
           resolution,
+          hasAlpha: imageDataHasTransparency(imageData),
           url: previewUrl
         });
         if (sourceObjectUrlRef.current) {
@@ -370,11 +414,12 @@ export function App() {
       setSource({
         name: file.name,
         size: file.size,
-        type: file.type,
-        format: file.type.replace("image/", "").toUpperCase(),
+        type: file.type || mimeTypeForFile(file),
+        format: getImageFileFormat(file),
         width: canvas.width,
         height: canvas.height,
         resolution,
+        hasAlpha: imageDataHasTransparency(imageData),
         url
       });
       setOriginalImageData(imageData);
@@ -865,6 +910,68 @@ export function App() {
     setToast(null);
   }
 
+  function cropRefToBounds(ref, bounds, sourceWidth, sourceHeight) {
+    const imageData = ref.current;
+    if (!imageData || imageData.width !== sourceWidth || imageData.height !== sourceHeight) return;
+    ref.current = cropImageDataToBounds(imageData, bounds);
+  }
+
+  function trimTransparentPadding() {
+    if (!originalImageData || !processedImageData) return;
+
+    const bounds = findVisibleAlphaBounds(processedImageData);
+    if (!bounds) {
+      setToast({
+        type: "warning",
+        title: "Nothing to trim",
+        message: "No visible pixels were found in the current cleaned alpha."
+      });
+      return;
+    }
+
+    if (bounds.x === 0 && bounds.y === 0 && bounds.width === originalImageData.width && bounds.height === originalImageData.height) {
+      setToast({
+        type: "info",
+        title: "Already tight",
+        message: "The current cleaned alpha already touches the document edges."
+      });
+      return;
+    }
+
+    const sourceWidth = originalImageData.width;
+    const sourceHeight = originalImageData.height;
+    const nextImageData = cropImageDataToBounds(originalImageData, bounds);
+
+    commitDocumentImageEdit(nextImageData, {
+      statusText: "Transparent padding trimmed"
+    });
+    cropRefToBounds(importedOriginalImageRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(preSegmentationOriginalRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(backgroundRemovedImageRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(preSuperScaleOriginalRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(preSuperScaleProcessedRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(superScaledImageRef, bounds, sourceWidth, sourceHeight);
+
+    setPan({ x: 0, y: 0 });
+    setVectorContour(null);
+    setVectorContourStale(true);
+    setToast({
+      type: "success",
+      title: "Trim complete",
+      message: `Trimmed to ${bounds.width} x ${bounds.height} from the current cleaned alpha.`
+    });
+  }
+
+  function updateContourOption(key, value) {
+    setContourOptions((current) => ({
+      ...current,
+      [key]: value
+    }));
+    if (key === "alphaThreshold" || key === "simplifyTolerance" || key === "offsetPixels") {
+      setVectorContourStale(Boolean(vectorContour));
+    }
+  }
+
   function cancelBackgroundRemoval() {
     const activeJob = activeBgRemoveJobRef.current;
     latestBgRemoveRequestRef.current += 1;
@@ -1051,8 +1158,40 @@ export function App() {
       imageData: includeImage && imageData ? cloneImageData(imageData) : null,
       resolution: cloneResolution(source?.resolution),
       settings: structuredClone(settings),
-      preset
+      preset,
+      stageSnapshot: includeImage ? cloneStageSnapshot() : null
     };
+  }
+
+  function cloneStageSnapshot() {
+    return {
+      preSegmentationOriginal: cloneRefImageData(preSegmentationOriginalRef),
+      importedOriginal: cloneRefImageData(importedOriginalImageRef),
+      backgroundRemoved: cloneRefImageData(backgroundRemovedImageRef),
+      preSuperScaleOriginal: cloneRefImageData(preSuperScaleOriginalRef),
+      preSuperScaleProcessed: cloneRefImageData(preSuperScaleProcessedRef),
+      superScaled: cloneRefImageData(superScaledImageRef),
+      hasPreSegmentationOriginal,
+      hasBackgroundRemovedStage,
+      hasSuperScaleStage,
+      compareBeforeLayers: structuredClone(compareBeforeLayers),
+      compareAfterLayers: structuredClone(compareAfterLayers)
+    };
+  }
+
+  function restoreStageSnapshot(snapshot) {
+    if (!snapshot) return;
+    preSegmentationOriginalRef.current = snapshot.preSegmentationOriginal ? cloneImageData(snapshot.preSegmentationOriginal) : null;
+    importedOriginalImageRef.current = snapshot.importedOriginal ? cloneImageData(snapshot.importedOriginal) : null;
+    backgroundRemovedImageRef.current = snapshot.backgroundRemoved ? cloneImageData(snapshot.backgroundRemoved) : null;
+    preSuperScaleOriginalRef.current = snapshot.preSuperScaleOriginal ? cloneImageData(snapshot.preSuperScaleOriginal) : null;
+    preSuperScaleProcessedRef.current = snapshot.preSuperScaleProcessed ? cloneImageData(snapshot.preSuperScaleProcessed) : null;
+    superScaledImageRef.current = snapshot.superScaled ? cloneImageData(snapshot.superScaled) : null;
+    setHasPreSegmentationOriginal(Boolean(snapshot.hasPreSegmentationOriginal));
+    setHasBackgroundRemovedStage(Boolean(snapshot.hasBackgroundRemovedStage));
+    setHasSuperScaleStage(Boolean(snapshot.hasSuperScaleStage));
+    setCompareBeforeLayers(snapshot.compareBeforeLayers || DEFAULT_COMPARE_BEFORE);
+    setCompareAfterLayers(snapshot.compareAfterLayers || DEFAULT_COMPARE_AFTER);
   }
 
   function pushUndoSnapshot(snapshot) {
@@ -1121,6 +1260,8 @@ export function App() {
   }
 
   function applyHistorySnapshot(snapshot, statusText) {
+    restoreStageSnapshot(snapshot.stageSnapshot);
+
     if (snapshot.imageData) {
       replaceDocumentImage(cloneImageData(snapshot.imageData), statusText, { resolution: snapshot.resolution });
     } else {
@@ -1169,6 +1310,34 @@ export function App() {
     setStatus("Processing preview");
     scheduleProcessing(originalImageData, settings);
   }, [originalImageData, settings]);
+
+  useEffect(() => {
+    if (vectorContour) {
+      setVectorContourStale(true);
+    }
+  }, [processedImageData]);
+
+  useEffect(() => {
+    if (!contourOptions.visible || !processedImageData) return;
+    const id = window.setTimeout(() => {
+      const contour = traceVectorContour(processedImageData, {
+        alphaThreshold: contourOptions.alphaThreshold,
+        simplifyTolerance: contourOptions.simplifyTolerance,
+        offsetPixels: contourOptions.offsetPixels,
+        minArea: 2
+      });
+      setVectorContour(contour);
+      setVectorContourStale(false);
+    }, 80);
+
+    return () => window.clearTimeout(id);
+  }, [
+    processedImageData,
+    contourOptions.visible,
+    contourOptions.alphaThreshold,
+    contourOptions.simplifyTolerance,
+    contourOptions.offsetPixels
+  ]);
 
   useEffect(() => () => {
     if (processingDebounceRef.current) {
@@ -1289,6 +1458,15 @@ export function App() {
 
     if (zoom >= 6) drawPixelGrid(ctx, x, y, displayWidth, displayHeight, zoom);
 
+    if (
+      contourOptions.visible &&
+      hasCurrentVectorContour &&
+      vectorContour.width === frameImageData.width &&
+      vectorContour.height === frameImageData.height
+    ) {
+      drawVectorContour(ctx, vectorContour, x, y, zoom, contourOptions.color);
+    }
+
     const brushPoint = brushPointRef.current;
     if (isBrushTool && brushPoint) {
       drawBrushCursor(
@@ -1300,7 +1478,7 @@ export function App() {
         canvasTool
       );
     }
-  }, [source, originalImageData, processedImageData, compareMode, compareBeforeLayers, compareAfterLayers, split, zoom, pan, background, customBackground, canvasTool, brushSize, canvasMode, isBrushTool, hasSuperScaleStage]);
+  }, [source, originalImageData, processedImageData, compareMode, compareBeforeLayers, compareAfterLayers, split, zoom, pan, background, customBackground, canvasTool, brushSize, canvasMode, isBrushTool, hasSuperScaleStage, contourOptions, vectorContour, vectorContourStale, hasCurrentVectorContour]);
 
   useEffect(() => {
     renderCanvasRef.current = renderCanvas;
@@ -1391,30 +1569,61 @@ export function App() {
     setSettings(structuredClone(next.settings));
   };
 
-  const handleExport = async () => {
-    if (!processedImageData || !source) return;
-    if (!window.alphaKiller?.chooseExportTarget || !window.alphaKiller?.writeExport) {
-      setToast({
-        type: "warning",
-        title: "Open Electron to export",
-        message: "Native PNG and TIFF export uses Electron's save dialog."
-      });
-      return;
-    }
+  function updateExportSetting(key, value) {
+    const next = { ...exportSettings, [key]: value };
+    setExportSettings(next);
+    persistExportSettings(next);
+  }
 
+  const handleExport = async (selectedSettings = exportSettings) => {
+    if (!processedImageData || !source) return;
+    const selected = normalizeExportSettings(selectedSettings);
     const baseName = source.name.replace(/\.[^.]+$/, "");
-    const defaultFormat = source.format === "TIFF" ? "tiff" : "png";
+    const defaultFormat = normalizeExportDialogFormat(selected.format);
+
     try {
+      const defaultExtension = extensionForExportDialogFormat(defaultFormat);
+      if (!window.alphaKiller?.chooseExportTarget || !window.alphaKiller?.writeExport) {
+        const exportContour = buildExportContour(defaultFormat, processedImageData, {
+          ...contourOptions,
+          visible: Boolean(selected.includeContour)
+        });
+        const bytes = await encodeExportBytes(defaultFormat, processedImageData, source.resolution, {
+          background: defaultFormat === "jpeg" ? "custom" : background,
+          customBackground: defaultFormat === "jpeg" ? selected.jpegMatte : customBackground,
+          contour: exportContour,
+          contourColor: contourOptions.color,
+          contourTitle: `${baseName} AlphaKiller vector contour`
+        });
+
+        downloadByteFile(bytes, `${baseName}-cleaned.${defaultExtension}`, mimeForExportFormat(defaultFormat));
+        setToast({
+          type: "success",
+          title: "Export downloaded",
+          message: `${formatLabelForExport(defaultFormat)} downloaded from the browser preview.`
+        });
+        setExportDialogOpen(false);
+        return;
+      }
+
       const target = await window.alphaKiller.chooseExportTarget({
-        defaultPath: `${baseName}-cleaned.${defaultFormat === "tiff" ? "tiff" : "png"}`,
+        defaultPath: `${baseName}-cleaned.${defaultExtension}`,
         defaultFormat
       });
 
       if (target?.canceled || !target?.exportId) return;
+      const exportContour = buildExportContour(target.format, processedImageData, {
+        ...contourOptions,
+        visible: Boolean(selected.includeContour)
+      });
 
-      const bytes = target.format === "tiff"
-        ? encodeTiffImageData(processedImageData, source.resolution)
-        : await imageDataToPngArrayBuffer(processedImageData, source.resolution);
+      const bytes = await encodeExportBytes(target.format, processedImageData, source.resolution, {
+        background: target.format === "jpeg" ? "custom" : background,
+        customBackground: target.format === "jpeg" ? selected.jpegMatte : customBackground,
+        contour: exportContour,
+        contourColor: contourOptions.color,
+        contourTitle: `${baseName} AlphaKiller vector contour`
+      });
 
       const result = await window.alphaKiller.writeExport({
         exportId: target.exportId,
@@ -1422,13 +1631,24 @@ export function App() {
       });
 
       if (result?.canceled) return;
-      const formatLabel = target.format === "tiff" ? "TIFF" : "PNG";
-      const dpiLabel = source.resolution ? `, ${formatResolution(source.resolution)}` : "";
+      const formatLabel = formatLabelForExport(target.format);
+      const dpiLabel = target.format === "pdf"
+        ? `, ${formatResolution(getPdfExportResolution(source.resolution))} bitmap`
+        : target.format !== "svg" && source.resolution
+          ? `, ${formatResolution(source.resolution)}`
+          : "";
+      const flattenLabel = target.format === "jpeg" ? ` flattened on ${selected.jpegMatte.toUpperCase()}` : "";
+      const contourLabel = target.format === "pdf" && exportContour?.pathCount
+        ? ` with ${exportContour.pathCount} vector contour path${exportContour.pathCount === 1 ? "" : "s"}`
+        : target.format === "svg"
+          ? ` with ${exportContour?.pathCount || 0} vector contour path${exportContour?.pathCount === 1 ? "" : "s"}`
+          : "";
       setToast({
         type: "success",
         title: "Export complete",
-        message: `${formatLabel} saved at ${processedImageData.width} x ${processedImageData.height}${dpiLabel}.`
+        message: `${formatLabel} saved at ${processedImageData.width} x ${processedImageData.height}${dpiLabel}${flattenLabel}${contourLabel}.`
       });
+      setExportDialogOpen(false);
     } catch (error) {
       console.error(error);
       setToast({
@@ -1754,7 +1974,7 @@ export function App() {
       <input
         ref={fileInputRef}
         type="file"
-        accept="image/png,image/webp,image/tiff,.tif,.tiff"
+        accept="image/png,image/jpeg,image/webp,image/tiff,.jpg,.jpeg,.tif,.tiff"
         hidden
         onChange={(event) => loadFile(event.target.files?.[0])}
       />
@@ -1839,6 +2059,15 @@ export function App() {
           <Sparkles size={16} />
         </button>
         <button
+          className="icon-button"
+          title="Trim transparent padding"
+          aria-label="Trim transparent padding"
+          disabled={!processedImageData || isBackgroundRemoving || isSuperScaling}
+          onClick={trimTransparentPadding}
+        >
+          <Crop size={16} />
+        </button>
+        <button
           className="icon-button super-scale-button"
           title="Super Scale"
           aria-label="Super Scale"
@@ -1877,7 +2106,7 @@ export function App() {
         >
           <Settings size={16} />
         </button>
-        <button className="primary-button" disabled={!processedImageData || isSuperScaling} onClick={handleExport}>
+        <button className="primary-button" disabled={!processedImageData || isSuperScaling} onClick={() => setExportDialogOpen(true)}>
           <Download size={15} />
           Export
         </button>
@@ -1901,7 +2130,7 @@ export function App() {
                 <dt>DPI</dt><dd>{formatResolution(source.resolution)}</dd>
                 <dt>Bytes</dt><dd>{formatBytes(source.size)}</dd>
                 <dt>Type</dt><dd>{source.format || source.type.replace("image/", "").toUpperCase()}</dd>
-                <dt>Alpha</dt><dd><span className="pill good">Detected</span></dd>
+                <dt>Alpha</dt><dd><span className={`pill ${source.hasAlpha ? "good" : "neutral"}`}>{source.hasAlpha ? "Detected" : "Opaque"}</span></dd>
               </dl>
               {hasPreSegmentationOriginal && (
                 <button className="restore-button" onClick={restoreOriginal}>
@@ -1913,7 +2142,7 @@ export function App() {
           ) : (
             <div className="empty-panel">
               <FileImage size={32} />
-              <strong>Drop a PNG, WebP, or TIFF</strong>
+              <strong>Drop a PNG, JPEG, WebP, or TIFF</strong>
               <span>The first import stays local and previews immediately.</span>
               <button onClick={() => fileInputRef.current?.click()}>Open Image</button>
             </div>
@@ -2077,6 +2306,25 @@ export function App() {
             <RangeControl label="Strength" value={settings.hardening.strength} min={0} max={100} unit="%" onChange={(value) => updateSetting("hardening", "strength", value)} />
             <RangeControl label="Midpoint" value={settings.hardening.midpoint} min={1} max={99} unit="%" onChange={(value) => updateSetting("hardening", "midpoint", value)} />
           </ToolSection>
+
+          <ToolSection
+            icon={<Pipette size={15} />}
+            title="Vector Contour"
+            enabled={contourOptions.visible}
+            onToggle={(value) => updateContourOption("visible", value)}
+          >
+            <RangeControl label="Opacity cutoff" value={contourOptions.alphaThreshold} min={0} max={255} onChange={(value) => updateContourOption("alphaThreshold", value)} />
+            <RangeControl label="Offset" value={contourOptions.offsetPixels} min={-48} max={48} unit="px" onChange={(value) => updateContourOption("offsetPixels", value)} />
+            <RangeControl label="Curve smoothing" value={contourOptions.simplifyTolerance} min={0} max={12} unit="px" onChange={(value) => updateContourOption("simplifyTolerance", value)} />
+            <ColorControl label="Stroke" value={contourOptions.color} onChange={(value) => updateContourOption("color", value)} />
+            <p className={`contour-summary ${vectorContourStale ? "stale" : ""}`}>
+              {vectorContour
+                ? vectorContourStale
+                  ? "Updating live contour..."
+                  : `${vectorContour.pathCount} path${vectorContour.pathCount === 1 ? "" : "s"} / ${vectorContour.pointCount} points`
+                : "Live contour follows the current cleaned preview alpha, after all filters and pen edits."}
+            </p>
+          </ToolSection>
         </aside>
       </main>
       )}
@@ -2107,6 +2355,20 @@ export function App() {
           onBriaPreserveAlphaChange={updateBriaPreserveAlpha}
           onTokenSave={saveSettingsToken}
           onClose={() => setSettingsPanelOpen(false)}
+        />
+      )}
+
+      {exportDialogOpen && (
+        <ExportDialog
+          source={source}
+          imageData={processedImageData}
+          previewUrl={exportPreviewUrl}
+          settings={exportSettings}
+          contour={hasCurrentVectorContour ? vectorContour : null}
+          contourColor={contourOptions.color}
+          onChange={updateExportSetting}
+          onClose={() => setExportDialogOpen(false)}
+          onExport={() => handleExport(exportSettings)}
         />
       )}
 
@@ -2313,6 +2575,158 @@ function Switch({ checked, onChange }) {
   );
 }
 
+function ExportDialog({ source, imageData, previewUrl, settings, contour, contourColor, onChange, onClose, onExport }) {
+  const format = normalizeExportDialogFormat(settings.format);
+  const formatInfo = EXPORT_FORMATS.find((item) => item.id === format) || EXPORT_FORMATS[0];
+  const resolution = source?.resolution || (format === "pdf" ? getPdfExportResolution(null) : null);
+  const resolutionLabel = formatResolution(resolution);
+  const includeContourPreview = (format === "pdf" && settings.includeContour) || format === "svg";
+  const contourPaths = includeContourPreview ? contour?.paths || [] : [];
+  const transparentLabel = format === "jpeg" ? "Flattened" : format === "svg" ? "Vector only" : "Preserved";
+  const exportLabel = `Export ${formatInfo.label}`;
+  const estimatedSize = estimateExportSize(format, imageData, {
+    includeContour: settings.includeContour,
+    contour
+  });
+
+  return (
+    <div className="modal-backdrop export-backdrop" role="presentation">
+      <form className="export-dialog" onSubmit={(event) => {
+        event.preventDefault();
+        onExport();
+      }}>
+        <header className="export-dialog-header">
+          <div>
+            <h2>Export artwork</h2>
+            <p>Choose a production format. Pixel dimensions stay unchanged.</p>
+          </div>
+          <button type="button" className="dialog-close" aria-label="Close export dialog" onClick={onClose}>
+            <X size={18} />
+          </button>
+        </header>
+
+        <section className="export-dialog-body">
+          <div className="export-left">
+            <span className="export-section-label">Format</span>
+            <div className="export-format-list" role="radiogroup" aria-label="Export format">
+              {EXPORT_FORMATS.map((item) => (
+                <label key={item.id} className={`export-format-card ${format === item.id ? "selected" : ""}`}>
+                  <input
+                    type="radio"
+                    name="export-format"
+                    value={item.id}
+                    checked={format === item.id}
+                    onChange={() => onChange("format", item.id)}
+                  />
+                  <b>{item.label}</b>
+                  <span>{item.description}</span>
+                </label>
+              ))}
+            </div>
+
+            <span className="export-section-label">Resolution</span>
+            <div className="export-resolution-grid">
+              <div>
+                <strong>Pixels</strong>
+                <span>{imageData.width} x {imageData.height}</span>
+                <small>No resampling on export</small>
+              </div>
+              <div>
+                <strong>Working DPI</strong>
+                <span>{resolutionLabel}</span>
+                <small>{source?.resolution ? "From the current document" : format === "pdf" ? "PDF fallback when source has no DPI" : "No DPI metadata in source"}</small>
+              </div>
+              <div>
+                <strong>Print size</strong>
+                <span>{formatPrintSize(imageData, resolution)}</span>
+                <small>Derived from pixels and DPI</small>
+              </div>
+            </div>
+          </div>
+
+          <div className="export-right">
+            <span className="export-section-label">Options</span>
+            <div className="export-options">
+              {format === "jpeg" ? (
+                <label className="export-color-option">
+                  <span>
+                    <strong>Matte background</strong>
+                    <small>JPEG has no alpha, so transparency is flattened.</small>
+                  </span>
+                  <input type="color" value={settings.jpegMatte} onChange={(event) => onChange("jpegMatte", event.target.value)} />
+                  <code>{settings.jpegMatte.toUpperCase()}</code>
+                </label>
+              ) : (
+                <div className="export-option-readonly">
+                  <span>
+                    <strong>{format === "svg" ? "Vector contour" : "Transparent background"}</strong>
+                    <small>{format === "svg" ? "Exports the traced outline from the cleaned alpha." : "Alpha is preserved in the exported file."}</small>
+                  </span>
+                  <em>{transparentLabel}</em>
+                </div>
+              )}
+
+              {format === "pdf" && (
+                <label className="export-check-option">
+                  <input
+                    type="checkbox"
+                    checked={settings.includeContour}
+                    onChange={(event) => onChange("includeContour", event.target.checked)}
+                  />
+                  <span>
+                    <strong>Include vector contour</strong>
+                    <small>Draws the live contour as editable PDF stroke data over the bitmap.</small>
+                  </span>
+                </label>
+              )}
+
+              {format === "svg" && (
+                <div className="export-option-readonly">
+                  <span>
+                    <strong>Contour source</strong>
+                    <small>Generated from the cleaned preview alpha after active filters and pen edits.</small>
+                  </span>
+                  <em>{contour?.pathCount ? `${contour.pathCount} paths` : "Live"}</em>
+                </div>
+              )}
+            </div>
+
+            <span className="export-section-label">Preview</span>
+            <div className={`export-preview ${format === "jpeg" ? "is-jpeg" : ""}`} style={format === "jpeg" ? { background: settings.jpegMatte } : undefined}>
+              {format !== "svg" && <img src={previewUrl} alt="" />}
+              {includeContourPreview && contourPaths.length > 0 && (
+                <svg viewBox={`0 0 ${imageData.width} ${imageData.height}`} aria-hidden="true">
+                  {contourPaths.map((path, index) => (
+                    <path key={index} d={path.d} />
+                  ))}
+                </svg>
+              )}
+              {format === "svg" && contourPaths.length === 0 && <span>No contour preview yet</span>}
+            </div>
+
+            <dl className="export-summary">
+              <dt>Format</dt><dd>{formatInfo.label}</dd>
+              <dt>Pixels</dt><dd>{imageData.width} x {imageData.height}</dd>
+              <dt>DPI</dt><dd>{resolutionLabel}</dd>
+              <dt>Alpha</dt><dd>{transparentLabel}</dd>
+              <dt>Contour</dt><dd>{format === "svg" ? "SVG output" : format === "pdf" && settings.includeContour ? "Included" : "Not included"}</dd>
+              <dt>Est. size</dt><dd>{formatBytes(estimatedSize)}</dd>
+            </dl>
+          </div>
+        </section>
+
+        <footer className="export-dialog-footer">
+          <span>Export runs locally except BRIA-generated edits already applied to the document.</span>
+          <div>
+            <button type="button" onClick={onClose}>Cancel</button>
+            <button type="submit" className="primary-button">{exportLabel}</button>
+          </div>
+        </footer>
+      </form>
+    </div>
+  );
+}
+
 function AboutPage({ version }) {
   return (
     <main className="about-page">
@@ -2332,16 +2746,17 @@ function AboutPage({ version }) {
           <h2>What It Does</h2>
           <p>
             AlphaKiller prepares transparent artwork for production by removing matte halos,
-            cleaning hidden RGB, refining semi-transparent edges, and exporting clean PNG or TIFF files.
+            cleaning hidden RGB, refining semi-transparent edges, and exporting clean PNG, JPEG, TIFF, PDF, or SVG files.
           </p>
         </article>
 
         <article className="about-panel">
           <h2>Current Beta</h2>
           <ul>
-            <li>PNG, WebP, TIFF import</li>
-            <li>Transparent PNG and TIFF export</li>
-            <li>DPI preservation for PNG and TIFF sources</li>
+            <li>PNG, JPEG, WebP, TIFF import</li>
+            <li>Transparent PNG, TIFF, PDF, and vector SVG export</li>
+            <li>DPI preservation for PNG, JPEG, and TIFF sources</li>
+            <li>PDF export at the current working DPI</li>
             <li>Undo/redo and locally saved cleanup presets</li>
           </ul>
         </article>
@@ -2447,7 +2862,7 @@ function drawEmptyMark(ctx, width, height) {
   ctx.fillStyle = "rgba(255,255,255,.72)";
   ctx.font = "600 16px system-ui";
   ctx.textAlign = "center";
-  ctx.fillText("Drop a PNG, WebP, or TIFF", width / 2, height / 2 - 4);
+  ctx.fillText("Drop a PNG, JPEG, WebP, or TIFF", width / 2, height / 2 - 4);
   ctx.font = "12px system-ui";
   ctx.fillStyle = "rgba(255,255,255,.42)";
   ctx.fillText("Alpha cleanup preview appears here", width / 2, height / 2 + 22);
@@ -2611,6 +3026,45 @@ function drawBrushCursor(ctx, x, y, radius, active, tool = "delete") {
   ctx.restore();
 }
 
+function drawVectorContour(ctx, contour, x, y, zoom, color) {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(zoom, zoom);
+  ctx.strokeStyle = color;
+  ctx.lineWidth = Math.max(0.35, 2 / Math.max(zoom, 0.001));
+  ctx.lineJoin = "round";
+  ctx.lineCap = "round";
+  ctx.shadowColor = "rgba(0, 0, 0, .75)";
+  ctx.shadowBlur = 3 / Math.max(zoom, 0.001);
+
+  for (const path of contour.paths) {
+    const points = path.points;
+    if (!points.length) continue;
+    ctx.beginPath();
+    ctx.moveTo(points[0].x, points[0].y);
+    if (path.curves?.length) {
+      for (const curve of path.curves) {
+        ctx.bezierCurveTo(
+          curve.c1.x,
+          curve.c1.y,
+          curve.c2.x,
+          curve.c2.y,
+          curve.to.x,
+          curve.to.y
+        );
+      }
+    } else {
+      for (let index = 1; index < points.length; index += 1) {
+        ctx.lineTo(points[index].x, points[index].y);
+      }
+    }
+    ctx.closePath();
+    ctx.stroke();
+  }
+
+  ctx.restore();
+}
+
 function drawPixelGrid(ctx, x, y, width, height, zoom) {
   ctx.save();
   ctx.strokeStyle = "rgba(255,255,255,.12)";
@@ -2640,6 +3094,31 @@ function formatBytes(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+}
+
+function estimateExportSize(format, imageData, options = {}) {
+  const pixels = imageData.width * imageData.height;
+  if (format === "jpeg") return pixels * 1.2;
+  if (format === "tiff") return pixels * 4 + 4096;
+  if (format === "pdf") {
+    const contourBytes = options.includeContour && options.contour?.pointCount ? options.contour.pointCount * 18 : 0;
+    return pixels * 4 + contourBytes + 8192;
+  }
+  if (format === "svg") {
+    return Math.max(1024, (options.contour?.pointCount || pixels / 64) * 24);
+  }
+  return pixels * 3.2;
+}
+
+function formatPrintSize(imageData, resolution) {
+  const xDpi = Number(resolution?.xDpi);
+  const yDpi = Number(resolution?.yDpi);
+  if (!Number.isFinite(xDpi) || !Number.isFinite(yDpi) || xDpi <= 0 || yDpi <= 0) return "-";
+  return `${formatInches(imageData.width / xDpi)} x ${formatInches(imageData.height / yDpi)} in`;
+}
+
+function formatInches(value) {
+  return value >= 10 ? value.toFixed(1) : value.toFixed(2);
 }
 
 function percent(value) {
@@ -2780,6 +3259,60 @@ function loadPersistedBriaPreserveAlpha() {
   }
 }
 
+function loadPersistedExportSettings() {
+  try {
+    const raw = window.localStorage?.getItem(EXPORT_SETTINGS_KEY);
+    return normalizeExportSettings(raw ? JSON.parse(raw) : null);
+  } catch {
+    return normalizeExportSettings(null);
+  }
+}
+
+function persistExportSettings(settings) {
+  persistLocalStorage(EXPORT_SETTINGS_KEY, JSON.stringify(normalizeExportSettings(settings)));
+}
+
+function normalizeExportSettings(settings) {
+  const format = normalizeExportDialogFormat(settings?.format);
+  const jpegMatte = /^#[0-9a-f]{6}$/i.test(String(settings?.jpegMatte || ""))
+    ? settings.jpegMatte
+    : DEFAULT_EXPORT_SETTINGS.jpegMatte;
+  return {
+    ...DEFAULT_EXPORT_SETTINGS,
+    format,
+    includeContour: settings?.includeContour === undefined ? DEFAULT_EXPORT_SETTINGS.includeContour : Boolean(settings.includeContour),
+    jpegMatte
+  };
+}
+
+function normalizeExportDialogFormat(format) {
+  return EXPORT_FORMATS.some((item) => item.id === format) ? format : DEFAULT_EXPORT_SETTINGS.format;
+}
+
+function extensionForExportDialogFormat(format) {
+  if (format === "jpeg") return "jpg";
+  if (format === "tiff") return "tiff";
+  if (format === "pdf") return "pdf";
+  if (format === "svg") return "svg";
+  return "png";
+}
+
+function mimeForExportFormat(format) {
+  if (format === "jpeg") return "image/jpeg";
+  if (format === "tiff") return "image/tiff";
+  if (format === "pdf") return "application/pdf";
+  if (format === "svg") return "image/svg+xml";
+  return "image/png";
+}
+
+function formatLabelForExport(format) {
+  if (format === "jpeg") return "JPEG";
+  if (format === "tiff") return "TIFF";
+  if (format === "pdf") return "PDF";
+  if (format === "svg") return "SVG";
+  return "PNG";
+}
+
 function loadCustomPresets() {
   try {
     const raw = window.localStorage?.getItem(CUSTOM_PRESETS_KEY);
@@ -2868,8 +3401,24 @@ function removeLocalStorage(key) {
   }
 }
 
+function downloadByteFile(bytes, filename, type) {
+  const blob = new Blob([bytes], { type });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
 function cloneImageData(imageData) {
   return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
+}
+
+function cloneRefImageData(ref) {
+  return ref.current ? cloneImageData(ref.current) : null;
 }
 
 function cloneResolution(resolution) {
@@ -2884,6 +3433,20 @@ function scaleResolution(resolution, factor) {
     yDpi: resolution.yDpi * factor,
     source: resolution.source || "metadata"
   };
+}
+
+function getPdfExportResolution(resolution) {
+  return resolution || { xDpi: PDF_FALLBACK_DPI, yDpi: PDF_FALLBACK_DPI, source: "PDF fallback" };
+}
+
+function buildExportContour(format, imageData, options) {
+  if (format !== "svg" && (format !== "pdf" || !options.visible)) return null;
+  return traceVectorContour(imageData, {
+    alphaThreshold: options.alphaThreshold,
+    simplifyTolerance: options.simplifyTolerance,
+    offsetPixels: options.offsetPixels,
+    minArea: 2
+  });
 }
 
 function getCanvasPoint(event, canvas) {
@@ -3039,6 +3602,11 @@ function isTiffFile(file) {
   return file.type === "image/tiff" || file.type === "image/x-tiff" || name.endsWith(".tif") || name.endsWith(".tiff");
 }
 
+function isJpegFile(file) {
+  const name = file.name.toLowerCase();
+  return file.type === "image/jpeg" || file.type === "image/pjpeg" || name.endsWith(".jpg") || name.endsWith(".jpeg");
+}
+
 async function decodeTiffFile(file) {
   const buffer = await file.arrayBuffer();
   const ifds = UTIF.decode(buffer);
@@ -3055,17 +3623,45 @@ async function decodeTiffFile(file) {
 }
 
 async function readFileResolution(file) {
-  if (!isPngFile(file)) return null;
   try {
-    return readPngResolution(await file.arrayBuffer());
+    if (isPngFile(file)) {
+      return readPngResolution(await file.arrayBuffer());
+    }
+    if (isJpegFile(file)) {
+      return readJpegResolution(await file.arrayBuffer());
+    }
   } catch {
     return null;
   }
+  return null;
 }
 
 function isPngFile(file) {
   const name = file.name.toLowerCase();
   return file.type === "image/png" || name.endsWith(".png");
+}
+
+function getImageFileFormat(file) {
+  if (isJpegFile(file)) return "JPEG";
+  if (isPngFile(file)) return "PNG";
+  if (isTiffFile(file)) return "TIFF";
+  if (file.type === "image/webp" || file.name.toLowerCase().endsWith(".webp")) return "WEBP";
+  return (file.type || "image").replace("image/", "").toUpperCase();
+}
+
+function mimeTypeForFile(file) {
+  if (isJpegFile(file)) return "image/jpeg";
+  if (isPngFile(file)) return "image/png";
+  if (isTiffFile(file)) return "image/tiff";
+  if (file.name.toLowerCase().endsWith(".webp")) return "image/webp";
+  return file.type || "application/octet-stream";
+}
+
+function imageDataHasTransparency(imageData) {
+  for (let index = 3; index < imageData.data.length; index += 4) {
+    if (imageData.data[index] < 255) return true;
+  }
+  return false;
 }
 
 function imageDataToObjectUrl(imageData) {
@@ -3091,6 +3687,77 @@ async function imageDataToPngArrayBuffer(imageData, resolution = null) {
     }, "image/png");
   });
   return applyPngResolution(await blob.arrayBuffer(), resolution);
+}
+
+async function encodeExportBytes(format, imageData, resolution, options = {}) {
+  if (format === "tiff") {
+    return encodeTiffImageData(imageData, resolution);
+  }
+
+  if (format === "pdf") {
+    return encodePdfImageData(imageData, {
+      resolution,
+      fallbackDpi: PDF_FALLBACK_DPI,
+      contour: options.contour,
+      contourStroke: options.contourColor,
+      contourStrokeWidth: 1
+    });
+  }
+
+  if (format === "svg") {
+    const contour = options.contour || buildExportContour("svg", imageData, DEFAULT_CONTOUR_OPTIONS);
+    return textToArrayBuffer(contourToSvg(contour, {
+      stroke: options.contourColor,
+      strokeWidth: 1,
+      title: options.contourTitle || "AlphaKiller vector contour"
+    }));
+  }
+
+  if (format === "jpeg") {
+    return imageDataToJpegArrayBuffer(imageData, resolution, options);
+  }
+
+  return imageDataToPngArrayBuffer(imageData, resolution);
+}
+
+function textToArrayBuffer(text) {
+  const bytes = new TextEncoder().encode(text);
+  return bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength);
+}
+
+async function imageDataToJpegArrayBuffer(imageData, resolution = null, options = {}) {
+  const matte = getJpegMatteColor(options.background, options.customBackground);
+  const sourceCanvas = document.createElement("canvas");
+  sourceCanvas.width = imageData.width;
+  sourceCanvas.height = imageData.height;
+  sourceCanvas.getContext("2d").putImageData(imageData, 0, 0);
+
+  const canvas = document.createElement("canvas");
+  canvas.width = imageData.width;
+  canvas.height = imageData.height;
+  const context = canvas.getContext("2d");
+  context.fillStyle = matte;
+  context.fillRect(0, 0, canvas.width, canvas.height);
+  context.drawImage(sourceCanvas, 0, 0);
+
+  const blob = await new Promise((resolve, reject) => {
+    canvas.toBlob((nextBlob) => {
+      if (nextBlob) {
+        resolve(nextBlob);
+      } else {
+        reject(new Error("Could not encode image as JPEG."));
+      }
+    }, "image/jpeg", 0.95);
+  });
+
+  return applyJpegResolution(await blob.arrayBuffer(), resolution);
+}
+
+function getJpegMatteColor(background, customBackground) {
+  if (background === "black") return "#000000";
+  if (background === "gray") return "#858b94";
+  if (background === "custom") return customBackground || "#ffffff";
+  return "#ffffff";
 }
 
 async function pngArrayBufferToImageData(pngBytes) {

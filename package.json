@@ -1,6 +1,6 @@
 {
   "name": "alphakiller",
-  "version": "0.1.0-beta.1",
+  "version": "0.1.0-beta.2",
   "description": "Desktop image cleanup tool for transparent pixel and anti-aliasing artifacts.",
   "main": "electron/main.js",
   "type": "module",
@@ -13,6 +13,7 @@
     "diagnose:hf": "node scripts/hf-access-check.mjs",
     "diagnose:bg-remove": "node scripts/bg-remove-smoke.mjs",
     "diagnose:rmbg2:api": "node scripts/rmbg2-api-smoke.mjs",
+    "diagnose:pdf": "node scripts/pdf-export-smoke.mjs",
     "benchmark:bg-remove": "node scripts/bg-remove-benchmark.mjs",
     "build": "vite build",
     "dist:mac": "npm run build && electron-builder --mac dmg --arm64",
