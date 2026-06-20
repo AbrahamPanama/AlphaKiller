@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Activity,
   Blend,
   Check,
   ChevronDown,
@@ -34,7 +33,7 @@ import {
   ZoomOut
 } from "lucide-react";
 import UTIF from "utif";
-import { applyMaskToImage, cropImageDataToBounds, findVisibleAlphaBounds } from "./imageProcessing.js";
+import { applyMaskToImage, cropImageDataToBounds, findVisibleAlphaBounds, protectPureWhite } from "./imageProcessing.js";
 import {
   applyJpegResolution,
   applyPngResolution,
@@ -49,10 +48,9 @@ import { SettingsPanel } from "./SettingsPanel.jsx";
 import { contourToSvg, traceVectorContour } from "./vectorTrace.js";
 
 const DEFAULT_SETTINGS = {
-  threshold: { enabled: false, threshold: 128, softness: 8 },
   defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2, tolerance: 180 },
-  bleed: { enabled: true, radius: 2, iterations: 2, affectSemiTransparent: true, useCustomColor: false, color: "#ffffff" },
-  hardening: { enabled: false, strength: 55, midpoint: 50 }
+  bleed: { enabled: true, reach: 12, affectSemiTransparent: true, useCustomColor: false, color: "#ffffff" },
+  edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
 };
 
 const APP_VERSION_LABEL = "0.1 beta 2";
@@ -70,7 +68,7 @@ const PRESETS = [
     description: "Binary transparency for masks and pixel art.",
     settings: {
       ...DEFAULT_SETTINGS,
-      threshold: { enabled: true, threshold: 128, softness: 0 },
+      edgeFinish: { ...DEFAULT_SETTINGS.edgeFinish, enabled: true, cutoff: 128 },
       defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false },
       bleed: { ...DEFAULT_SETTINGS.bleed, enabled: false }
     }
@@ -85,13 +83,23 @@ const PRESETS = [
     }
   },
   {
+    id: "uv-print-edge",
+    name: "UV Print Edge",
+    description: "Defringe, then crisp 1-bit edge with a black keyline for UV printing.",
+    settings: {
+      ...DEFAULT_SETTINGS,
+      defringe: { enabled: true, matteColor: "#ffffff", strength: 120, radius: 4, tolerance: 230 },
+      edgeFinish: { enabled: true, cutoff: 128, edgeColorEnabled: true, edgeColor: "#000000", edgeWidth: 0 }
+    }
+  },
+  {
     id: "sprite-padding",
     name: "Sprite Edge Padding",
     description: "Bleeds edge colors into hidden transparent RGB.",
     settings: {
       ...DEFAULT_SETTINGS,
       defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false },
-      bleed: { ...DEFAULT_SETTINGS.bleed, enabled: true, radius: 4, iterations: 4, affectSemiTransparent: true }
+      bleed: { ...DEFAULT_SETTINGS.bleed, enabled: true, reach: 48, affectSemiTransparent: true }
     }
   }
 ];
@@ -151,7 +159,7 @@ const DEFAULT_COMPARE_AFTER = {
 
 const COMPARE_FEATURES = [
   { id: "bgr", label: "BGR", title: "Background removal" },
-  { id: "alpha", label: "Alpha", title: "Defringe, color bleed, threshold, and hardening" },
+  { id: "alpha", label: "Alpha", title: "Defringe, color bleed, and edge finishing" },
   { id: "manual", label: "Manual", title: "Delete and Reconstruct pen edits" },
   { id: "ss", label: "SS", title: "Super Scale" }
 ];
@@ -203,7 +211,8 @@ const EXPORT_FORMATS = [
 const DEFAULT_EXPORT_SETTINGS = {
   format: "png",
   includeContour: true,
-  jpegMatte: "#ffffff"
+  jpegMatte: "#ffffff",
+  protectWhite: false
 };
 
 export function App() {
@@ -1593,7 +1602,8 @@ export function App() {
           customBackground: defaultFormat === "jpeg" ? selected.jpegMatte : customBackground,
           contour: exportContour,
           contourColor: contourOptions.color,
-          contourTitle: `${baseName} AlphaKiller vector contour`
+          contourTitle: `${baseName} AlphaKiller vector contour`,
+          protectWhite: selected.protectWhite
         });
 
         downloadByteFile(bytes, `${baseName}-cleaned.${defaultExtension}`, mimeForExportFormat(defaultFormat));
@@ -1622,7 +1632,8 @@ export function App() {
         customBackground: target.format === "jpeg" ? selected.jpegMatte : customBackground,
         contour: exportContour,
         contourColor: contourOptions.color,
-        contourTitle: `${baseName} AlphaKiller vector contour`
+        contourTitle: `${baseName} AlphaKiller vector contour`,
+        protectWhite: selected.protectWhite
       });
 
       const result = await window.alphaKiller.writeExport({
@@ -2271,7 +2282,7 @@ export function App() {
             <ColorControl label="Matte" value={settings.defringe.matteColor} onChange={(value) => updateSetting("defringe", "matteColor", value)} />
             <RangeControl label="Strength" value={settings.defringe.strength} min={0} max={200} unit="%" onChange={(value) => updateSetting("defringe", "strength", value)} />
             <RangeControl label="Matte tolerance" value={settings.defringe.tolerance ?? 255} min={0} max={255} onChange={(value) => updateSetting("defringe", "tolerance", value)} />
-            <RangeControl label="Edge radius" value={settings.defringe.radius} min={1} max={6} unit="px" onChange={(value) => updateSetting("defringe", "radius", value)} />
+            <RangeControl label="Edge depth" value={settings.defringe.radius} min={1} max={4} onChange={(value) => updateSetting("defringe", "radius", value)} />
           </ToolSection>
 
           <ToolSection
@@ -2280,31 +2291,22 @@ export function App() {
             enabled={settings.bleed.enabled}
             onToggle={(value) => updateSetting("bleed", "enabled", value)}
           >
-            <RangeControl label="Radius" value={settings.bleed.radius} min={1} max={8} unit="px" onChange={(value) => updateSetting("bleed", "radius", value)} />
-            <RangeControl label="Iterations" value={settings.bleed.iterations} min={1} max={6} onChange={(value) => updateSetting("bleed", "iterations", value)} />
+            <RangeControl label="Reach" value={settings.bleed.reach} min={2} max={64} unit="px" onChange={(value) => updateSetting("bleed", "reach", value)} />
             <ToggleRow label="Use bleed color" checked={settings.bleed.useCustomColor ?? false} onChange={(value) => updateSetting("bleed", "useCustomColor", value)} />
             <ColorControl label="Bleed color" value={settings.bleed.color ?? "#ffffff"} onChange={(value) => updateSetting("bleed", "color", value)} />
             <ToggleRow label="Affect semi-alpha" checked={settings.bleed.affectSemiTransparent} onChange={(value) => updateSetting("bleed", "affectSemiTransparent", value)} />
           </ToolSection>
 
           <ToolSection
-            icon={<Activity size={15} />}
-            title="Alpha Threshold"
-            enabled={settings.threshold.enabled}
-            onToggle={(value) => updateSetting("threshold", "enabled", value)}
+            icon={<Scissors size={15} />}
+            title="Edge Finishing"
+            enabled={settings.edgeFinish.enabled}
+            onToggle={(value) => updateSetting("edgeFinish", "enabled", value)}
           >
-            <RangeControl label="Threshold" value={settings.threshold.threshold} min={0} max={255} onChange={(value) => updateSetting("threshold", "threshold", value)} />
-            <RangeControl label="Softness" value={settings.threshold.softness} min={0} max={64} onChange={(value) => updateSetting("threshold", "softness", value)} />
-          </ToolSection>
-
-          <ToolSection
-            icon={<Sparkles size={15} />}
-            title="Alpha Hardening"
-            enabled={settings.hardening.enabled}
-            onToggle={(value) => updateSetting("hardening", "enabled", value)}
-          >
-            <RangeControl label="Strength" value={settings.hardening.strength} min={0} max={100} unit="%" onChange={(value) => updateSetting("hardening", "strength", value)} />
-            <RangeControl label="Midpoint" value={settings.hardening.midpoint} min={1} max={99} unit="%" onChange={(value) => updateSetting("hardening", "midpoint", value)} />
+            <RangeControl label="Cutoff" value={settings.edgeFinish.cutoff} min={1} max={254} onChange={(value) => updateSetting("edgeFinish", "cutoff", value)} />
+            <ToggleRow label="Edge color" checked={settings.edgeFinish.edgeColorEnabled ?? false} onChange={(value) => updateSetting("edgeFinish", "edgeColorEnabled", value)} />
+            <ColorControl label="Color" value={settings.edgeFinish.edgeColor ?? "#000000"} onChange={(value) => updateSetting("edgeFinish", "edgeColor", value)} />
+            <RangeControl label="Edge width" value={settings.edgeFinish.edgeWidth ?? 0} min={0} max={16} unit="px" onChange={(value) => updateSetting("edgeFinish", "edgeWidth", value)} />
           </ToolSection>
 
           <ToolSection
@@ -2689,6 +2691,20 @@ function ExportDialog({ source, imageData, previewUrl, settings, contour, contou
                   <em>{contour?.pathCount ? `${contour.pathCount} paths` : "Live"}</em>
                 </div>
               )}
+
+              {format !== "svg" && (
+                <label className="export-check-option">
+                  <input
+                    type="checkbox"
+                    checked={settings.protectWhite}
+                    onChange={(event) => onChange("protectWhite", event.target.checked)}
+                  />
+                  <span>
+                    <strong>Protect pure white</strong>
+                    <small>Nudges 255,255,255 (CMYK 0,0,0,0) to 254,254,254 so RIP software does not read it as a knockout/alpha.</small>
+                  </span>
+                </label>
+              )}
             </div>
 
             <span className="export-section-label">Preview</span>
@@ -2710,6 +2726,7 @@ function ExportDialog({ source, imageData, previewUrl, settings, contour, contou
               <dt>DPI</dt><dd>{resolutionLabel}</dd>
               <dt>Alpha</dt><dd>{transparentLabel}</dd>
               <dt>Contour</dt><dd>{format === "svg" ? "SVG output" : format === "pdf" && settings.includeContour ? "Included" : "Not included"}</dd>
+              <dt>White</dt><dd>{format === "svg" ? "-" : settings.protectWhite ? "Protected (254)" : "Pure 255"}</dd>
               <dt>Est. size</dt><dd>{formatBytes(estimatedSize)}</dd>
             </dl>
           </div>
@@ -3281,7 +3298,8 @@ function normalizeExportSettings(settings) {
     ...DEFAULT_EXPORT_SETTINGS,
     format,
     includeContour: settings?.includeContour === undefined ? DEFAULT_EXPORT_SETTINGS.includeContour : Boolean(settings.includeContour),
-    jpegMatte
+    jpegMatte,
+    protectWhite: settings?.protectWhite === undefined ? DEFAULT_EXPORT_SETTINGS.protectWhite : Boolean(settings.protectWhite)
   };
 }
 
@@ -3350,23 +3368,45 @@ function normalizeCustomPreset(preset) {
 
 function normalizePresetSettings(settings) {
   return {
-    threshold: {
-      ...DEFAULT_SETTINGS.threshold,
-      ...(settings?.threshold || {})
-    },
-    defringe: {
-      ...DEFAULT_SETTINGS.defringe,
-      ...(settings?.defringe || {})
-    },
-    bleed: {
-      ...DEFAULT_SETTINGS.bleed,
-      ...(settings?.bleed || {})
-    },
-    hardening: {
-      ...DEFAULT_SETTINGS.hardening,
-      ...(settings?.hardening || {})
-    }
+    defringe: normalizeDefringeSettings(settings?.defringe),
+    bleed: normalizeBleedSettings(settings?.bleed),
+    edgeFinish: normalizeEdgeFinishSettings(settings)
   };
+}
+
+function normalizeEdgeFinishSettings(settings) {
+  if (settings?.edgeFinish) {
+    const merged = { ...DEFAULT_SETTINGS.edgeFinish, ...settings.edgeFinish };
+    merged.cutoff = Math.min(254, Math.max(1, Math.round(Number(merged.cutoff) || 128)));
+    merged.edgeWidth = Math.min(16, Math.max(0, Math.round(Number(merged.edgeWidth) || 0)));
+    merged.edgeColorEnabled = Boolean(merged.edgeColorEnabled);
+    return merged;
+  }
+  // Migrate legacy Threshold + Hardening into the unified Edge Finishing operator.
+  const legacyThreshold = settings?.threshold;
+  const legacyHardening = settings?.hardening;
+  const enabled = Boolean(legacyThreshold?.enabled || legacyHardening?.enabled);
+  const cutoff = Math.min(254, Math.max(1, Math.round(Number(legacyThreshold?.threshold) || 128)));
+  return { ...DEFAULT_SETTINGS.edgeFinish, enabled, cutoff };
+}
+
+function normalizeDefringeSettings(defringe) {
+  const merged = { ...DEFAULT_SETTINGS.defringe, ...(defringe || {}) };
+  // Edge depth saturates at 4 (alphaLimit caps at 254); clamp legacy 5/6 values.
+  merged.radius = Math.min(4, Math.max(1, Math.round(Number(merged.radius) || 1)));
+  return merged;
+}
+
+function normalizeBleedSettings(bleed) {
+  const merged = { ...DEFAULT_SETTINGS.bleed, ...(bleed || {}) };
+  // Legacy presets stored radius + iterations; their product (×3) was the reach in pixels.
+  if (bleed && bleed.reach == null && bleed.radius != null) {
+    merged.reach = Number(bleed.radius) * (Number(bleed.iterations) || 1) * 3;
+  }
+  merged.reach = Math.min(64, Math.max(2, Math.round(Number(merged.reach) || DEFAULT_SETTINGS.bleed.reach)));
+  delete merged.radius;
+  delete merged.iterations;
+  return merged;
 }
 
 function loadStoredHfToken() {
@@ -3690,12 +3730,15 @@ async function imageDataToPngArrayBuffer(imageData, resolution = null) {
 }
 
 async function encodeExportBytes(format, imageData, resolution, options = {}) {
+  // SVG carries no raster pixels; every other format gets pure-white protection when requested.
+  const raster = options.protectWhite && format !== "svg" ? protectPureWhite(imageData) : imageData;
+
   if (format === "tiff") {
-    return encodeTiffImageData(imageData, resolution);
+    return encodeTiffImageData(raster, resolution);
   }
 
   if (format === "pdf") {
-    return encodePdfImageData(imageData, {
+    return encodePdfImageData(raster, {
       resolution,
       fallbackDpi: PDF_FALLBACK_DPI,
       contour: options.contour,
@@ -3714,10 +3757,10 @@ async function encodeExportBytes(format, imageData, resolution, options = {}) {
   }
 
   if (format === "jpeg") {
-    return imageDataToJpegArrayBuffer(imageData, resolution, options);
+    return imageDataToJpegArrayBuffer(raster, resolution, options);
   }
 
-  return imageDataToPngArrayBuffer(imageData, resolution);
+  return imageDataToPngArrayBuffer(raster, resolution);
 }
 
 function textToArrayBuffer(text) {
@@ -3726,7 +3769,9 @@ function textToArrayBuffer(text) {
 }
 
 async function imageDataToJpegArrayBuffer(imageData, resolution = null, options = {}) {
-  const matte = getJpegMatteColor(options.background, options.customBackground);
+  let matte = getJpegMatteColor(options.background, options.customBackground);
+  // A pure-white flatten matte would reintroduce 255,255,255 across the background.
+  if (options.protectWhite && /^#ffffff$/i.test(matte)) matte = "#fefefe";
   const sourceCanvas = document.createElement("canvas");
   sourceCanvas.width = imageData.width;
   sourceCanvas.height = imageData.height;

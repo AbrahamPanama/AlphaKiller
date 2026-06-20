@@ -145,21 +145,20 @@ The split handle should be draggable and keyboard accessible.
 
 ## 8. Editing Tools
 
-### 8.1 Alpha Threshold
+### 8.1 Edge Finishing
 
-Purpose: Convert semi-transparent pixels into fully opaque or fully transparent pixels based on alpha value.
+Purpose: Produce crisp, print-ready (1-bit) edges by binarizing alpha at a cutoff so no semi-transparent pixels remain, and optionally recolor the edge band to a chosen color (e.g. a black keyline) to "kill" the anti-aliased rim — useful for UV printing. Consolidates the former Alpha Threshold and Alpha Hardening tools.
 
 Controls:
 
-- Threshold slider: 0-255.
-- Edge softness slider.
-- Preserve fully transparent RGB toggle.
-- Preview affected pixels toggle.
+- Cutoff slider: 1-254 (alpha at/above becomes opaque, below becomes transparent).
+- Edge color toggle + color swatch (default black).
+- Edge width slider: 0-16 px (0 recolors only the existing rim; higher dilates an outward colored keyline).
 
 Expected UI behavior:
 
 - Show live preview.
-- Warn subtly when hard thresholding may create jagged edges.
+- Warn subtly when hard cutoff may create jagged edges.
 - Provide reset-to-default for each control.
 
 ### 8.2 Defringe / Matte Removal
@@ -171,7 +170,8 @@ Controls:
 - Matte color picker.
 - Auto-detect matte color button.
 - Strength slider.
-- Edge radius slider.
+- Matte tolerance slider (max color distance from the matte that still gets corrected).
+- Edge depth slider (how far into the anti-aliased edge, by alpha, defringing reaches).
 - Protect saturated colors toggle.
 - Preview fringe map toggle.
 
@@ -186,8 +186,7 @@ Purpose: Extend nearby opaque colors into transparent or semi-transparent pixels
 
 Controls:
 
-- Radius slider.
-- Iterations stepper.
+- Reach slider (bleed distance in pixels).
 - Affect transparent pixels toggle.
 - Affect semi-transparent pixels toggle.
 - Preserve alpha toggle.
@@ -197,19 +196,7 @@ Expected UI behavior:
 - Especially useful for game assets and sprites.
 - The UI should not imply this removes transparency; it fixes hidden RGB data around edges.
 
-### 8.4 Alpha Hardening
-
-Purpose: Push semi-transparent pixels toward either opaque or transparent while keeping smoother edges than a raw threshold.
-
-Controls:
-
-- Strength slider.
-- Midpoint slider.
-- Curve selector: linear, smooth, aggressive.
-- Minimum alpha clamp.
-- Maximum alpha clamp.
-
-### 8.5 Cleanup Stack
+### 8.4 Cleanup Stack
 
 Users should be able to enable multiple cleanup operations in order.
 
@@ -257,7 +244,7 @@ Recommended sections:
 Controls should use familiar UI patterns:
 
 - Sliders for continuous values.
-- Steppers or numeric inputs for iterations/radius.
+- Steppers or numeric inputs for reach/depth.
 - Toggles for boolean options.
 - Swatches for colors.
 - Segmented controls for modes.
@@ -303,6 +290,7 @@ Required options:
 - Add suffix option, default: `-cleaned`.
 - Preserve dimensions.
 - Preserve metadata toggle if supported.
+- Protect pure white toggle (opt-in): nudges RGB 255,255,255 (CMYK 0,0,0,0) to 254,254,254 on visible pixels for all raster formats, so RIP software does not read paper-white as a knockout/alpha value. Not applicable to SVG.
 
 ### 11.2 Batch Export
 
@@ -515,7 +503,7 @@ Required menu groups:
 - File: Open, Open Folder, Recent Files, Export, Batch Export, Close.
 - Edit: Undo, Redo, Reset Settings, Preferences.
 - View: Zoom In, Zoom Out, Fit, 100%, Toggle Grid, Toggle Alpha Mask, Toggle Split View.
-- Tools: Alpha Threshold, Defringe, Color Bleed, Alpha Hardening.
+- Tools: Defringe, Color Bleed, Edge Finishing.
 - Help: Documentation, Keyboard Shortcuts, About AlphaKiller.
 
 ## 23. Design Deliverables Requested From Claude Design
@@ -577,7 +565,7 @@ The first build should include:
 - Single image open/import.
 - Canvas preview.
 - Checkerboard, black, white, gray, and custom preview backgrounds.
-- Alpha Threshold.
+- Edge Finishing.
 - Defringe.
 - Color Bleed.
 - Before/after toggle.

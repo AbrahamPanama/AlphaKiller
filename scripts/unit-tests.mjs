@@ -15,7 +15,8 @@ const {
   cropImageDataToBounds,
   dilateBand,
   findVisibleAlphaBounds,
-  applyProcessing
+  applyProcessing,
+  protectPureWhite
 } = await import("../src/imageProcessing.js");
 const {
   applyJpegResolution,
@@ -110,20 +111,69 @@ function testFindVisibleAlphaBoundsAndCrop() {
   ]);
 }
 
-function testAlphaThresholdProcessing() {
+function testEdgeFinishCutoffBinarizes() {
   const image = makeImageData(2, 1, [
     0, 0, 0, 127,
     255, 255, 255, 128
   ]);
   const output = applyProcessing(image, {
     defringe: { enabled: false, matteColor: "#ffffff", strength: 0, radius: 1 },
-    bleed: { enabled: false, radius: 1, iterations: 1, affectSemiTransparent: false },
-    threshold: { enabled: true, threshold: 128, softness: 0 },
-    hardening: { enabled: false, strength: 0, midpoint: 50 }
+    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
+    edgeFinish: { enabled: true, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
   });
 
+  // Alpha below cutoff -> 0, at/above cutoff -> 255; colors untouched.
   assert.equal(output.data[3], 0);
   assert.equal(output.data[7], 255);
+  assert.equal(output.data[4], 255);
+}
+
+function testEdgeFinishRecolorsRim() {
+  // 4x1: solid core, retained rim (a>=cutoff but originally semi), dropped, transparent.
+  const image = makeImageData(4, 1, [
+    200, 100, 50, 255,
+    200, 100, 50, 200,
+    200, 100, 50, 60,
+    200, 100, 50, 0
+  ]);
+  const output = applyProcessing(image, {
+    defringe: { enabled: false, matteColor: "#ffffff", strength: 0, radius: 1 },
+    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
+    edgeFinish: { enabled: true, cutoff: 128, edgeColorEnabled: true, edgeColor: "#000000", edgeWidth: 0 }
+  });
+
+  // No semi-alpha survives.
+  for (let i = 3; i < output.data.length; i += 4) {
+    assert.ok(output.data[i] === 0 || output.data[i] === 255);
+  }
+  // The retained rim pixel (index 1) is recolored to the edge color and opaque.
+  assert.deepEqual(Array.from(output.data.slice(4, 8)), [0, 0, 0, 255]);
+  // The dropped pixel (index 2, alpha 60 < cutoff) is cut.
+  assert.equal(output.data[11], 0);
+}
+
+function testProtectPureWhite() {
+  const image = makeImageData(4, 1, [
+    255, 255, 255, 255, // pure white, opaque -> nudged
+    255, 255, 255, 0,   // pure white, transparent -> left alone
+    255, 255, 254, 255, // not pure white -> untouched
+    10, 20, 30, 255     // arbitrary -> untouched
+  ]);
+  const output = protectPureWhite(image);
+
+  // Source is not mutated.
+  assert.equal(image.data[0], 255);
+  // Visible pure white becomes 254,254,254; alpha preserved.
+  assert.deepEqual(Array.from(output.data.slice(0, 4)), [254, 254, 254, 255]);
+  // Transparent pure white is left as-is.
+  assert.deepEqual(Array.from(output.data.slice(4, 8)), [255, 255, 255, 0]);
+  // Near-white and other colors are untouched.
+  assert.deepEqual(Array.from(output.data.slice(8, 12)), [255, 255, 254, 255]);
+  assert.deepEqual(Array.from(output.data.slice(12, 16)), [10, 20, 30, 255]);
+
+  // Custom limit.
+  const custom = protectPureWhite(makeImageData(1, 1, [255, 255, 255, 255]), { limit: 250 });
+  assert.deepEqual(Array.from(custom.data), [250, 250, 250, 255]);
 }
 
 function testDefringeTolerance() {
@@ -133,9 +183,8 @@ function testDefringeTolerance() {
   ]);
   const output = applyProcessing(image, {
     defringe: { enabled: true, matteColor: "#ffffff", strength: 100, radius: 3, tolerance: 32 },
-    bleed: { enabled: false, radius: 1, iterations: 1, affectSemiTransparent: false },
-    threshold: { enabled: false, threshold: 128, softness: 0 },
-    hardening: { enabled: false, strength: 0, midpoint: 50 }
+    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
+    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
   });
 
   assert.ok(output.data[0] < 240);
@@ -150,9 +199,8 @@ function testDefringeTolerancePotency() {
   ]);
   const output = applyProcessing(image, {
     defringe: { enabled: true, matteColor: "#ffffff", strength: 100, radius: 3, tolerance: 180 },
-    bleed: { enabled: false, radius: 1, iterations: 1, affectSemiTransparent: false },
-    threshold: { enabled: false, threshold: 128, softness: 0 },
-    hardening: { enabled: false, strength: 0, midpoint: 50 }
+    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
+    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
   });
 
   assert.equal(output.data[0], 0);
@@ -166,12 +214,11 @@ function testDefringeStrengthPotency() {
   ]);
   const output = applyProcessing(image, {
     defringe: { enabled: true, matteColor: "#ffffff", strength: 50, radius: 3, tolerance: 255 },
-    bleed: { enabled: false, radius: 1, iterations: 1, affectSemiTransparent: false },
-    threshold: { enabled: false, threshold: 128, softness: 0 },
-    hardening: { enabled: false, strength: 0, midpoint: 50 }
+    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
+    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
   });
 
-  assert.equal(output.data[0], 173);
+  assert.equal(output.data[0], 176);
 }
 
 function testColorBleedReachPotency() {
@@ -184,9 +231,8 @@ function testColorBleedReachPotency() {
   ]);
   const output = applyProcessing(image, {
     defringe: { enabled: false, matteColor: "#ffffff", strength: 0, radius: 1, tolerance: 255 },
-    bleed: { enabled: true, radius: 1, iterations: 1, affectSemiTransparent: false, useCustomColor: false, color: "#ffffff" },
-    threshold: { enabled: false, threshold: 128, softness: 0 },
-    hardening: { enabled: false, strength: 0, midpoint: 50 }
+    bleed: { enabled: true, reach: 3, affectSemiTransparent: false, useCustomColor: false, color: "#ffffff" },
+    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
   });
 
   assert.deepEqual(Array.from(output.data.slice(12, 15)), [10, 20, 30]);
@@ -200,9 +246,8 @@ function testColorBleedCustomColor() {
   ]);
   const output = applyProcessing(image, {
     defringe: { enabled: false, matteColor: "#ffffff", strength: 0, radius: 1, tolerance: 255 },
-    bleed: { enabled: true, radius: 1, iterations: 1, affectSemiTransparent: false, useCustomColor: true, color: "#336699" },
-    threshold: { enabled: false, threshold: 128, softness: 0 },
-    hardening: { enabled: false, strength: 0, midpoint: 50 }
+    bleed: { enabled: true, reach: 3, affectSemiTransparent: false, useCustomColor: true, color: "#336699" },
+    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
   });
 
   assert.deepEqual(Array.from(output.data.slice(4, 8)), [51, 102, 153, 0]);
@@ -396,7 +441,9 @@ testApplyMaskToImage();
 testBuildTrimap();
 testDilateBand();
 testFindVisibleAlphaBoundsAndCrop();
-testAlphaThresholdProcessing();
+testEdgeFinishCutoffBinarizes();
+testEdgeFinishRecolorsRim();
+testProtectPureWhite();
 testDefringeTolerance();
 testDefringeTolerancePotency();
 testDefringeStrengthPotency();

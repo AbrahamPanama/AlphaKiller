@@ -9,15 +9,32 @@ export function applyProcessing(sourceImageData, settings) {
     colorBleed(working, settings.bleed);
   }
 
-  if (settings.threshold.enabled) {
-    alphaThreshold(working, settings.threshold);
-  }
-
-  if (settings.hardening.enabled) {
-    alphaHarden(working, settings.hardening);
+  if (settings.edgeFinish?.enabled) {
+    edgeFinish(working, settings.edgeFinish);
   }
 
   return working;
+}
+
+// Nudge pure white (RGB 255,255,255 — the CMYK 0,0,0,0 paper-white) on visible pixels down to a
+// near-white `limit` so RIP software does not read it as a knockout / no-ink (alpha) value.
+// Returns a new ImageData; the alpha channel is left untouched.
+export function protectPureWhite(imageData, options = {}) {
+  const limit = clampByte(options.limit ?? 254);
+  const requireVisible = options.requireVisible ?? true;
+  const output = cloneImageData(imageData);
+  const data = output.data;
+
+  for (let i = 0; i < data.length; i += 4) {
+    if (requireVisible && data[i + 3] === 0) continue;
+    if (data[i] === 255 && data[i + 1] === 255 && data[i + 2] === 255) {
+      data[i] = limit;
+      data[i + 1] = limit;
+      data[i + 2] = limit;
+    }
+  }
+
+  return output;
 }
 
 export function affectedPixelStats(original, processed) {
@@ -195,56 +212,69 @@ const BLEED_SOURCE_ALPHA = 180;
 const BLEED_DISTANCE_INF = 65535;
 const BLEED_ORTHOGONAL_WEIGHT = 10;
 const BLEED_DIAGONAL_WEIGHT = 14;
-const BLEED_DISTANCE_SCALE = 10;
-const BLEED_REACH_POTENCY = 3;
 const DEFRINGE_STRENGTH_POTENCY = 2;
-const MATTE_TOLERANCE_POTENCY = 6;
 
 function cloneImageData(imageData) {
   return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
 }
 
-function alphaThreshold(imageData, { threshold, softness }) {
-  const data = imageData.data;
-  const soft = Math.max(0, softness);
-  const low = threshold - soft;
-  const high = threshold + soft;
+// Edge Finishing: binarize alpha at `cutoff` for crisp, print-ready (1-bit) edges, and
+// optionally recolor the edge band to a chosen color. With edgeWidth = 0 only the existing
+// anti-aliased rim is recolored (silhouette unchanged); edgeWidth > 0 dilates an opaque
+// colored keyline outward by that many pixels.
+function edgeFinish(imageData, { cutoff, edgeColorEnabled, edgeColor, edgeWidth }) {
+  const { width, height, data } = imageData;
+  const pixelCount = width * height;
+  const cut = clampByte(cutoff ?? 128);
 
-  for (let i = 0; i < data.length; i += 4) {
-    const a = data[i + 3];
-    if (soft === 0) {
-      data[i + 3] = a >= threshold ? 255 : 0;
-    } else if (a <= low) {
-      data[i + 3] = 0;
-    } else if (a >= high) {
-      data[i + 3] = 255;
+  // Binarized inside-mask of the hard shape.
+  const inside = new Uint8Array(pixelCount);
+  for (let pixel = 0, index = 0; pixel < pixelCount; pixel++, index += 4) {
+    inside[pixel] = data[index + 3] >= cut ? 1 : 0;
+  }
+
+  if (!edgeColorEnabled) {
+    for (let pixel = 0, index = 0; pixel < pixelCount; pixel++, index += 4) {
+      data[index + 3] = inside[pixel] ? 255 : 0;
+    }
+    return;
+  }
+
+  const color = hexToRgb(edgeColor || "#000000");
+  const grow = Math.max(0, Math.floor(edgeWidth ?? 0));
+  // Final opaque shape grows outward by `grow`; the core that keeps art color is eroded 1px.
+  const finalMask = grow > 0 ? dilateBand(inside, width, height, 1, grow) : inside;
+  const core = erodeMask(inside, width, height, 1);
+
+  for (let pixel = 0, index = 0; pixel < pixelCount; pixel++, index += 4) {
+    if (finalMask[pixel]) {
+      data[index + 3] = 255;
+      if (!core[pixel]) {
+        data[index] = color.r;
+        data[index + 1] = color.g;
+        data[index + 2] = color.b;
+      }
     } else {
-      const t = smoothstep((a - low) / Math.max(1, high - low));
-      data[i + 3] = Math.round(t * 255);
+      data[index + 3] = 0;
     }
   }
 }
 
-function alphaHarden(imageData, { strength, midpoint }) {
-  const data = imageData.data;
-  const amount = strength / 100;
-  const mid = midpoint / 100;
-
-  for (let i = 0; i < data.length; i += 4) {
-    const alpha = data[i + 3] / 255;
-    if (alpha === 0 || alpha === 1) continue;
-    const hardened = alpha < mid
-      ? alpha * (1 - amount)
-      : alpha + (1 - alpha) * amount;
-    data[i + 3] = clampByte(hardened * 255);
-  }
+// Binary erosion via dilation of the complement (erode(M) = ¬dilate(¬M)).
+function erodeMask(mask, width, height, radius) {
+  const inverted = new Uint8Array(mask.length);
+  for (let i = 0; i < mask.length; i++) inverted[i] = mask[i] ? 0 : 1;
+  const dilated = dilateBand(inverted, width, height, 1, radius);
+  const output = new Uint8Array(mask.length);
+  for (let i = 0; i < mask.length; i++) output[i] = dilated[i] ? 0 : 1;
+  return output;
 }
 
 function defringe(imageData, { matteColor, strength, radius, tolerance }) {
   const data = imageData.data;
   const matte = hexToRgb(matteColor);
   const amount = (Math.max(0, strength) / 100) * DEFRINGE_STRENGTH_POTENCY;
-  const matteTolerance = Math.max(0, tolerance ?? 255) * MATTE_TOLERANCE_POTENCY;
+  const matteTolerance = Math.max(0, tolerance ?? 255);
   const alphaLimit = Math.min(254, 80 + radius * 45);
 
   for (let i = 0; i < data.length; i += 4) {
@@ -273,14 +303,15 @@ function getMatteMatch(r, g, b, matte, tolerance) {
   return 1 - smoothstep(distance / tolerance);
 }
 
-function colorBleed(imageData, { radius, iterations, affectSemiTransparent, useCustomColor, color }) {
+function colorBleed(imageData, { reach, affectSemiTransparent, useCustomColor, color }) {
   const { width, height } = imageData;
   const data = imageData.data;
   const pixelCount = width * height;
   const bleedColor = useCustomColor ? hexToRgb(color || "#ffffff") : null;
+  // reach is the bleed distance in pixels; one orthogonal pixel step costs BLEED_ORTHOGONAL_WEIGHT.
   const maxDistance = Math.min(
     BLEED_DISTANCE_INF - 1,
-    Math.max(1, radius) * Math.max(1, iterations) * BLEED_DISTANCE_SCALE * BLEED_REACH_POTENCY
+    Math.max(1, reach) * BLEED_ORTHOGONAL_WEIGHT
   );
   const distances = new Uint16Array(pixelCount);
   distances.fill(BLEED_DISTANCE_INF);
