@@ -2,7 +2,7 @@
 
 ## 1. Product Overview
 
-AlphaKiller is a desktop image editing app for cleaning problematic transparent and semi-transparent pixels in PNG, JPEG, WebP, and TIFF assets. Its primary use case is fixing anti-aliased edges, halos, dirty mattes, and texture bleed issues in graphics, icons, sprites, UI assets, and exported artwork.
+AlphaKiller is a desktop image editing app for cleaning problematic transparent and semi-transparent pixels in PNG, JPEG, WebP, and TIFF assets. Its primary use case is fixing anti-aliased edges, halos, dirty mattes, and edge RGB artifacts in graphics, icons, sprites, UI assets, and exported artwork.
 
 The interface should feel like a precise, modern production tool: fast, focused, visual, and confidence-building. Users should be able to load an image, immediately see the transparency problem, adjust cleanup tools, compare before and after, and export the result without navigating through unnecessary panels.
 
@@ -147,18 +147,21 @@ The split handle should be draggable and keyboard accessible.
 
 ### 8.1 Edge Finishing
 
-Purpose: Produce crisp, print-ready (1-bit) edges by binarizing alpha at a cutoff so no semi-transparent pixels remain, and optionally recolor the edge band to a chosen color (e.g. a black keyline) to "kill" the anti-aliased rim — useful for UV printing. Consolidates the former Alpha Threshold and Alpha Hardening tools.
+Purpose: Produce crisp, print-ready (1-bit) edges by binarizing alpha at a cutoff so no semi-transparent pixels remain, and optionally finish the rim with Off, Auto, or Solid color handling. This consolidates the former Alpha Threshold, Alpha Hardening, and redundant Color Bleed / Edge Padding behavior.
 
 Controls:
 
 - Cutoff slider: 1-254 (alpha at/above becomes opaque, below becomes transparent).
-- Edge color toggle + color swatch (default black).
-- Edge width slider: 0-16 px (0 recolors only the existing rim; higher dilates an outward colored keyline).
+- Rim Color segmented control: Off / Auto / Solid.
+- Auto Rim Color description: use nearby artwork color for the rim so printed edges carry matching ink and avoid white, black, or transparent-pixel halos.
+- Solid Rim Color swatch (default black), shown only when Solid is selected.
+- Rim width slider: 0-16 px (0 finishes only the existing rim; higher dilates an outward keyline).
 
 Expected UI behavior:
 
 - Show live preview.
 - Warn subtly when hard cutoff may create jagged edges.
+- Auto Rim Color should be described in print-friendly wording, not technical sampling language.
 - Provide reset-to-default for each control.
 
 ### 8.2 Defringe / Matte Removal
@@ -172,6 +175,7 @@ Controls:
 - Strength slider.
 - Matte tolerance slider (max color distance from the matte that still gets corrected).
 - Edge depth slider (how far into the anti-aliased edge, by alpha, defringing reaches).
+- Passes slider (1-5): re-runs defringing on the corrected result, pushing stubborn matte residue further out — equivalent to exporting with transparency and defringing again.
 - Protect saturated colors toggle.
 - Preview fringe map toggle.
 
@@ -180,21 +184,19 @@ Expected UI behavior:
 - Matte color should be shown as a swatch.
 - Auto-detect should explain confidence using simple UI language, not technical logs.
 
-### 8.3 Color Bleed / Edge Padding
+### 8.3 Removed: Color Bleed / Edge Padding
 
-Purpose: Extend nearby opaque colors into transparent or semi-transparent pixels to prevent edge artifacts.
+Color Bleed is no longer a separate cleanup tool. It was removed as redundant because its edge-padding purpose is covered by Edge Finishing with Rim Color and Rim Width.
 
-Controls:
+Former behavior:
 
-- Reach slider (bleed distance in pixels).
-- Affect transparent pixels toggle.
-- Affect semi-transparent pixels toggle.
-- Preserve alpha toggle.
+- Extend nearby opaque colors into transparent or semi-transparent pixels to prevent edge artifacts.
+- Preserve alpha while fixing hidden RGB data around edges.
 
-Expected UI behavior:
+Current UI requirement:
 
-- Especially useful for game assets and sprites.
-- The UI should not imply this removes transparency; it fixes hidden RGB data around edges.
+- Do not expose Color Bleed as a tool, menu item, preset control, or MVP feature.
+- Route edge color cleanup to Edge Finishing > Rim Color.
 
 ### 8.4 Cleanup Stack
 
@@ -330,7 +332,7 @@ Suggested built-in presets:
 - Gentle Edge Cleanup.
 - White Matte Defringe.
 - Black Matte Defringe.
-- Sprite Edge Padding.
+- Sprite Rim Cleanup.
 - Icon Cleanup.
 
 Preset names should be practical and tied to outcomes.
@@ -503,7 +505,7 @@ Required menu groups:
 - File: Open, Open Folder, Recent Files, Export, Batch Export, Close.
 - Edit: Undo, Redo, Reset Settings, Preferences.
 - View: Zoom In, Zoom Out, Fit, 100%, Toggle Grid, Toggle Alpha Mask, Toggle Split View.
-- Tools: Defringe, Color Bleed, Edge Finishing.
+- Tools: Defringe, Edge Finishing.
 - Help: Documentation, Keyboard Shortcuts, About AlphaKiller.
 
 ## 23. Design Deliverables Requested From Claude Design
@@ -565,9 +567,8 @@ The first build should include:
 - Single image open/import.
 - Canvas preview.
 - Checkerboard, black, white, gray, and custom preview backgrounds.
-- Edge Finishing.
+- Edge Finishing with Rim Color Off / Auto / Solid.
 - Defringe.
-- Color Bleed.
 - Before/after toggle.
 - Split view.
 - Trim transparent padding.

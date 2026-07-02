@@ -182,13 +182,24 @@ export function encodeTiffImageData(imageData, resolution) {
 export function encodePdfImageData(imageData, options = {}) {
   const fallbackDpi = Math.max(1, Number(options.fallbackDpi || options.dpi || 300));
   const resolution = normalizePdfResolution(options.resolution, fallbackDpi);
-  const pageWidth = imageData.width * 72 / resolution.xDpi;
-  const pageHeight = imageData.height * 72 / resolution.yDpi;
+  const pointPerPxX = 72 / resolution.xDpi;
+  const pointPerPxY = 72 / resolution.yDpi;
+
+  // Expand the page so a contour that bulges past the image edge still fits; the bitmap keeps its
+  // pixel size and is positioned within the (possibly larger) page.
+  const box = pdfContentBounds(imageData.width, imageData.height, options.contour);
+  const pageWidth = (box.maxX - box.minX) * pointPerPxX;
+  const pageHeight = (box.maxY - box.minY) * pointPerPxY;
+  const imageW = imageData.width * pointPerPxX;
+  const imageH = imageData.height * pointPerPxY;
+  const imageX = -box.minX * pointPerPxX;
+  const imageY = (box.maxY - imageData.height) * pointPerPxY;
+
   const vectorContent = pdfContourContent(options.contour, {
-    pageWidth,
-    pageHeight,
-    imageWidth: imageData.width,
-    imageHeight: imageData.height,
+    pointPerPxX,
+    pointPerPxY,
+    offsetX: box.minX,
+    maxY: box.maxY,
     stroke: options.contourStroke,
     strokeWidth: options.contourStrokeWidth
   });
@@ -206,7 +217,7 @@ export function encodePdfImageData(imageData, options = {}) {
 
   const content = asciiBytes([
     "q",
-    `${formatPdfNumber(pageWidth)} 0 0 ${formatPdfNumber(pageHeight)} 0 0 cm`,
+    `${formatPdfNumber(imageW)} 0 0 ${formatPdfNumber(imageH)} ${formatPdfNumber(imageX)} ${formatPdfNumber(imageY)} cm`,
     "/Im0 Do",
     "Q",
     vectorContent,
@@ -284,15 +295,39 @@ function normalizePdfResolution(resolution, fallbackDpi) {
   return { xDpi: fallbackDpi, yDpi: fallbackDpi };
 }
 
+// Page content box in image-pixel space: the image rectangle unioned with any contour that
+// extends beyond it. minX/minY may be negative when the contour bulges past the top/left edge.
+function pdfContentBounds(imageWidth, imageHeight, contour) {
+  let minX = 0;
+  let minY = 0;
+  let maxX = imageWidth;
+  let maxY = imageHeight;
+  const bounds = contour?.bounds;
+  if (bounds && Number.isFinite(bounds.minX)) {
+    minX = Math.min(minX, Math.floor(bounds.minX));
+    minY = Math.min(minY, Math.floor(bounds.minY));
+    maxX = Math.max(maxX, Math.ceil(bounds.maxX));
+    maxY = Math.max(maxY, Math.ceil(bounds.maxY));
+  }
+  return { minX, minY, maxX, maxY };
+}
+
 function pdfContourContent(contour, options) {
   const paths = contour?.paths || [];
   if (!paths.length) return "";
 
-  const scaleX = options.pageWidth / options.imageWidth;
-  const scaleY = options.pageHeight / options.imageHeight;
+  const sx = options.pointPerPxX;
+  const sy = options.pointPerPxY;
+  const offsetX = options.offsetX || 0;
+  const maxY = options.maxY;
+  // Image pixel (x, y) -> PDF point, accounting for the page origin shift and PDF's bottom-up Y.
+  const toPdf = (point) => ({
+    x: formatPdfNumber((point.x - offsetX) * sx),
+    y: formatPdfNumber((maxY - point.y) * sy)
+  });
   const color = parsePdfColor(options.stroke);
   const strokeWidthPx = Math.max(0.1, Number(options.strokeWidth ?? 1));
-  const strokeWidth = strokeWidthPx * Math.min(scaleX, scaleY);
+  const strokeWidth = strokeWidthPx * Math.min(sx, sy);
   const lines = [
     "q",
     `${formatPdfNumber(color.r)} ${formatPdfNumber(color.g)} ${formatPdfNumber(color.b)} RG`,
@@ -304,18 +339,18 @@ function pdfContourContent(contour, options) {
   for (const path of paths) {
     const points = path.points || [];
     if (points.length < 2) continue;
-    const first = pdfPoint(points[0], scaleX, scaleY, options.pageHeight);
+    const first = toPdf(points[0]);
     lines.push(`${first.x} ${first.y} m`);
     if (path.curves?.length) {
       for (const curve of path.curves) {
-        const c1 = pdfPoint(curve.c1, scaleX, scaleY, options.pageHeight);
-        const c2 = pdfPoint(curve.c2, scaleX, scaleY, options.pageHeight);
-        const to = pdfPoint(curve.to, scaleX, scaleY, options.pageHeight);
+        const c1 = toPdf(curve.c1);
+        const c2 = toPdf(curve.c2);
+        const to = toPdf(curve.to);
         lines.push(`${c1.x} ${c1.y} ${c2.x} ${c2.y} ${to.x} ${to.y} c`);
       }
     } else {
       for (let index = 1; index < points.length; index += 1) {
-        const point = pdfPoint(points[index], scaleX, scaleY, options.pageHeight);
+        const point = toPdf(points[index]);
         lines.push(`${point.x} ${point.y} l`);
       }
     }
@@ -324,13 +359,6 @@ function pdfContourContent(contour, options) {
 
   lines.push("S", "Q");
   return lines.join("\n");
-}
-
-function pdfPoint(point, scaleX, scaleY, pageHeight) {
-  return {
-    x: formatPdfNumber(point.x * scaleX),
-    y: formatPdfNumber(pageHeight - point.y * scaleY)
-  };
 }
 
 function parsePdfColor(color) {

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, nativeTheme } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeTheme } from "electron";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import fs from "node:fs/promises";
@@ -10,6 +10,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const isDev = !app.isPackaged;
 const devServerUrl = process.env.ALPHAKILLER_DEV_URL || "http://127.0.0.1:5173";
 const windowsIconPath = path.join(__dirname, "../build/icon.ico");
+const LOCKED_WEB_ZOOM_FACTOR = 1;
+const BROWSER_ZOOM_KEYS = new Set(["+", "=", "-", "_", "0"]);
 
 let mainWindow;
 const pendingExportTargets = new Map();
@@ -39,6 +41,8 @@ function createWindow() {
     }
   });
 
+  lockWindowZoom(mainWindow);
+
   if (isDev) {
     mainWindow.loadURL(devServerUrl);
   } else {
@@ -46,13 +50,99 @@ function createWindow() {
   }
 }
 
+function lockWindowZoom(window) {
+  const { webContents } = window;
+
+  const resetZoom = () => {
+    webContents.setZoomFactor(LOCKED_WEB_ZOOM_FACTOR);
+  };
+  const lockVisualZoom = () => {
+    webContents.setVisualZoomLevelLimits(1, 1).catch(() => {
+      // Older Electron builds may reject while the renderer is initializing.
+    });
+  };
+
+  webContents.on("did-finish-load", () => {
+    lockVisualZoom();
+    resetZoom();
+  });
+  webContents.on("zoom-changed", (event) => {
+    event.preventDefault();
+    resetZoom();
+  });
+  webContents.on("before-input-event", (event, input) => {
+    const key = normalizeShortcutKey(input);
+    const isBrowserZoomShortcut = input.type === "keyDown" &&
+      (input.control || input.meta) &&
+      BROWSER_ZOOM_KEYS.has(key);
+
+    if (isBrowserZoomShortcut) {
+      event.preventDefault();
+      resetZoom();
+    }
+  });
+
+  lockVisualZoom();
+  resetZoom();
+}
+
 app.whenReady().then(() => {
+  installApplicationMenu();
   createWindow();
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
 });
+
+function installApplicationMenu() {
+  const template = [
+    ...(process.platform === "darwin"
+      ? [{
+        label: app.name,
+        submenu: [
+          { role: "about" },
+          { type: "separator" },
+          { role: "hide" },
+          { role: "hideOthers" },
+          { role: "unhide" },
+          { type: "separator" },
+          { role: "quit" }
+        ]
+      }]
+      : []),
+    {
+      label: "File",
+      submenu: [
+        process.platform === "darwin" ? { role: "close" } : { role: "quit" }
+      ]
+    },
+    {
+      label: "Edit",
+      submenu: [
+        { role: "undo" },
+        { role: "redo" },
+        { type: "separator" },
+        { role: "cut" },
+        { role: "copy" },
+        { role: "paste" },
+        { role: "selectAll" }
+      ]
+    },
+    {
+      label: "View",
+      submenu: [
+        { role: "reload" },
+        { role: "forceReload" },
+        { role: "toggleDevTools" },
+        { type: "separator" },
+        { role: "togglefullscreen" }
+      ]
+    }
+  ];
+
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+}
 
 app.on("window-all-closed", () => {
   if (process.platform !== "darwin") app.quit();
@@ -67,6 +157,15 @@ function assertTrustedSender(event) {
   if (!isTrusted) {
     throw new Error("Rejected IPC call from an untrusted frame");
   }
+}
+
+function normalizeShortcutKey(input) {
+  const key = String(input.key || "").toLowerCase();
+  if (key === "plus") return "+";
+  if (key === "minus") return "-";
+  if (key === "equal") return "=";
+  if (key === "digit0" || key === "numpad0") return "0";
+  return key;
 }
 
 ipcMain.handle("app:get-theme", (event) => {

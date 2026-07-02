@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
-  Blend,
   Check,
   ChevronDown,
   Crop,
@@ -48,9 +47,8 @@ import { SettingsPanel } from "./SettingsPanel.jsx";
 import { contourToSvg, traceVectorContour } from "./vectorTrace.js";
 
 const DEFAULT_SETTINGS = {
-  defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2, tolerance: 180 },
-  bleed: { enabled: true, reach: 12, affectSemiTransparent: true, useCustomColor: false, color: "#ffffff" },
-  edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
+  defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2, tolerance: 180, passes: 1 },
+  edgeFinish: { enabled: false, cutoff: 128, rimColorMode: "off", edgeColor: "#000000", edgeWidth: 0 }
 };
 
 const APP_VERSION_LABEL = "0.1 beta 2";
@@ -59,7 +57,7 @@ const PRESETS = [
   {
     id: "gentle",
     name: "Gentle Edge Cleanup",
-    description: "Light defringe and subtle color bleed for icons.",
+    description: "Light defringe and restrained edge finishing for icons.",
     settings: DEFAULT_SETTINGS
   },
   {
@@ -69,8 +67,7 @@ const PRESETS = [
     settings: {
       ...DEFAULT_SETTINGS,
       edgeFinish: { ...DEFAULT_SETTINGS.edgeFinish, enabled: true, cutoff: 128 },
-      defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false },
-      bleed: { ...DEFAULT_SETTINGS.bleed, enabled: false }
+      defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false }
     }
   },
   {
@@ -89,17 +86,7 @@ const PRESETS = [
     settings: {
       ...DEFAULT_SETTINGS,
       defringe: { enabled: true, matteColor: "#ffffff", strength: 120, radius: 4, tolerance: 230 },
-      edgeFinish: { enabled: true, cutoff: 128, edgeColorEnabled: true, edgeColor: "#000000", edgeWidth: 0 }
-    }
-  },
-  {
-    id: "sprite-padding",
-    name: "Sprite Edge Padding",
-    description: "Bleeds edge colors into hidden transparent RGB.",
-    settings: {
-      ...DEFAULT_SETTINGS,
-      defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false },
-      bleed: { ...DEFAULT_SETTINGS.bleed, enabled: true, reach: 48, affectSemiTransparent: true }
+      edgeFinish: { enabled: true, cutoff: 128, rimColorMode: "solid", edgeColor: "#000000", edgeWidth: 0 }
     }
   }
 ];
@@ -110,6 +97,12 @@ const BACKGROUNDS = [
   { id: "white", label: "White" },
   { id: "gray", label: "Gray" },
   { id: "custom", label: "Custom" }
+];
+
+const RIM_COLOR_MODE_OPTIONS = [
+  { id: "off", label: "Off" },
+  { id: "auto", label: "Auto" },
+  { id: "solid", label: "Solid" }
 ];
 
 const SUPPORTED_IMAGE_EXTENSIONS = [".png", ".webp", ".jpg", ".jpeg", ".tif", ".tiff"];
@@ -159,7 +152,7 @@ const DEFAULT_COMPARE_AFTER = {
 
 const COMPARE_FEATURES = [
   { id: "bgr", label: "BGR", title: "Background removal" },
-  { id: "alpha", label: "Alpha", title: "Defringe, color bleed, and edge finishing" },
+  { id: "alpha", label: "Alpha", title: "Defringe and edge finishing" },
   { id: "manual", label: "Manual", title: "Delete and Reconstruct pen edits" },
   { id: "ss", label: "SS", title: "Super Scale" }
 ];
@@ -344,6 +337,26 @@ export function App() {
     vectorContour.width === processedImageData.width &&
     vectorContour.height === processedImageData.height
   );
+
+  useEffect(() => {
+    const preventBrowserZoomKey = (event) => {
+      if (!isBrowserZoomShortcut(event)) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+    const preventBrowserZoomWheel = (event) => {
+      if (!event.ctrlKey && !event.metaKey) return;
+      event.preventDefault();
+      event.stopPropagation();
+    };
+
+    window.addEventListener("keydown", preventBrowserZoomKey, { capture: true });
+    window.addEventListener("wheel", preventBrowserZoomWheel, { capture: true, passive: false });
+    return () => {
+      window.removeEventListener("keydown", preventBrowserZoomKey, { capture: true });
+      window.removeEventListener("wheel", preventBrowserZoomWheel, { capture: true });
+    };
+  }, []);
 
   const loadFile = useCallback(async (file) => {
     if (!file || !isSupportedImageFile(file)) {
@@ -538,7 +551,7 @@ export function App() {
     const job = {
       requestId,
       imageData,
-      settings: structuredClone(nextSettings)
+      settings: createProcessingSettings(nextSettings)
     };
 
     if (processingDebounceRef.current) {
@@ -1113,7 +1126,7 @@ export function App() {
       name,
       description: "Saved cleanup settings.",
       custom: true,
-      settings: structuredClone(settings)
+      settings: normalizePresetSettings(settings)
     };
     const nextCustomPresets = [
       ...customPresets.filter((item) => item.id !== id),
@@ -1166,7 +1179,7 @@ export function App() {
     return {
       imageData: includeImage && imageData ? cloneImageData(imageData) : null,
       resolution: cloneResolution(source?.resolution),
-      settings: structuredClone(settings),
+      settings: normalizePresetSettings(settings),
       preset,
       stageSnapshot: includeImage ? cloneStageSnapshot() : null
     };
@@ -1277,7 +1290,7 @@ export function App() {
       setStatus(statusText);
     }
 
-    setSettings(structuredClone(snapshot.settings));
+    setSettings(normalizePresetSettings(snapshot.settings));
     setPreset(snapshot.preset);
   }
 
@@ -1527,6 +1540,34 @@ export function App() {
   });
 
   useEffect(() => {
+    const onPaste = (event) => {
+      const target = event.target;
+      if (target && (target.tagName === "INPUT" || target.tagName === "TEXTAREA" || target.isContentEditable)) return;
+
+      const clipboard = event.clipboardData;
+      if (!clipboard) return;
+
+      let file = null;
+      for (const item of clipboard.items || []) {
+        if (item.kind === "file" && /^image\//i.test(item.type)) {
+          file = item.getAsFile();
+          if (file) break;
+        }
+      }
+      if (!file && clipboard.files?.length) {
+        file = clipboard.files[0];
+      }
+      if (!file) return;
+
+      event.preventDefault();
+      loadFile(ensurePastedFileName(file));
+    };
+
+    window.addEventListener("paste", onPaste);
+    return () => window.removeEventListener("paste", onPaste);
+  }, [loadFile]);
+
+  useEffect(() => {
     renderCanvas();
   }, [renderCanvas]);
 
@@ -1575,7 +1616,7 @@ export function App() {
     if (!next) return;
     pushSettingsUndoSnapshot({ forceNew: true });
     setPreset(id);
-    setSettings(structuredClone(next.settings));
+    setSettings(normalizePresetSettings(next.settings));
   };
 
   function updateExportSetting(key, value) {
@@ -2283,18 +2324,7 @@ export function App() {
             <RangeControl label="Strength" value={settings.defringe.strength} min={0} max={200} unit="%" onChange={(value) => updateSetting("defringe", "strength", value)} />
             <RangeControl label="Matte tolerance" value={settings.defringe.tolerance ?? 255} min={0} max={255} onChange={(value) => updateSetting("defringe", "tolerance", value)} />
             <RangeControl label="Edge depth" value={settings.defringe.radius} min={1} max={4} onChange={(value) => updateSetting("defringe", "radius", value)} />
-          </ToolSection>
-
-          <ToolSection
-            icon={<Blend size={15} />}
-            title="Color Bleed"
-            enabled={settings.bleed.enabled}
-            onToggle={(value) => updateSetting("bleed", "enabled", value)}
-          >
-            <RangeControl label="Reach" value={settings.bleed.reach} min={2} max={64} unit="px" onChange={(value) => updateSetting("bleed", "reach", value)} />
-            <ToggleRow label="Use bleed color" checked={settings.bleed.useCustomColor ?? false} onChange={(value) => updateSetting("bleed", "useCustomColor", value)} />
-            <ColorControl label="Bleed color" value={settings.bleed.color ?? "#ffffff"} onChange={(value) => updateSetting("bleed", "color", value)} />
-            <ToggleRow label="Affect semi-alpha" checked={settings.bleed.affectSemiTransparent} onChange={(value) => updateSetting("bleed", "affectSemiTransparent", value)} />
+            <RangeControl label="Passes" value={settings.defringe.passes ?? 1} min={1} max={5} onChange={(value) => updateSetting("defringe", "passes", value)} />
           </ToolSection>
 
           <ToolSection
@@ -2304,8 +2334,29 @@ export function App() {
             onToggle={(value) => updateSetting("edgeFinish", "enabled", value)}
           >
             <RangeControl label="Cutoff" value={settings.edgeFinish.cutoff} min={1} max={254} onChange={(value) => updateSetting("edgeFinish", "cutoff", value)} />
-            <ToggleRow label="Edge color" checked={settings.edgeFinish.edgeColorEnabled ?? false} onChange={(value) => updateSetting("edgeFinish", "edgeColorEnabled", value)} />
-            <ColorControl label="Color" value={settings.edgeFinish.edgeColor ?? "#000000"} onChange={(value) => updateSetting("edgeFinish", "edgeColor", value)} />
+            <div className="range-control">
+              <span>Rim color</span>
+              <div className="segmented" role="radiogroup" aria-label="Rim color">
+                {RIM_COLOR_MODE_OPTIONS.map((item) => {
+                  const active = normalizeRimColorMode(settings.edgeFinish.rimColorMode) === item.id;
+                  return (
+                    <button
+                      key={item.id}
+                      type="button"
+                      className={active ? "active" : ""}
+                      role="radio"
+                      aria-checked={active}
+                      onClick={() => updateSetting("edgeFinish", "rimColorMode", item.id)}
+                    >
+                      {item.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+            {normalizeRimColorMode(settings.edgeFinish.rimColorMode) === "solid" && (
+              <ColorControl label="Rim color" value={settings.edgeFinish.edgeColor ?? "#000000"} onChange={(value) => updateSetting("edgeFinish", "edgeColor", value)} />
+            )}
             <RangeControl label="Edge width" value={settings.edgeFinish.edgeWidth ?? 0} min={0} max={16} unit="px" onChange={(value) => updateSetting("edgeFinish", "edgeWidth", value)} />
           </ToolSection>
 
@@ -2560,21 +2611,27 @@ function ColorControl({ label, value, onChange }) {
   );
 }
 
-function ToggleRow({ label, checked, onChange }) {
-  return (
-    <label className="toggle-row">
-      <span>{label}</span>
-      <Switch checked={checked} onChange={onChange} />
-    </label>
-  );
-}
-
 function Switch({ checked, onChange }) {
   return (
     <button className={`switch ${checked ? "on" : ""}`} role="switch" aria-checked={checked} onClick={() => onChange(!checked)}>
       <span />
     </button>
   );
+}
+
+function computeContourPreviewBox(imageData, contour) {
+  let minX = 0;
+  let minY = 0;
+  let maxX = imageData.width;
+  let maxY = imageData.height;
+  const bounds = contour?.bounds;
+  if (bounds && Number.isFinite(bounds.minX)) {
+    minX = Math.min(minX, Math.floor(bounds.minX));
+    minY = Math.min(minY, Math.floor(bounds.minY));
+    maxX = Math.max(maxX, Math.ceil(bounds.maxX));
+    maxY = Math.max(maxY, Math.ceil(bounds.maxY));
+  }
+  return { minX, minY, width: Math.max(1, maxX - minX), height: Math.max(1, maxY - minY) };
 }
 
 function ExportDialog({ source, imageData, previewUrl, settings, contour, contourColor, onChange, onClose, onExport }) {
@@ -2584,6 +2641,7 @@ function ExportDialog({ source, imageData, previewUrl, settings, contour, contou
   const resolutionLabel = formatResolution(resolution);
   const includeContourPreview = (format === "pdf" && settings.includeContour) || format === "svg";
   const contourPaths = includeContourPreview ? contour?.paths || [] : [];
+  const contourPreviewBox = computeContourPreviewBox(imageData, includeContourPreview ? contour : null);
   const transparentLabel = format === "jpeg" ? "Flattened" : format === "svg" ? "Vector only" : "Preserved";
   const exportLabel = `Export ${formatInfo.label}`;
   const estimatedSize = estimateExportSize(format, imageData, {
@@ -2711,7 +2769,7 @@ function ExportDialog({ source, imageData, previewUrl, settings, contour, contou
             <div className={`export-preview ${format === "jpeg" ? "is-jpeg" : ""}`} style={format === "jpeg" ? { background: settings.jpegMatte } : undefined}>
               {format !== "svg" && <img src={previewUrl} alt="" />}
               {includeContourPreview && contourPaths.length > 0 && (
-                <svg viewBox={`0 0 ${imageData.width} ${imageData.height}`} aria-hidden="true">
+                <svg viewBox={`${contourPreviewBox.minX} ${contourPreviewBox.minY} ${contourPreviewBox.width} ${contourPreviewBox.height}`} aria-hidden="true">
                   {contourPaths.map((path, index) => (
                     <path key={index} d={path.d} />
                   ))}
@@ -2763,7 +2821,7 @@ function AboutPage({ version }) {
           <h2>What It Does</h2>
           <p>
             AlphaKiller prepares transparent artwork for production by removing matte halos,
-            cleaning hidden RGB, refining semi-transparent edges, and exporting clean PNG, JPEG, TIFF, PDF, or SVG files.
+            refining semi-transparent edges, and exporting clean PNG, JPEG, TIFF, PDF, or SVG files.
           </p>
         </article>
 
@@ -3369,43 +3427,51 @@ function normalizeCustomPreset(preset) {
 function normalizePresetSettings(settings) {
   return {
     defringe: normalizeDefringeSettings(settings?.defringe),
-    bleed: normalizeBleedSettings(settings?.bleed),
     edgeFinish: normalizeEdgeFinishSettings(settings)
   };
+}
+
+function createProcessingSettings(settings) {
+  return normalizePresetSettings(settings);
 }
 
 function normalizeEdgeFinishSettings(settings) {
   if (settings?.edgeFinish) {
     const merged = { ...DEFAULT_SETTINGS.edgeFinish, ...settings.edgeFinish };
-    merged.cutoff = Math.min(254, Math.max(1, Math.round(Number(merged.cutoff) || 128)));
-    merged.edgeWidth = Math.min(16, Math.max(0, Math.round(Number(merged.edgeWidth) || 0)));
-    merged.edgeColorEnabled = Boolean(merged.edgeColorEnabled);
-    return merged;
+    return {
+      enabled: Boolean(merged.enabled),
+      cutoff: normalizeCutoff(merged.cutoff),
+      rimColorMode: normalizeRimColorMode(merged.rimColorMode, merged.edgeColorEnabled),
+      edgeColor: normalizeHexColor(merged.edgeColor, DEFAULT_SETTINGS.edgeFinish.edgeColor),
+      edgeWidth: Math.min(16, Math.max(0, Math.round(Number(merged.edgeWidth) || 0)))
+    };
   }
   // Migrate legacy Threshold + Hardening into the unified Edge Finishing operator.
   const legacyThreshold = settings?.threshold;
   const legacyHardening = settings?.hardening;
   const enabled = Boolean(legacyThreshold?.enabled || legacyHardening?.enabled);
-  const cutoff = Math.min(254, Math.max(1, Math.round(Number(legacyThreshold?.threshold) || 128)));
+  const cutoff = normalizeCutoff(legacyThreshold?.threshold);
   return { ...DEFAULT_SETTINGS.edgeFinish, enabled, cutoff };
+}
+
+function normalizeRimColorMode(mode, legacyEdgeColorEnabled = false) {
+  if (mode === "off" || mode === "auto" || mode === "solid") return mode;
+  return legacyEdgeColorEnabled ? "solid" : "off";
+}
+
+function normalizeCutoff(value) {
+  return Math.min(254, Math.max(1, Math.round(Number(value) || 128)));
+}
+
+function normalizeHexColor(value, fallback) {
+  return /^#[0-9a-f]{6}$/i.test(String(value || "")) ? value : fallback;
 }
 
 function normalizeDefringeSettings(defringe) {
   const merged = { ...DEFAULT_SETTINGS.defringe, ...(defringe || {}) };
   // Edge depth saturates at 4 (alphaLimit caps at 254); clamp legacy 5/6 values.
   merged.radius = Math.min(4, Math.max(1, Math.round(Number(merged.radius) || 1)));
-  return merged;
-}
-
-function normalizeBleedSettings(bleed) {
-  const merged = { ...DEFAULT_SETTINGS.bleed, ...(bleed || {}) };
-  // Legacy presets stored radius + iterations; their product (×3) was the reach in pixels.
-  if (bleed && bleed.reach == null && bleed.radius != null) {
-    merged.reach = Number(bleed.radius) * (Number(bleed.iterations) || 1) * 3;
-  }
-  merged.reach = Math.min(64, Math.max(2, Math.round(Number(merged.reach) || DEFAULT_SETTINGS.bleed.reach)));
-  delete merged.radius;
-  delete merged.iterations;
+  merged.passes = Math.min(5, Math.max(1, Math.round(Number(merged.passes) || 1)));
   return merged;
 }
 
@@ -3632,6 +3698,23 @@ function reconstructCirclePixels(data, sourceData, width, height, center, radius
   }
 }
 
+// Clipboard image blobs often arrive with a generic or missing name; give them one that the
+// supported-file check and source panel can use.
+function ensurePastedFileName(file) {
+  if (file.name && SUPPORTED_IMAGE_EXTENSIONS.some((extension) => file.name.toLowerCase().endsWith(extension))) {
+    return file;
+  }
+  const extension = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/pjpeg": "jpg",
+    "image/webp": "webp",
+    "image/tiff": "tif",
+    "image/x-tiff": "tif"
+  }[file.type] || "png";
+  return new File([file], `pasted-image.${extension}`, { type: file.type || "image/png" });
+}
+
 function isSupportedImageFile(file) {
   const name = file.name.toLowerCase();
   return RASTER_MIME_RE.test(file.type) || SUPPORTED_IMAGE_EXTENSIONS.some((extension) => name.endsWith(extension));
@@ -3695,6 +3778,12 @@ function mimeTypeForFile(file) {
   if (isTiffFile(file)) return "image/tiff";
   if (file.name.toLowerCase().endsWith(".webp")) return "image/webp";
   return file.type || "application/octet-stream";
+}
+
+function isBrowserZoomShortcut(event) {
+  if (!event.metaKey && !event.ctrlKey) return false;
+  const key = String(event.key || "").toLowerCase();
+  return key === "+" || key === "=" || key === "-" || key === "_" || key === "0";
 }
 
 function imageDataHasTransparency(imageData) {

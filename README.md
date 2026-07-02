@@ -3,7 +3,7 @@
 Current version: **0.1 beta 2** (`0.1.0-beta.2`).
 
 AlphaKiller is an Electron image editor for cleaning transparent-pixel artifacts:
-anti-aliased edges, matte halos, and hidden RGB bleed around transparent pixels.
+anti-aliased edges, matte halos, and hidden edge RGB around transparent pixels.
 It is built for artwork and production files that need clean alpha before PNG,
 JPEG, TIFF, PDF, or SVG export, white-ink printing, compositing, or texture use.
 
@@ -20,10 +20,23 @@ JPEG, TIFF, PDF, or SVG export, white-ink printing, compositing, or texture use.
   pixels.
 - Toolbar trim command that crops transparent padding from the current cleaned
   alpha.
-- Defringe, color bleed, alpha threshold, and alpha hardening controls.
+- Defringe and Edge Finishing controls, including hard alpha cutoff and Rim
+  Color modes: Off, Auto, and Solid.
 - Source metadata, DPI, and pixel inspection.
 - PNG, flattened JPEG, transparent TIFF, transparent PDF, or vector contour SVG
   export through Electron's native save dialog.
+
+## Edge Finishing and Rim Color
+
+Color Bleed has been removed as a separate tool because it duplicated the edge
+fill behavior now handled by Edge Finishing. Use Rim Color in Edge Finishing
+instead:
+
+- **Off**: apply the alpha cutoff without changing edge RGB values.
+- **Auto**: fill the rim from nearby visible artwork colors so print edges carry
+  matching ink instead of a white, black, or transparent-pixel halo.
+- **Solid**: fill the rim with a chosen swatch, useful for deliberate keylines or
+  single-color production edges.
 
 ## Repository Layout
 

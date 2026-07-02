@@ -5,10 +5,6 @@ export function applyProcessing(sourceImageData, settings) {
     defringe(working, settings.defringe);
   }
 
-  if (settings.bleed.enabled) {
-    colorBleed(working, settings.bleed);
-  }
-
   if (settings.edgeFinish?.enabled) {
     edgeFinish(working, settings.edgeFinish);
   }
@@ -208,24 +204,26 @@ export function dilateBand(buffer, width, height, value, radius) {
   return output;
 }
 
-const BLEED_SOURCE_ALPHA = 180;
-const BLEED_DISTANCE_INF = 65535;
-const BLEED_ORTHOGONAL_WEIGHT = 10;
-const BLEED_DIAGONAL_WEIGHT = 14;
+const RIM_DISTANCE_INF = 65535;
+const RIM_ORTHOGONAL_WEIGHT = 10;
+const RIM_DIAGONAL_WEIGHT = 14;
+const AUTO_RIM_STRONG_ALPHA = 180;
+const AUTO_RIM_STRONG_EDGE_SOURCE_PENALTY = 16;
+const AUTO_RIM_WEAK_SOURCE_PENALTY = 80;
 const DEFRINGE_STRENGTH_POTENCY = 2;
 
 function cloneImageData(imageData) {
   return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
 }
 
-// Edge Finishing: binarize alpha at `cutoff` for crisp, print-ready (1-bit) edges, and
-// optionally recolor the edge band to a chosen color. With edgeWidth = 0 only the existing
-// anti-aliased rim is recolored (silhouette unchanged); edgeWidth > 0 dilates an opaque
-// colored keyline outward by that many pixels.
-function edgeFinish(imageData, { cutoff, edgeColorEnabled, edgeColor, edgeWidth }) {
+// Edge Finishing: binarize alpha at `cutoff` for crisp, print-ready (1-bit) edges,
+// then optionally finish the rim with nearby artwork color or a solid swatch.
+function edgeFinish(imageData, settings = {}) {
+  const { cutoff, edgeColor, edgeWidth } = settings;
   const { width, height, data } = imageData;
   const pixelCount = width * height;
-  const cut = clampByte(cutoff ?? 128);
+  const cut = Math.min(254, Math.max(1, clampByte(cutoff ?? 128)));
+  const rimColorMode = normalizeRimColorMode(settings);
 
   // Binarized inside-mask of the hard shape.
   const inside = new Uint8Array(pixelCount);
@@ -233,31 +231,178 @@ function edgeFinish(imageData, { cutoff, edgeColorEnabled, edgeColor, edgeWidth 
     inside[pixel] = data[index + 3] >= cut ? 1 : 0;
   }
 
-  if (!edgeColorEnabled) {
+  if (rimColorMode === "off") {
     for (let pixel = 0, index = 0; pixel < pixelCount; pixel++, index += 4) {
       data[index + 3] = inside[pixel] ? 255 : 0;
     }
     return;
   }
 
-  const color = hexToRgb(edgeColor || "#000000");
-  const grow = Math.max(0, Math.floor(edgeWidth ?? 0));
+  const grow = normalizeRimWidth(edgeWidth);
   // Final opaque shape grows outward by `grow`; the core that keeps art color is eroded 1px.
   const finalMask = grow > 0 ? dilateBand(inside, width, height, 1, grow) : inside;
   const core = erodeMask(inside, width, height, 1);
+  const sourceData = rimColorMode === "auto" ? new Uint8ClampedArray(data) : null;
+  const autoSources = sourceData
+    ? buildAutoRimSourcePixels(sourceData, width, height, inside, core, finalMask, cut)
+    : null;
+  const color = rimColorMode === "solid" ? hexToRgb(edgeColor || "#000000") : null;
 
   for (let pixel = 0, index = 0; pixel < pixelCount; pixel++, index += 4) {
     if (finalMask[pixel]) {
       data[index + 3] = 255;
       if (!core[pixel]) {
-        data[index] = color.r;
-        data[index + 1] = color.g;
-        data[index + 2] = color.b;
+        if (color) {
+          data[index] = color.r;
+          data[index + 1] = color.g;
+          data[index + 2] = color.b;
+        } else {
+          const sourcePixel = autoSources[pixel];
+          if (sourcePixel >= 0) {
+            const sourceIndex = sourcePixel * 4;
+            data[index] = sourceData[sourceIndex];
+            data[index + 1] = sourceData[sourceIndex + 1];
+            data[index + 2] = sourceData[sourceIndex + 2];
+          }
+        }
       }
     } else {
       data[index + 3] = 0;
     }
   }
+}
+
+function normalizeRimColorMode({ rimColorMode, edgeColorEnabled }) {
+  if (rimColorMode === "auto" || rimColorMode === "solid" || rimColorMode === "off") {
+    return rimColorMode;
+  }
+  return edgeColorEnabled ? "solid" : "off";
+}
+
+function normalizeRimWidth(edgeWidth) {
+  const value = Number(edgeWidth);
+  if (!Number.isFinite(value)) return 0;
+  return Math.min(16, Math.max(0, Math.floor(value)));
+}
+
+function buildAutoRimSourcePixels(sourceData, width, height, inside, core, finalMask, cutoff) {
+  const pixelCount = width * height;
+  const distances = new Uint16Array(pixelCount);
+  const sourcePixels = new Int32Array(pixelCount);
+  const minSourceAlpha = Math.max(1, cutoff);
+  const strongAlpha = Math.max(minSourceAlpha, AUTO_RIM_STRONG_ALPHA);
+
+  distances.fill(RIM_DISTANCE_INF);
+  sourcePixels.fill(-1);
+
+  for (let pixel = 0, index = 0; pixel < pixelCount; pixel++, index += 4) {
+    if (!inside[pixel]) continue;
+
+    const alpha = sourceData[index + 3];
+    if (alpha < minSourceAlpha) continue;
+
+    let seedDistance = AUTO_RIM_WEAK_SOURCE_PENALTY;
+    if (alpha >= strongAlpha) {
+      seedDistance = core[pixel] ? 0 : AUTO_RIM_STRONG_EDGE_SOURCE_PENALTY;
+    }
+
+    distances[pixel] = seedDistance;
+    sourcePixels[pixel] = pixel;
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    const row = y * width;
+    for (let x = 0; x < width; x += 1) {
+      relaxAutoRimPixel(distances, sourcePixels, finalMask, row + x, x, y, width, height, -1);
+    }
+  }
+
+  for (let y = height - 1; y >= 0; y -= 1) {
+    const row = y * width;
+    for (let x = width - 1; x >= 0; x -= 1) {
+      relaxAutoRimPixel(distances, sourcePixels, finalMask, row + x, x, y, width, height, 1);
+    }
+  }
+
+  return sourcePixels;
+}
+
+function relaxAutoRimPixel(distances, sourcePixels, finalMask, pixel, x, y, width, height, direction) {
+  if (!finalMask[pixel]) return;
+
+  let bestDistance = distances[pixel];
+  let sourcePixel = sourcePixels[pixel];
+
+  if (direction < 0) {
+    if (x > 0) {
+      const candidatePixel = pixel - 1;
+      const candidate = distances[candidatePixel] + RIM_ORTHOGONAL_WEIGHT;
+      if (sourcePixels[candidatePixel] >= 0 && candidate < bestDistance) {
+        bestDistance = candidate;
+        sourcePixel = sourcePixels[candidatePixel];
+      }
+    }
+    if (y > 0) {
+      const top = pixel - width;
+      const candidate = distances[top] + RIM_ORTHOGONAL_WEIGHT;
+      if (sourcePixels[top] >= 0 && candidate < bestDistance) {
+        bestDistance = candidate;
+        sourcePixel = sourcePixels[top];
+      }
+      if (x > 0) {
+        const diagonal = top - 1;
+        const diagonalCandidate = distances[diagonal] + RIM_DIAGONAL_WEIGHT;
+        if (sourcePixels[diagonal] >= 0 && diagonalCandidate < bestDistance) {
+          bestDistance = diagonalCandidate;
+          sourcePixel = sourcePixels[diagonal];
+        }
+      }
+      if (x + 1 < width) {
+        const diagonal = top + 1;
+        const diagonalCandidate = distances[diagonal] + RIM_DIAGONAL_WEIGHT;
+        if (sourcePixels[diagonal] >= 0 && diagonalCandidate < bestDistance) {
+          bestDistance = diagonalCandidate;
+          sourcePixel = sourcePixels[diagonal];
+        }
+      }
+    }
+  } else {
+    if (x + 1 < width) {
+      const candidatePixel = pixel + 1;
+      const candidate = distances[candidatePixel] + RIM_ORTHOGONAL_WEIGHT;
+      if (sourcePixels[candidatePixel] >= 0 && candidate < bestDistance) {
+        bestDistance = candidate;
+        sourcePixel = sourcePixels[candidatePixel];
+      }
+    }
+    if (y + 1 < height) {
+      const bottom = pixel + width;
+      const candidate = distances[bottom] + RIM_ORTHOGONAL_WEIGHT;
+      if (sourcePixels[bottom] >= 0 && candidate < bestDistance) {
+        bestDistance = candidate;
+        sourcePixel = sourcePixels[bottom];
+      }
+      if (x + 1 < width) {
+        const diagonal = bottom + 1;
+        const diagonalCandidate = distances[diagonal] + RIM_DIAGONAL_WEIGHT;
+        if (sourcePixels[diagonal] >= 0 && diagonalCandidate < bestDistance) {
+          bestDistance = diagonalCandidate;
+          sourcePixel = sourcePixels[diagonal];
+        }
+      }
+      if (x > 0) {
+        const diagonal = bottom - 1;
+        const diagonalCandidate = distances[diagonal] + RIM_DIAGONAL_WEIGHT;
+        if (sourcePixels[diagonal] >= 0 && diagonalCandidate < bestDistance) {
+          bestDistance = diagonalCandidate;
+          sourcePixel = sourcePixels[diagonal];
+        }
+      }
+    }
+  }
+
+  distances[pixel] = bestDistance;
+  sourcePixels[pixel] = sourcePixel;
 }
 
 // Binary erosion via dilation of the complement (erode(M) = ¬dilate(¬M)).
@@ -270,25 +415,30 @@ function erodeMask(mask, width, height, radius) {
   return output;
 }
 
-function defringe(imageData, { matteColor, strength, radius, tolerance }) {
+function defringe(imageData, { matteColor, strength, radius, tolerance, passes }) {
   const data = imageData.data;
   const matte = hexToRgb(matteColor);
   const amount = (Math.max(0, strength) / 100) * DEFRINGE_STRENGTH_POTENCY;
   const matteTolerance = Math.max(0, tolerance ?? 255);
   const alphaLimit = Math.min(254, 80 + radius * 45);
+  // Each pass recomputes the matte match from the already-corrected colors, so extra passes push
+  // stubborn matte residue further out — equivalent to exporting and defringing the file again.
+  const passCount = Math.min(5, Math.max(1, Math.round(Number(passes) || 1)));
 
-  for (let i = 0; i < data.length; i += 4) {
-    const a = data[i + 3];
-    if (a === 0 || a === 255 || a > alphaLimit) continue;
+  for (let pass = 0; pass < passCount; pass += 1) {
+    for (let i = 0; i < data.length; i += 4) {
+      const a = data[i + 3];
+      if (a === 0 || a === 255 || a > alphaLimit) continue;
 
-    const alpha = Math.max(1 / 255, a / 255);
-    const match = getMatteMatch(data[i], data[i + 1], data[i + 2], matte, matteTolerance);
-    if (match <= 0) continue;
+      const alpha = Math.max(1 / 255, a / 255);
+      const match = getMatteMatch(data[i], data[i + 1], data[i + 2], matte, matteTolerance);
+      if (match <= 0) continue;
 
-    const correction = (1 - alpha) * amount * match;
-    data[i] = clampByte(data[i] + ((data[i] - matte.r) * correction));
-    data[i + 1] = clampByte(data[i + 1] + ((data[i + 1] - matte.g) * correction));
-    data[i + 2] = clampByte(data[i + 2] + ((data[i + 2] - matte.b) * correction));
+      const correction = (1 - alpha) * amount * match;
+      data[i] = clampByte(data[i] + ((data[i] - matte.r) * correction));
+      data[i + 1] = clampByte(data[i + 1] + ((data[i + 1] - matte.g) * correction));
+      data[i + 2] = clampByte(data[i + 2] + ((data[i + 2] - matte.b) * correction));
+    }
   }
 }
 
@@ -301,126 +451,6 @@ function getMatteMatch(r, g, b, matte, tolerance) {
   if (distance === 0) return 1;
   if (tolerance <= 0 || distance >= tolerance) return 0;
   return 1 - smoothstep(distance / tolerance);
-}
-
-function colorBleed(imageData, { reach, affectSemiTransparent, useCustomColor, color }) {
-  const { width, height } = imageData;
-  const data = imageData.data;
-  const pixelCount = width * height;
-  const bleedColor = useCustomColor ? hexToRgb(color || "#ffffff") : null;
-  // reach is the bleed distance in pixels; one orthogonal pixel step costs BLEED_ORTHOGONAL_WEIGHT.
-  const maxDistance = Math.min(
-    BLEED_DISTANCE_INF - 1,
-    Math.max(1, reach) * BLEED_ORTHOGONAL_WEIGHT
-  );
-  const distances = new Uint16Array(pixelCount);
-  distances.fill(BLEED_DISTANCE_INF);
-
-  for (let pixel = 0, index = 0; pixel < pixelCount; pixel++, index += 4) {
-    if (data[index + 3] >= BLEED_SOURCE_ALPHA) {
-      distances[pixel] = 0;
-    }
-  }
-
-  for (let y = 0; y < height; y++) {
-    const row = y * width;
-    for (let x = 0; x < width; x++) {
-      relaxBleedPixel(data, distances, row + x, x, y, width, height, maxDistance, affectSemiTransparent, bleedColor, -1);
-    }
-  }
-
-  for (let y = height - 1; y >= 0; y--) {
-    const row = y * width;
-    for (let x = width - 1; x >= 0; x--) {
-      relaxBleedPixel(data, distances, row + x, x, y, width, height, maxDistance, affectSemiTransparent, bleedColor, 1);
-    }
-  }
-}
-
-function relaxBleedPixel(data, distances, pixel, x, y, width, height, maxDistance, affectSemiTransparent, bleedColor, direction) {
-  const index = pixel * 4;
-  if (!shouldBleedPixel(data[index + 3], affectSemiTransparent)) return;
-
-  let bestDistance = distances[pixel];
-  let sourcePixel = -1;
-
-  if (direction < 0) {
-    if (x > 0) {
-      const candidate = distances[pixel - 1] + BLEED_ORTHOGONAL_WEIGHT;
-      if (candidate < bestDistance && candidate <= maxDistance) {
-        bestDistance = candidate;
-        sourcePixel = pixel - 1;
-      }
-    }
-    if (y > 0) {
-      const top = pixel - width;
-      const candidate = distances[top] + BLEED_ORTHOGONAL_WEIGHT;
-      if (candidate < bestDistance && candidate <= maxDistance) {
-        bestDistance = candidate;
-        sourcePixel = top;
-      }
-      if (x > 0) {
-        const diagonal = top - 1;
-        const diagonalCandidate = distances[diagonal] + BLEED_DIAGONAL_WEIGHT;
-        if (diagonalCandidate < bestDistance && diagonalCandidate <= maxDistance) {
-          bestDistance = diagonalCandidate;
-          sourcePixel = diagonal;
-        }
-      }
-      if (x + 1 < width) {
-        const diagonal = top + 1;
-        const diagonalCandidate = distances[diagonal] + BLEED_DIAGONAL_WEIGHT;
-        if (diagonalCandidate < bestDistance && diagonalCandidate <= maxDistance) {
-          bestDistance = diagonalCandidate;
-          sourcePixel = diagonal;
-        }
-      }
-    }
-  } else {
-    if (x + 1 < width) {
-      const candidate = distances[pixel + 1] + BLEED_ORTHOGONAL_WEIGHT;
-      if (candidate < bestDistance && candidate <= maxDistance) {
-        bestDistance = candidate;
-        sourcePixel = pixel + 1;
-      }
-    }
-    if (y + 1 < height) {
-      const bottom = pixel + width;
-      const candidate = distances[bottom] + BLEED_ORTHOGONAL_WEIGHT;
-      if (candidate < bestDistance && candidate <= maxDistance) {
-        bestDistance = candidate;
-        sourcePixel = bottom;
-      }
-      if (x + 1 < width) {
-        const diagonal = bottom + 1;
-        const diagonalCandidate = distances[diagonal] + BLEED_DIAGONAL_WEIGHT;
-        if (diagonalCandidate < bestDistance && diagonalCandidate <= maxDistance) {
-          bestDistance = diagonalCandidate;
-          sourcePixel = diagonal;
-        }
-      }
-      if (x > 0) {
-        const diagonal = bottom - 1;
-        const diagonalCandidate = distances[diagonal] + BLEED_DIAGONAL_WEIGHT;
-        if (diagonalCandidate < bestDistance && diagonalCandidate <= maxDistance) {
-          bestDistance = diagonalCandidate;
-          sourcePixel = diagonal;
-        }
-      }
-    }
-  }
-
-  if (sourcePixel === -1) return;
-
-  const sourceIndex = sourcePixel * 4;
-  distances[pixel] = bestDistance;
-  data[index] = bleedColor ? bleedColor.r : data[sourceIndex];
-  data[index + 1] = bleedColor ? bleedColor.g : data[sourceIndex + 1];
-  data[index + 2] = bleedColor ? bleedColor.b : data[sourceIndex + 2];
-}
-
-function shouldBleedPixel(alpha, affectSemiTransparent) {
-  return alpha === 0 || (affectSemiTransparent && alpha < 128);
 }
 
 function smoothstep(value) {

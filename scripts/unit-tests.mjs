@@ -36,6 +36,27 @@ function makeImageData(width, height, pixels) {
   return new ImageData(new Uint8ClampedArray(pixels), width, height);
 }
 
+function processingSettings(overrides = {}) {
+  return {
+    defringe: {
+      enabled: false,
+      matteColor: "#ffffff",
+      strength: 0,
+      radius: 1,
+      tolerance: 255,
+      ...(overrides.defringe || {})
+    },
+    edgeFinish: {
+      enabled: false,
+      cutoff: 128,
+      rimColorMode: "off",
+      edgeColor: "#000000",
+      edgeWidth: 0,
+      ...(overrides.edgeFinish || {})
+    }
+  };
+}
+
 function testApplyMaskToImage() {
   const image = makeImageData(2, 2, [
     10, 20, 30, 255,
@@ -111,45 +132,59 @@ function testFindVisibleAlphaBoundsAndCrop() {
   ]);
 }
 
-function testEdgeFinishCutoffBinarizes() {
+function testEdgeFinishOffRimColorBinarizesWithoutRecoloring() {
   const image = makeImageData(2, 1, [
-    0, 0, 0, 127,
-    255, 255, 255, 128
+    10, 20, 30, 127,
+    240, 250, 255, 128
   ]);
-  const output = applyProcessing(image, {
-    defringe: { enabled: false, matteColor: "#ffffff", strength: 0, radius: 1 },
-    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
-    edgeFinish: { enabled: true, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
-  });
+  const output = applyProcessing(image, processingSettings({
+    edgeFinish: { enabled: true, cutoff: 128, rimColorMode: "off" }
+  }));
 
   // Alpha below cutoff -> 0, at/above cutoff -> 255; colors untouched.
   assert.equal(output.data[3], 0);
   assert.equal(output.data[7], 255);
-  assert.equal(output.data[4], 255);
+  assert.deepEqual(Array.from(output.data.slice(4, 7)), [240, 250, 255]);
 }
 
-function testEdgeFinishRecolorsRim() {
-  // 4x1: solid core, retained rim (a>=cutoff but originally semi), dropped, transparent.
-  const image = makeImageData(4, 1, [
+function testEdgeFinishSolidRimColorUsesConfiguredColor() {
+  // 5x1: transparent, outer rim, solid core, retained rim, dropped.
+  const image = makeImageData(5, 1, [
+    200, 100, 50, 0,
+    200, 100, 50, 255,
     200, 100, 50, 255,
     200, 100, 50, 200,
-    200, 100, 50, 60,
     200, 100, 50, 0
   ]);
-  const output = applyProcessing(image, {
-    defringe: { enabled: false, matteColor: "#ffffff", strength: 0, radius: 1 },
-    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
-    edgeFinish: { enabled: true, cutoff: 128, edgeColorEnabled: true, edgeColor: "#000000", edgeWidth: 0 }
-  });
+  const output = applyProcessing(image, processingSettings({
+    edgeFinish: { enabled: true, cutoff: 128, rimColorMode: "solid", edgeColor: "#336699", edgeWidth: 0 }
+  }));
 
   // No semi-alpha survives.
   for (let i = 3; i < output.data.length; i += 4) {
     assert.ok(output.data[i] === 0 || output.data[i] === 255);
   }
-  // The retained rim pixel (index 1) is recolored to the edge color and opaque.
-  assert.deepEqual(Array.from(output.data.slice(4, 8)), [0, 0, 0, 255]);
-  // The dropped pixel (index 2, alpha 60 < cutoff) is cut.
-  assert.equal(output.data[11], 0);
+  // The core keeps its art color, while the retained rim pixel uses the solid rim color.
+  assert.deepEqual(Array.from(output.data.slice(8, 12)), [200, 100, 50, 255]);
+  assert.deepEqual(Array.from(output.data.slice(12, 16)), [51, 102, 153, 255]);
+  // Transparent pixels outside the finished edge stay cut.
+  assert.equal(output.data[3], 0);
+  assert.equal(output.data[19], 0);
+}
+
+function testEdgeFinishAutoRimColorUsesAdjacentVisiblePixel() {
+  const image = makeImageData(3, 1, [
+    255, 0, 0, 0,       // hidden transparent RGB must not color the rim
+    240, 240, 240, 200, // retained rim pixel with dirty matte color
+    20, 140, 220, 255   // adjacent visible art color
+  ]);
+  const output = applyProcessing(image, processingSettings({
+    edgeFinish: { enabled: true, cutoff: 128, rimColorMode: "auto", edgeWidth: 0 }
+  }));
+
+  assert.equal(output.data[3], 0);
+  assert.deepEqual(Array.from(output.data.slice(4, 8)), [20, 140, 220, 255]);
+  assert.deepEqual(Array.from(output.data.slice(8, 12)), [20, 140, 220, 255]);
 }
 
 function testProtectPureWhite() {
@@ -176,16 +211,41 @@ function testProtectPureWhite() {
   assert.deepEqual(Array.from(custom.data), [250, 250, 250, 255]);
 }
 
+function testVectorContourExpandsPastBorder() {
+  // 4x4 fully-opaque image: the subject is borderless (touches every edge).
+  const size = 4;
+  const pixels = [];
+  for (let i = 0; i < size * size; i += 1) pixels.push(120, 130, 140, 255);
+  const image = makeImageData(size, size, pixels);
+
+  const noOffset = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 0, offsetPixels: 0 });
+  assert.ok(noOffset.bounds.minX >= 0 && noOffset.bounds.maxX <= size, "no-offset contour should hug the image rect");
+
+  const offset = traceVectorContour(image, { alphaThreshold: 16, simplifyTolerance: 0, offsetPixels: 5 });
+  // A positive offset must push the contour OUTSIDE the original image bounds.
+  assert.ok(offset.bounds.minX < 0, `expected minX < 0, got ${offset.bounds.minX}`);
+  assert.ok(offset.bounds.minY < 0, `expected minY < 0, got ${offset.bounds.minY}`);
+  assert.ok(offset.bounds.maxX > size, `expected maxX > ${size}, got ${offset.bounds.maxX}`);
+  assert.ok(offset.bounds.maxY > size, `expected maxY > ${size}, got ${offset.bounds.maxY}`);
+  // width/height stay equal to the image so staleness/identity checks keep working.
+  assert.equal(offset.width, size);
+  assert.equal(offset.height, size);
+
+  // The exported SVG sizes to the expanded contour with a negative-origin viewBox.
+  const svg = contourToSvg(offset, { strokeWidth: 1 });
+  const viewBox = svg.match(/viewBox="([^"]+)"/)[1].split(" ").map(Number);
+  assert.ok(viewBox[0] < 0 && viewBox[1] < 0, `expected negative viewBox origin, got ${viewBox}`);
+  assert.ok(viewBox[2] > size && viewBox[3] > size, `expected expanded viewBox size, got ${viewBox}`);
+}
+
 function testDefringeTolerance() {
   const image = makeImageData(2, 1, [
     240, 240, 240, 128,
     20, 90, 180, 128
   ]);
-  const output = applyProcessing(image, {
-    defringe: { enabled: true, matteColor: "#ffffff", strength: 100, radius: 3, tolerance: 32 },
-    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
-    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
-  });
+  const output = applyProcessing(image, processingSettings({
+    defringe: { enabled: true, matteColor: "#ffffff", strength: 100, radius: 3, tolerance: 32 }
+  }));
 
   assert.ok(output.data[0] < 240);
   assert.equal(output.data[4], 20);
@@ -197,11 +257,9 @@ function testDefringeTolerancePotency() {
   const image = makeImageData(1, 1, [
     0, 0, 0, 128
   ]);
-  const output = applyProcessing(image, {
-    defringe: { enabled: true, matteColor: "#ffffff", strength: 100, radius: 3, tolerance: 180 },
-    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
-    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
-  });
+  const output = applyProcessing(image, processingSettings({
+    defringe: { enabled: true, matteColor: "#ffffff", strength: 100, radius: 3, tolerance: 180 }
+  }));
 
   assert.equal(output.data[0], 0);
   assert.equal(output.data[1], 0);
@@ -212,45 +270,40 @@ function testDefringeStrengthPotency() {
   const image = makeImageData(1, 1, [
     200, 200, 200, 128
   ]);
-  const output = applyProcessing(image, {
-    defringe: { enabled: true, matteColor: "#ffffff", strength: 50, radius: 3, tolerance: 255 },
-    bleed: { enabled: false, reach: 3, affectSemiTransparent: false },
-    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
-  });
+  const output = applyProcessing(image, processingSettings({
+    defringe: { enabled: true, matteColor: "#ffffff", strength: 50, radius: 3, tolerance: 255 }
+  }));
 
   assert.equal(output.data[0], 176);
 }
 
-function testColorBleedReachPotency() {
-  const image = makeImageData(5, 1, [
-    10, 20, 30, 255,
-    0, 0, 0, 0,
-    0, 0, 0, 0,
-    0, 0, 0, 0,
-    0, 0, 0, 0
-  ]);
-  const output = applyProcessing(image, {
-    defringe: { enabled: false, matteColor: "#ffffff", strength: 0, radius: 1, tolerance: 255 },
-    bleed: { enabled: true, reach: 3, affectSemiTransparent: false, useCustomColor: false, color: "#ffffff" },
-    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
-  });
+function testDefringePasses() {
+  const pixels = [220, 220, 220, 128];
+  const run = (passes) => applyProcessing(makeImageData(1, 1, [...pixels]), processingSettings({
+    defringe: { enabled: true, matteColor: "#ffffff", strength: 60, radius: 3, tolerance: 255, passes }
+  })).data[0];
 
-  assert.deepEqual(Array.from(output.data.slice(12, 15)), [10, 20, 30]);
-  assert.deepEqual(Array.from(output.data.slice(16, 19)), [0, 0, 0]);
-}
+  const onePass = run(1);
+  const twoPasses = run(2);
+  const fivePasses = run(5);
 
-function testColorBleedCustomColor() {
-  const image = makeImageData(2, 1, [
-    10, 20, 30, 255,
-    0, 0, 0, 0
-  ]);
-  const output = applyProcessing(image, {
-    defringe: { enabled: false, matteColor: "#ffffff", strength: 0, radius: 1, tolerance: 255 },
-    bleed: { enabled: true, reach: 3, affectSemiTransparent: false, useCustomColor: true, color: "#336699" },
-    edgeFinish: { enabled: false, cutoff: 128, edgeColorEnabled: false, edgeColor: "#000000", edgeWidth: 0 }
-  });
+  // Each extra pass pushes the color further from the white matte (darker here).
+  assert.ok(onePass < 220, `one pass should correct, got ${onePass}`);
+  assert.ok(twoPasses < onePass, `two passes should correct more (${twoPasses} !< ${onePass})`);
+  assert.ok(fivePasses < twoPasses, `five passes should correct even more (${fivePasses} !< ${twoPasses})`);
 
-  assert.deepEqual(Array.from(output.data.slice(4, 8)), [51, 102, 153, 0]);
+  // Two passes must equal manually defringing an already-defringed image (the export/reimport trick).
+  const first = applyProcessing(makeImageData(1, 1, [...pixels]), processingSettings({
+    defringe: { enabled: true, matteColor: "#ffffff", strength: 60, radius: 3, tolerance: 255, passes: 1 }
+  }));
+  const roundTripped = applyProcessing(first, processingSettings({
+    defringe: { enabled: true, matteColor: "#ffffff", strength: 60, radius: 3, tolerance: 255, passes: 1 }
+  }));
+  assert.equal(twoPasses, roundTripped.data[0]);
+
+  // Out-of-range values clamp to the 1-5 range.
+  assert.equal(run(99), fivePasses);
+  assert.equal(run(0), onePass);
 }
 
 function testPngResolutionMetadata() {
@@ -441,14 +494,14 @@ testApplyMaskToImage();
 testBuildTrimap();
 testDilateBand();
 testFindVisibleAlphaBoundsAndCrop();
-testEdgeFinishCutoffBinarizes();
-testEdgeFinishRecolorsRim();
+testEdgeFinishOffRimColorBinarizesWithoutRecoloring();
+testEdgeFinishSolidRimColorUsesConfiguredColor();
+testEdgeFinishAutoRimColorUsesAdjacentVisiblePixel();
 testProtectPureWhite();
 testDefringeTolerance();
 testDefringeTolerancePotency();
 testDefringeStrengthPotency();
-testColorBleedReachPotency();
-testColorBleedCustomColor();
+testDefringePasses();
 testPngResolutionMetadata();
 testJpegResolutionMetadata();
 testTiffExportPreservesAlphaAndResolution();
@@ -460,5 +513,6 @@ testVectorContourUsesThreshold();
 testVectorContourSvg();
 testVectorContourSvgUsesCurvesWhenSmoothed();
 testVectorContourOffset();
+testVectorContourExpandsPastBorder();
 
 console.log("Unit tests passed.");

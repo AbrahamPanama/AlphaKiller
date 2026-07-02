@@ -11,21 +11,29 @@ export function traceVectorContour(imageData, options = {}) {
   const offsetPixels = clampOffset(options.offsetPixels ?? 0);
   const minArea = Math.max(0, Number(options.minArea ?? 1));
   const maxPaths = Math.max(1, Number(options.maxPaths ?? 256));
-  let foreground = new Uint8Array(width * height);
+
+  // A positive (outward) offset must be able to expand past the image edge for borderless
+  // subjects that touch the boundary. Trace inside a grid padded by the offset distance (plus a
+  // 1px background ring so the contour can close around the dilated mask); points are mapped back
+  // into image coordinate space afterwards, so they may be negative or exceed width/height.
+  const pad = offsetPixels > 0 ? offsetPixels + 1 : 0;
+  const gridWidth = width + pad * 2;
+  const gridHeight = height + pad * 2;
+
+  let foreground = new Uint8Array(gridWidth * gridHeight);
   let foregroundCount = 0;
 
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      const index = y * width + x;
-      if (imageData.data[index * 4 + 3] > alphaThreshold) {
-        foreground[index] = 1;
+      if (imageData.data[(y * width + x) * 4 + 3] > alphaThreshold) {
+        foreground[(y + pad) * gridWidth + (x + pad)] = 1;
         foregroundCount += 1;
       }
     }
   }
 
   if (foregroundCount && offsetPixels !== 0) {
-    foreground = offsetMask(foreground, width, height, offsetPixels);
+    foreground = offsetMask(foreground, gridWidth, gridHeight, offsetPixels);
     foregroundCount = countMaskPixels(foreground);
   }
 
@@ -35,11 +43,11 @@ export function traceVectorContour(imageData, options = {}) {
 
   const segments = [];
   const starts = new Map();
-  const isForeground = (x, y) => x >= 0 && y >= 0 && x < width && y < height && foreground[y * width + x] === 1;
+  const isForeground = (x, y) => x >= 0 && y >= 0 && x < gridWidth && y < gridHeight && foreground[y * gridWidth + x] === 1;
   const addSegment = (sx, sy, ex, ey) => {
     const index = segments.length;
     segments.push({ sx, sy, ex, ey });
-    const key = vertexKey(sx, sy, width);
+    const key = vertexKey(sx, sy, gridWidth);
     const bucket = starts.get(key);
     if (bucket) {
       bucket.push(index);
@@ -48,8 +56,8 @@ export function traceVectorContour(imageData, options = {}) {
     }
   };
 
-  for (let y = 0; y < height; y += 1) {
-    for (let x = 0; x < width; x += 1) {
+  for (let y = 0; y < gridHeight; y += 1) {
+    for (let x = 0; x < gridWidth; x += 1) {
       if (!isForeground(x, y)) continue;
       if (!isForeground(x, y - 1)) addSegment(x + 1, y, x, y);
       if (!isForeground(x - 1, y)) addSegment(x, y, x, y + 1);
@@ -63,8 +71,9 @@ export function traceVectorContour(imageData, options = {}) {
 
   for (let index = 0; index < segments.length; index += 1) {
     if (used[index]) continue;
-    const path = stitchPath(index, segments, starts, used, width);
-    if (path.length < 3) continue;
+    const rawPath = stitchPath(index, segments, starts, used, gridWidth);
+    if (rawPath.length < 3) continue;
+    const path = pad ? rawPath.map((point) => ({ x: point.x - pad, y: point.y - pad })) : rawPath;
 
     const simplified = simplifyClosedPath(path, simplifyTolerance);
     if (simplified.length < 3) continue;
@@ -90,6 +99,7 @@ export function traceVectorContour(imageData, options = {}) {
     alphaThreshold,
     simplifyTolerance: smoothing,
     offsetPixels,
+    bounds: computeContourBounds(limitedPaths, width, height),
     paths: limitedPaths,
     pathCount: limitedPaths.length,
     pointCount: limitedPaths.reduce((sum, path) => sum + path.points.length, 0),
@@ -97,25 +107,71 @@ export function traceVectorContour(imageData, options = {}) {
   };
 }
 
+// Bounding box of the traced contour in image coordinate space, including bezier control points
+// (which can bow slightly beyond the path points). May extend outside [0, width] x [0, height].
+function computeContourBounds(paths, width, height) {
+  let minX = Infinity;
+  let minY = Infinity;
+  let maxX = -Infinity;
+  let maxY = -Infinity;
+  const include = (x, y) => {
+    if (x < minX) minX = x;
+    if (y < minY) minY = y;
+    if (x > maxX) maxX = x;
+    if (y > maxY) maxY = y;
+  };
+
+  for (const path of paths) {
+    for (const point of path.points) include(point.x, point.y);
+    for (const curve of path.curves || []) {
+      include(curve.c1.x, curve.c1.y);
+      include(curve.c2.x, curve.c2.y);
+    }
+  }
+
+  if (!Number.isFinite(minX)) {
+    return { minX: 0, minY: 0, maxX: width, maxY: height };
+  }
+  return { minX, minY, maxX, maxY };
+}
+
 export function contourToSvg(contour, options = {}) {
-  const width = Math.max(1, contour?.width ?? 1);
-  const height = Math.max(1, contour?.height ?? 1);
   const stroke = sanitizeSvgColor(options.stroke || "#ff4fd8");
   const strokeWidth = Math.max(0.1, Number(options.strokeWidth ?? 1));
   const title = escapeXml(options.title || "AlphaKiller vector contour");
   const paths = contour?.paths || [];
+  const view = contourViewBox(contour);
   const body = paths.length
     ? paths.map((path) => `  <path d="${path.d}" />`).join("\n")
     : "  <!-- No visible alpha contour was detected. -->";
 
   return [
     `<?xml version="1.0" encoding="UTF-8"?>`,
-    `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}" fill="none" stroke="${stroke}" stroke-width="${strokeWidth}" stroke-linejoin="round" stroke-linecap="round">`,
+    `<svg xmlns="http://www.w3.org/2000/svg" width="${view.width}" height="${view.height}" viewBox="${view.minX} ${view.minY} ${view.width} ${view.height}" fill="none" stroke="${stroke}" stroke-width="${strokeWidth}" stroke-linejoin="round" stroke-linecap="round">`,
     `  <title>${title}</title>`,
     body,
     `</svg>`,
     ``
   ].join("\n");
+}
+
+// viewBox = the original image rectangle unioned with the contour extent, so it stays image-sized
+// in the normal case and only grows when an outward offset pushes the contour past the edge.
+export function contourViewBox(contour) {
+  const imageWidth = Math.max(1, contour?.width ?? 1);
+  const imageHeight = Math.max(1, contour?.height ?? 1);
+  let minX = 0;
+  let minY = 0;
+  let maxX = imageWidth;
+  let maxY = imageHeight;
+  const bounds = contour?.bounds;
+  if (bounds && Number.isFinite(bounds.minX)) {
+    minX = Math.min(minX, Math.floor(bounds.minX));
+    minY = Math.min(minY, Math.floor(bounds.minY));
+    maxX = Math.max(maxX, Math.ceil(bounds.maxX));
+    maxY = Math.max(maxY, Math.ceil(bounds.maxY));
+  }
+  return { minX, minY, width: Math.max(1, maxX - minX), height: Math.max(1, maxY - minY) };
 }
 
 function emptyContour(width, height, options) {
@@ -125,6 +181,7 @@ function emptyContour(width, height, options) {
     alphaThreshold: clampByte(options.alphaThreshold ?? 16),
     simplifyTolerance: Math.max(0, Number(options.simplifyTolerance ?? 1)),
     offsetPixels: clampOffset(options.offsetPixels ?? 0),
+    bounds: { minX: 0, minY: 0, maxX: width, maxY: height },
     paths: [],
     pathCount: 0,
     pointCount: 0,
