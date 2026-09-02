@@ -577,6 +577,18 @@ button {
   cursor: grabbing;
 }
 
+.canvas-shell.is-contour-repair.has-image canvas {
+  cursor: crosshair;
+}
+
+.canvas-shell.is-contour-edit.has-image canvas {
+  cursor: pointer;
+}
+
+.canvas-shell.is-contour-dragging canvas {
+  cursor: grabbing;
+}
+
 .canvas-tools {
   position: absolute;
   top: 12px;
@@ -894,6 +906,37 @@ input[type="range"] {
   color: var(--warn);
 }
 
+.contour-node-editor {
+  min-height: 40px;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 28px 28px;
+  align-items: center;
+  gap: 5px;
+  padding: 6px;
+  border-top: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+}
+
+.contour-node-editor > div {
+  min-width: 0;
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.contour-node-editor span {
+  overflow: hidden;
+  color: var(--text-2);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.contour-node-editor output {
+  font-size: 10px;
+}
+
 .switch {
   width: 34px;
   height: 20px;
@@ -1027,6 +1070,89 @@ input[type="range"] {
   color: var(--text-3);
   font-size: 11px;
   line-height: 1.35;
+}
+
+.settings-advanced {
+  padding: 10px 0 0;
+  border-top: 1px solid var(--border-soft);
+}
+
+.settings-advanced summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  color: var(--text-2);
+  cursor: pointer;
+  list-style: none;
+}
+
+.settings-advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.settings-advanced summary span {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.settings-advanced summary svg {
+  color: var(--accent);
+}
+
+.settings-advanced summary small {
+  color: var(--text-3);
+  font-size: 10px;
+}
+
+.settings-advanced-body {
+  display: grid;
+  gap: 9px;
+  padding-top: 10px;
+}
+
+.settings-check.compact {
+  padding: 6px 0;
+  border: 0;
+  background: transparent;
+}
+
+.settings-range {
+  display: grid;
+  gap: 5px;
+  color: var(--text-2);
+  font-size: 11px;
+}
+
+.settings-range > span {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.settings-range output {
+  min-width: 62px;
+  text-align: right;
+}
+
+.settings-range input {
+  width: 100%;
+}
+
+.settings-range:has(input:disabled) {
+  opacity: .42;
+}
+
+.settings-reset {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-top: 2px;
 }
 
 .model-options {

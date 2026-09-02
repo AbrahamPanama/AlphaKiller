@@ -1,10 +1,25 @@
-import { buildTrimap } from "./imageProcessing.js";
+import { buildTrimap, constrainRefinedMask, cropPaddedMask } from "./imageProcessing.js";
+import {
+  applyAdaptiveTrimapLocks,
+  applyCertainBackgroundVeto,
+  buildAdaptiveStructureTrimap,
+  buildCertainBackgroundMask,
+  deriveSamPrompts,
+  selectSamStructuralMask
+} from "./structureMatting.js";
+import {
+  accumulateSegmentationTile,
+  createSegmentationTiles,
+  finishSegmentationTiles,
+  fuseGuidedSegmentationMasks,
+  scoreMaskBoundary
+} from "./tiledSegmentation.js";
 
-const STAGE2_MODEL = "hustvl/vitmatte-base-distinctions-646";
-const DEFAULT_TILE_THRESHOLD = 2048;
-const SMALL_TILE_SIZE = 1536;
-const LARGE_TILE_SIZE = 1024;
-const TILE_OVERLAP = 128;
+// Xenova conversion ships browser-ready ONNX (fp32 + q8); the upstream hustvl repos do not.
+const STAGE2_MODEL = "Xenova/vitmatte-small-distinctions-646";
+const STRUCTURE_MODEL = "onnx-community/sam3-tracker-ONNX";
+const DEFAULT_TILE_THRESHOLD = 1024;
+const DEFAULT_TILE_SIZE = 512;
 const DEFAULT_STAGE1_MODEL_ID = "rmbg-1.4";
 const STAGE1_MODELS = {
   "rmbg-1.4": {
@@ -12,9 +27,8 @@ const STAGE1_MODELS = {
     runtime: "pipeline",
     task: "image-segmentation",
     config: { model_type: "segformer" },
-    nativeResolution: DEFAULT_TILE_THRESHOLD,
-    tileSize: SMALL_TILE_SIZE,
-    largeTileSize: LARGE_TILE_SIZE
+    nativeResolution: 1024,
+    tileSize: 1024
   },
   ben2: {
     repoId: "onnx-community/BEN2-ONNX",
@@ -22,7 +36,6 @@ const STAGE1_MODELS = {
     task: "background-removal",
     nativeResolution: 1024,
     tileSize: 1024,
-    largeTileSize: 1024,
     preferGpu: true,
     requiresGpu: true
   }
@@ -31,6 +44,7 @@ const STAGE1_MODELS = {
 let transformersPromise = null;
 const stage1Promises = new Map();
 let stage2Promise = null;
+let structurePromise = null;
 const stage1AccessPromises = new Map();
 let hfToken = "";
 const cancelledJobs = new Set();
@@ -47,6 +61,8 @@ self.onmessage = async (event) => {
 
   const startedAt = performance.now();
   const stagesRun = ["stage1"];
+  const warnings = [];
+  let structureMetrics = null;
   let currentStage = "warming";
 
   try {
@@ -61,24 +77,37 @@ self.onmessage = async (event) => {
     if (isCancelled(id)) return;
 
     currentStage = "infer-stage1";
-    const mask = await runStage1(source, {
+    const stage1Result = await runStage1(source, {
       id,
       stage1,
       modelId,
       tta: options.tta !== false,
       tileThreshold: options.tileThreshold ?? DEFAULT_TILE_THRESHOLD,
       refine: options.refine === true,
+      safeguards: normalizeSegmentationSafeguards(options.safeguards),
       device: stage1.device
     });
     if (isCancelled(id)) return;
+    const mask = stage1Result.mask;
+    const tileMetrics = stage1Result.metrics;
+    if (tileMetrics.tiled) stagesRun.push("stage1-tiles");
 
-    let finalMask = mask;
+    let conservativeMask = new Uint8Array(mask);
+    let aggressiveMask = new Uint8Array(mask);
     if (options.refine === true) {
       currentStage = "infer-stage2";
       try {
-        finalMask = await refineMask(source, mask, id, stage1.device);
+        const refinedStages = await refineMask(source, mask, id, stage1.device, {
+          structure: options.structure !== false
+        });
+        conservativeMask = refinedStages.conservativeMask;
+        aggressiveMask = refinedStages.aggressiveMask;
+        if (refinedStages.structureApplied) stagesRun.push("structure");
         stagesRun.push("stage2");
+        structureMetrics = refinedStages.structureMetrics;
+        if (refinedStages.warning) warnings.push(refinedStages.warning);
       } catch (error) {
+        warnings.push(`Edge refinement fell back to Stage 1: ${normalizeError(error)}`);
         postProgress(id, "compose", 0.9, { device: stage1.device });
       }
       if (isCancelled(id)) return;
@@ -86,8 +115,13 @@ self.onmessage = async (event) => {
 
     currentStage = "compose";
     postProgress(id, "compose", 0.96, { device: stage1.device });
-    const maskMean = meanMask(finalMask);
-    const maskBuffer = finalMask.buffer;
+    const stage1Mask = new Uint8Array(mask);
+    const detailMask = new Uint8Array(conservativeMask);
+    const cleanMask = new Uint8Array(aggressiveMask);
+    const maskMean = meanMask(stage1Mask);
+    const maskBuffer = detailMask.buffer;
+    const aggressiveMaskBuffer = cleanMask.buffer;
+    const stage1MaskBuffer = stage1Mask.buffer;
     self.postMessage({
       type: "result",
       id,
@@ -95,12 +129,17 @@ self.onmessage = async (event) => {
       height,
       buffer: maskBuffer,
       maskBuffer,
+      aggressiveMaskBuffer,
+      stage1MaskBuffer,
       durationMs: performance.now() - startedAt,
       device: stage1.device,
       maskMean,
       modelId,
-      stagesRun
-    }, [maskBuffer]);
+      stagesRun,
+      warnings,
+      structureMetrics,
+      tileMetrics
+    }, [maskBuffer, aggressiveMaskBuffer, stage1MaskBuffer]);
   } catch (error) {
     self.postMessage({
       type: "error",
@@ -291,7 +330,8 @@ async function loadStage2(id, device) {
   const { AutoProcessor, VitMatteForImageMatting } = await getTransformers();
   const modelOptions = {
     device: device === "gpu" ? "webgpu" : "wasm",
-    dtype: device === "gpu" ? "fp16" : "q8",
+    // The repo publishes model.onnx (fp32) and model_quantized.onnx (q8) only — no fp16.
+    dtype: device === "gpu" ? "fp32" : "q8",
     progress_callback: (progress) => postModelProgress(id, progress)
   };
   try {
@@ -315,59 +355,248 @@ async function loadStage2(id, device) {
   }
 }
 
-async function runStage1(source, options) {
-  const strategy = chooseTileStrategy(source.width, source.height, options.stage1.descriptor, options);
-  if (strategy.mode === "native") {
-    const passes = getAugmentations(options.tta, 4);
-    return segmentWithTta(source, source.width, source.height, passes, options, (done, total) => {
-      postProgress(options.id, "infer-stage1", scaledProgress(done / total, options.refine), { device: options.device });
-    });
+async function getStructureStage(id) {
+  if (structurePromise) return structurePromise;
+
+  structurePromise = loadStructureStage(id).catch((error) => {
+    structurePromise = null;
+    throw error;
+  });
+  return structurePromise;
+}
+
+async function loadStructureStage(id) {
+  if (!self.navigator?.gpu) {
+    throw new Error("SAM 3 structure locking requires WebGPU");
   }
 
-  const passes = getAugmentations(options.tta, strategy.maxPasses);
-  const tiles = createTiles(source.width, source.height, strategy.tileSize, TILE_OVERLAP);
+  const { AutoProcessor, Sam3TrackerModel } = await getTransformers();
+  await assertStage1Accessible({ repoId: STRUCTURE_MODEL });
+  let lastError = null;
+  for (const dtype of ["q4f16", "q4"]) {
+    try {
+      const modelOptions = {
+        device: "webgpu",
+        dtype,
+        progress_callback: (progress) => postModelProgress(id, progress)
+      };
+      const [model, processor] = await Promise.all([
+        Sam3TrackerModel.from_pretrained(STRUCTURE_MODEL, modelOptions),
+        AutoProcessor.from_pretrained(STRUCTURE_MODEL, {
+          progress_callback: (progress) => postModelProgress(id, progress)
+        })
+      ]);
+      return { model, processor, device: "gpu", dtype };
+    } catch (error) {
+      lastError = error;
+      if (isModelAccessError(error)) throw error;
+    }
+  }
+  throw lastError || new Error("SAM 3 structure locking could not start");
+}
+
+async function runStructureStage(source, baseMask, id) {
+  const prompts = deriveSamPrompts(baseMask, source.width, source.height, {
+    maxPoints: 12
+  });
+  if (!prompts) throw new Error("Stage 1 did not produce a usable SAM prompt");
+
+  postProgress(id, "infer-structure", 0.56, { device: "gpu" });
+  const { RawImage } = await getTransformers();
+  const { model, processor } = await getStructureStage(id);
+  if (isCancelled(id)) return null;
+
+  const inputImage = source.channels === 4 ? toCompositedRgbRawImage(source, RawImage) : source;
+  const inputPoints = [[prompts.points.map((point) => [point.x, point.y])]];
+  const inputLabels = [[prompts.labels]];
+  const inputBoxes = [[prompts.box]];
+  const inputs = await processor(inputImage, {
+    input_points: inputPoints,
+    input_labels: inputLabels,
+    input_boxes: inputBoxes
+  });
+  const outputs = await model(inputs);
+  if (isCancelled(id)) return null;
+
+  const masks = await processor.post_process_masks(
+    outputs.pred_masks,
+    inputs.original_sizes,
+    inputs.reshaped_input_sizes,
+    { binarize: false }
+  );
+  const selected = selectSamStructuralMask(
+    masks[0],
+    outputs.iou_scores,
+    baseMask,
+    source.width,
+    source.height
+  );
+  if (!selected) throw new Error("SAM 3 did not return a structurally plausible subject mask");
+
+  postProgress(id, "infer-structure", 0.72, { device: "gpu" });
+  return {
+    mask: selected.mask,
+    metrics: {
+      promptCount: prompts.points.length,
+      candidate: selected.candidate,
+      score: selected.score,
+      recall: selected.recall,
+      precision: selected.precision,
+      areaRatio: selected.areaRatio
+    }
+  };
+}
+
+async function runStage1(source, options) {
+  const strategy = chooseTileStrategy(source.width, source.height, options.stage1.descriptor, options);
+  const globalPasses = getAugmentations(options.tta, strategy.globalPasses);
+  const globalMask = await segmentWithTta(
+    source,
+    source.width,
+    source.height,
+    globalPasses,
+    options,
+    (done, total) => {
+      const progress = strategy.mode === "native"
+        ? done / total
+        : 0.35 * (done / total);
+      postProgress(options.id, "infer-stage1", scaledProgress(progress, options.refine), {
+        device: options.device
+      });
+    }
+  );
+
+  if (strategy.mode === "native") {
+    return {
+      mask: globalMask,
+      metrics: {
+        tiled: false,
+        globalPasses: globalPasses.length,
+        activeTiles: 0,
+        skippedTiles: 0
+      }
+    };
+  }
+
+  const detailPasses = getAugmentations(options.tta, strategy.tilePasses);
+  const tiles = createSegmentationTiles(
+    source.width,
+    source.height,
+    strategy.tileSize,
+    strategy.overlap
+  );
+  const activeTiles = tiles
+    .map((tile) => ({
+      tile,
+      score: scoreMaskBoundary(globalMask, source.width, source.height, tile, {
+        softLow: options.safeguards.seedThreshold,
+        softHigh: options.safeguards.preserveThreshold,
+        supportThreshold: options.safeguards.seedThreshold
+      })
+    }))
+    .filter((entry) => entry.score >= 8)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, options.safeguards.maxDetailTiles)
+    .map((entry) => entry.tile);
   const accum = new Float32Array(source.width * source.height);
   const weights = new Float32Array(source.width * source.height);
   let completed = 0;
-  const total = tiles.length * passes.length;
+  const total = Math.max(1, activeTiles.length * detailPasses.length);
 
-  for (const tile of tiles) {
-    if (isCancelled(options.id)) return new Uint8Array(source.width * source.height);
+  for (const tile of activeTiles) {
+    if (isCancelled(options.id)) {
+      return { mask: globalMask, metrics: { tiled: false, cancelled: true } };
+    }
     const tileImage = cropRawImage(source, tile.x, tile.y, tile.width, tile.height);
-    const tileMask = await segmentWithTta(tileImage, tile.width, tile.height, passes, options, (done) => {
-      postProgress(options.id, "infer-stage1", scaledProgress((completed + done) / total, options.refine), { device: options.device });
+    const tileMask = await segmentWithTta(tileImage, tile.width, tile.height, detailPasses, options, (done) => {
+      const tileProgress = (completed + done) / total;
+      postProgress(
+        options.id,
+        "infer-stage1",
+        scaledProgress(0.35 + 0.65 * tileProgress, options.refine),
+        { device: options.device }
+      );
     });
-    completed += passes.length;
-    blendTileMask(tileMask, tile, source.width, source.height, accum, weights);
+    completed += detailPasses.length;
+    accumulateSegmentationTile(
+      tileMask,
+      tile,
+      source.width,
+      source.height,
+      accum,
+      weights,
+      strategy.overlap
+    );
   }
 
-  const output = new Uint8Array(source.width * source.height);
-  for (let i = 0; i < output.length; i++) {
-    output[i] = Math.round(weights[i] > 0 ? accum[i] / weights[i] : 0);
+  if (activeTiles.length === 0) {
+    return {
+      mask: globalMask,
+      metrics: {
+        tiled: false,
+        globalPasses: globalPasses.length,
+        activeTiles: 0,
+        skippedTiles: tiles.length
+      }
+    };
   }
-  return output;
+
+  const detailMask = finishSegmentationTiles(accum, weights);
+  const fused = fuseGuidedSegmentationMasks(
+    globalMask,
+    detailMask,
+    source.width,
+    source.height,
+    {
+      seedThreshold: options.safeguards.seedThreshold,
+      detailThreshold: options.safeguards.detailThreshold,
+      preserveThreshold: options.safeguards.preserveThreshold,
+      edgeBlend: options.safeguards.edgeBlend / 100,
+      recoveryRadius: options.safeguards.recoveryRadius,
+      matteAwareProtection: options.safeguards.matteAwareProtection,
+      matteTolerance: options.safeguards.matteTolerance,
+      matteBoundaryRadius: options.safeguards.matteBoundaryRadius,
+      detailWeights: weights,
+      sourcePixels: source.data,
+      sourceChannels: source.channels
+    }
+  );
+  return {
+    mask: fused.mask,
+    metrics: {
+      tiled: true,
+      tileSize: strategy.tileSize,
+      overlap: strategy.overlap,
+      globalPasses: globalPasses.length,
+      tilePasses: detailPasses.length,
+      activeTiles: activeTiles.length,
+      skippedTiles: tiles.length - activeTiles.length,
+      ...fused.stats
+    }
+  };
 }
 
 function chooseTileStrategy(width, height, descriptor, options) {
   const maxEdge = Math.max(width, height);
+  const safeguards = options.safeguards || normalizeSegmentationSafeguards();
   const native = descriptor.nativeResolution || options.tileThreshold || DEFAULT_TILE_THRESHOLD;
+  const tileSize = safeguards.detailTileSize || DEFAULT_TILE_SIZE;
+  const tileTrigger = Math.max(640, Math.round(tileSize * 1.15));
 
-  if (maxEdge <= native) {
-    return { mode: "native" };
-  }
-
-  if (maxEdge <= native * 2) {
+  if (!safeguards.detailAnalysis || maxEdge <= tileTrigger) {
     return {
-      mode: "tile",
-      tileSize: descriptor.tileSize || native,
-      maxPasses: descriptor.runtime === "automodel" ? 4 : 4
+      mode: "native",
+      globalPasses: maxEdge > 4096 ? 2 : 4
     };
   }
 
   return {
-    mode: "tile",
-    tileSize: descriptor.largeTileSize || Math.max(1024, Math.floor(native / 2)),
-    maxPasses: 2
+    mode: "guided-tile",
+    tileSize,
+    overlap: Math.max(64, Math.min(tileSize - 1, Math.round(tileSize * 0.25))),
+    nativeResolution: native,
+    globalPasses: maxEdge > 4096 ? 2 : 4,
+    tilePasses: 1
   };
 }
 
@@ -468,20 +697,112 @@ async function tensorToMaskImage(tensor, descriptor, RawImage) {
   return new RawImage(output, width, height, 1);
 }
 
-async function refineMask(source, mask, id, device) {
+async function refineMask(source, mask, id, device, options = {}) {
+  let trimap = buildTrimap(mask, source.width, source.height, { dilateRadius: 4 });
+  let structureApplied = false;
+  let structureMetrics = null;
+  let certainBackground = null;
+  let warning = null;
+
+  if (options.structure !== false) {
+    if (device !== "gpu" || !self.navigator?.gpu) {
+      warning = "SAM 3 structure locking requires WebGPU; ViTMatte ran from the Stage 1 trimap.";
+    } else {
+      try {
+        const structure = await runStructureStage(source, mask, id);
+        if (structure && !isCancelled(id)) {
+          const backgroundEvidence = buildCertainBackgroundMask(
+            source.data,
+            mask,
+            source.width,
+            source.height,
+            { channels: source.channels }
+          );
+          const structuralMask = backgroundEvidence.stats.applied
+            ? applyCertainBackgroundVeto(
+                structure.mask,
+                backgroundEvidence.mask,
+                source.width,
+                source.height
+              )
+            : structure.mask;
+          const adaptive = buildAdaptiveStructureTrimap(
+            mask,
+            structuralMask,
+            source.width,
+            source.height
+          );
+          trimap = backgroundEvidence.stats.applied
+            ? applyCertainBackgroundVeto(
+                adaptive.trimap,
+                backgroundEvidence.mask,
+                source.width,
+                source.height
+              )
+            : adaptive.trimap;
+          certainBackground = backgroundEvidence.stats.applied
+            ? backgroundEvidence.mask
+            : null;
+          structureApplied = true;
+          structureMetrics = {
+            ...structure.metrics,
+            ...adaptive.stats,
+            backgroundVetoPixels: backgroundEvidence.stats.vetoPixels || 0,
+            backgroundVetoBorderComponents: backgroundEvidence.stats.borderComponents || 0,
+            backgroundVetoEnclosedComponents: backgroundEvidence.stats.enclosedComponents || 0,
+            backgroundBorderCoherence: backgroundEvidence.stats.borderCoherence || 0,
+            backgroundTolerance: backgroundEvidence.stats.tolerance || 0
+          };
+        }
+      } catch (error) {
+        warning = `SAM 3 structure locking was skipped: ${normalizeError(error)}`;
+      }
+    }
+  }
+
   postProgress(id, "infer-stage2", 0.78, { device });
   const { RawImage } = await getTransformers();
-  const trimap = buildTrimap(mask, source.width, source.height, { dilateRadius: 8 });
   const trimapImage = new RawImage(trimap, source.width, source.height, 1);
   const { processor, model } = await getStage2(id, device);
   const inputs = await processor(source, trimapImage);
   const { alphas } = await model(inputs);
   const alpha = tensorAlphaToMask(alphas);
-  const output = alpha.width === source.width && alpha.height === source.height
-    ? alpha.data
-    : (await new RawImage(alpha.data, alpha.width, alpha.height, 1).resize(source.width, source.height)).data;
+  const [contentHeight, contentWidth] = inputs.reshaped_input_sizes?.[0]
+    ?? [source.height, source.width];
+  const unpadded = cropPaddedMask(
+    alpha.data,
+    alpha.width,
+    alpha.height,
+    contentWidth,
+    contentHeight
+  );
+  const output = unpadded.width === source.width && unpadded.height === source.height
+    ? unpadded.data
+    : (await new RawImage(
+        unpadded.data,
+        unpadded.width,
+        unpadded.height,
+        1
+      ).resize(source.width, source.height)).data;
   postProgress(id, "infer-stage2", 0.94, { device });
-  return new Uint8Array(output);
+  let conservativeMask = structureApplied
+    ? applyAdaptiveTrimapLocks(output, trimap, source.width, source.height)
+    : new Uint8Array(output);
+  if (certainBackground) {
+    conservativeMask = applyCertainBackgroundVeto(
+      conservativeMask,
+      certainBackground,
+      source.width,
+      source.height
+    );
+  }
+  return {
+    conservativeMask,
+    aggressiveMask: constrainRefinedMask(mask, conservativeMask, { maxAlphaBoost: 0 }),
+    structureApplied,
+    structureMetrics,
+    warning
+  };
 }
 
 function tensorAlphaToMask(tensor) {
@@ -578,73 +899,35 @@ function cropRawImage(source, x, y, width, height) {
   return new source.constructor(data, width, height, source.channels);
 }
 
-function createTiles(width, height, tileSize, overlap) {
-  const xs = tileStarts(width, tileSize, overlap);
-  const ys = tileStarts(height, tileSize, overlap);
-  const tiles = [];
-  for (const y of ys) {
-    for (const x of xs) {
-      tiles.push({
-        x,
-        y,
-        width: Math.min(tileSize, width - x),
-        height: Math.min(tileSize, height - y)
-      });
-    }
-  }
-  return tiles;
-}
-
-function tileStarts(size, tileSize, overlap) {
-  if (size <= tileSize) return [0];
-  const step = Math.max(1, tileSize - overlap);
-  const starts = [];
-  for (let start = 0; start < size; start += step) {
-    starts.push(Math.min(start, size - tileSize));
-    if (starts.at(-1) === size - tileSize) break;
-  }
-  return [...new Set(starts)];
-}
-
-function blendTileMask(mask, tile, fullWidth, fullHeight, accum, weights) {
-  for (let y = 0; y < tile.height; y++) {
-    for (let x = 0; x < tile.width; x++) {
-      const fullX = tile.x + x;
-      const fullY = tile.y + y;
-      const outputIndex = fullY * fullWidth + fullX;
-      const weight = tileWeight(x, y, tile, fullWidth, fullHeight);
-      accum[outputIndex] += mask[y * tile.width + x] * weight;
-      weights[outputIndex] += weight;
-    }
-  }
-}
-
-function tileWeight(x, y, tile, fullWidth, fullHeight) {
-  return axisWeight(x, tile.x, tile.width, fullWidth) * axisWeight(y, tile.y, tile.height, fullHeight);
-}
-
-function axisWeight(local, tileStart, tileSize, fullSize) {
-  let weight = 1;
-  if (tileStart > 0 && local < TILE_OVERLAP) {
-    weight *= raisedCosine(local / TILE_OVERLAP);
-  }
-  if (tileStart + tileSize < fullSize && tileSize - 1 - local < TILE_OVERLAP) {
-    weight *= raisedCosine((tileSize - 1 - local) / TILE_OVERLAP);
-  }
-  return Math.max(0.001, weight);
-}
-
-function raisedCosine(t) {
-  const x = Math.max(0, Math.min(1, t));
-  return 0.5 - 0.5 * Math.cos(Math.PI * x);
-}
-
 function scaledProgress(value, refine) {
-  return value * (refine ? 0.74 : 0.9);
+  return value * (refine ? 0.52 : 0.9);
 }
 
 function sigmoid(value) {
   return 1 / (1 + Math.exp(-value));
+}
+
+function normalizeSegmentationSafeguards(value = {}) {
+  const seedThreshold = boundedInteger(value.seedThreshold, 32, 4, 128);
+  return {
+    detailAnalysis: value.detailAnalysis !== false,
+    detailTileSize: Math.round(boundedInteger(value.detailTileSize, 512, 384, 768) / 64) * 64,
+    maxDetailTiles: boundedInteger(value.maxDetailTiles, 24, 4, 48),
+    seedThreshold,
+    detailThreshold: boundedInteger(value.detailThreshold, 48, 4, 192),
+    preserveThreshold: boundedInteger(value.preserveThreshold, 224, seedThreshold + 1, 255),
+    edgeBlend: boundedInteger(value.edgeBlend, 78, 0, 100),
+    recoveryRadius: boundedInteger(value.recoveryRadius, 24, 1, 96),
+    matteAwareProtection: value.matteAwareProtection !== false,
+    matteTolerance: boundedInteger(value.matteTolerance, 32, 0, 128),
+    matteBoundaryRadius: boundedInteger(value.matteBoundaryRadius, 6, 1, 24)
+  };
+}
+
+function boundedInteger(value, fallback, min, max) {
+  const numeric = Number(value);
+  const normalized = Number.isFinite(numeric) ? Math.round(numeric) : fallback;
+  return Math.max(min, Math.min(max, normalized));
 }
 
 function normalizeStage1ModelId(modelId) {

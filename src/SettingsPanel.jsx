@@ -1,10 +1,11 @@
 import React, { useState } from "react";
-import { KeyRound, X } from "lucide-react";
+import { KeyRound, RotateCcw, ShieldCheck, X } from "lucide-react";
 
 export function SettingsPanel({
   models,
   selectedModel,
   refineDefault,
+  safeguards,
   briaPreserveAlpha,
   disabled,
   refineAvailable,
@@ -13,6 +14,8 @@ export function SettingsPanel({
   tokenValue,
   onModelChange,
   onRefineDefaultChange,
+  onSafeguardsChange,
+  onSafeguardsReset,
   onBriaPreserveAlphaChange,
   onTokenSave,
   onClose
@@ -62,6 +65,56 @@ export function SettingsPanel({
         </div>
       </section>
 
+      <details className="settings-advanced">
+        <summary>
+          <span><ShieldCheck size={14} /> Local model safeguards</span>
+          <small>Advanced</small>
+        </summary>
+        <div className="settings-advanced-body">
+          <p className="settings-hint">Controls how RMBG-1.4 and BEN2 local detail passes may recover or remove pixels. They do not alter BRIA API output.</p>
+          <label className="settings-check compact">
+            <input
+              type="checkbox"
+              checked={safeguards.detailAnalysis}
+              disabled={disabled}
+              onChange={(event) => onSafeguardsChange({ ...safeguards, detailAnalysis: event.target.checked })}
+            />
+            <span>
+              <strong>Fine-detail boundary analysis</strong>
+              <small>Enlarges silhouette crops for hair, lace, jewelry, and narrow branches.</small>
+            </span>
+          </label>
+
+          <SafeguardRange label="Analysis crop" value={safeguards.detailTileSize} min={384} max={768} step={128} unit=" px" disabled={disabled || !safeguards.detailAnalysis} onChange={(value) => onSafeguardsChange({ ...safeguards, detailTileSize: value })} />
+          <SafeguardRange label="Detail pass budget" value={safeguards.maxDetailTiles} min={4} max={48} step={2} unit=" crops" disabled={disabled || !safeguards.detailAnalysis} onChange={(value) => onSafeguardsChange({ ...safeguards, maxDetailTiles: value })} />
+          <SafeguardRange label="Subject seed" value={safeguards.seedThreshold} min={4} max={128} disabled={disabled} onChange={(value) => onSafeguardsChange({ ...safeguards, seedThreshold: value })} />
+          <SafeguardRange label="Recovery confidence" value={safeguards.detailThreshold} min={4} max={192} disabled={disabled} onChange={(value) => onSafeguardsChange({ ...safeguards, detailThreshold: value })} />
+          <SafeguardRange label="Protection starts at" value={safeguards.preserveThreshold} min={Math.min(254, safeguards.seedThreshold + 1)} max={255} disabled={disabled} onChange={(value) => onSafeguardsChange({ ...safeguards, preserveThreshold: value })} />
+          <SafeguardRange label="Boundary correction" value={safeguards.edgeBlend} min={0} max={100} unit="%" disabled={disabled} onChange={(value) => onSafeguardsChange({ ...safeguards, edgeBlend: value })} />
+          <SafeguardRange label="Recovery reach" value={safeguards.recoveryRadius} min={1} max={96} unit=" px" disabled={disabled} onChange={(value) => onSafeguardsChange({ ...safeguards, recoveryRadius: value })} />
+
+          <label className="settings-check compact">
+            <input
+              type="checkbox"
+              checked={safeguards.matteAwareProtection}
+              disabled={disabled}
+              onChange={(event) => onSafeguardsChange({ ...safeguards, matteAwareProtection: event.target.checked })}
+            />
+            <span>
+              <strong>Matte-aware protection</strong>
+              <small>Lets detail passes contract confident pixels only when they match a border-connected source matte.</small>
+            </span>
+          </label>
+          <SafeguardRange label="Matte color tolerance" value={safeguards.matteTolerance} min={0} max={128} disabled={disabled || !safeguards.matteAwareProtection} onChange={(value) => onSafeguardsChange({ ...safeguards, matteTolerance: value })} />
+          <SafeguardRange label="Matte edge depth" value={safeguards.matteBoundaryRadius} min={1} max={24} unit=" px" disabled={disabled || !safeguards.matteAwareProtection} onChange={(value) => onSafeguardsChange({ ...safeguards, matteBoundaryRadius: value })} />
+
+          <button className="text-button settings-reset" type="button" disabled={disabled} onClick={onSafeguardsReset} title="Restore safeguard defaults">
+            <RotateCcw size={13} />
+            Reset safeguards
+          </button>
+        </div>
+      </details>
+
       <section className="settings-section">
         <label className="settings-check">
           <input
@@ -86,8 +139,12 @@ export function SettingsPanel({
             onChange={(event) => onRefineDefaultChange(event.target.checked)}
           />
           <span>
-            <strong>High-quality edges by default</strong>
-            <small>{refineAvailable ? "Runs the matting refinement stage after the selected model." : "Unavailable until a browser-ready matting ONNX model is added."}</small>
+            <strong>Structure + edges by default</strong>
+            <small>{refineAvailable
+              ? hasWebGpu
+                ? "Uses SAM 3 to protect subject structure, then ViTMatte to refine uncertain edges."
+                : "Runs ViTMatte edge refinement; SAM 3 structure locking requires WebGPU."
+              : "Unavailable until a browser-ready matting ONNX model is added."}</small>
           </span>
         </label>
       </section>
@@ -117,5 +174,22 @@ export function SettingsPanel({
         </button>
       </section>
     </div>
+  );
+}
+
+function SafeguardRange({ label, value, min, max, step = 1, unit = "", disabled, onChange }) {
+  return (
+    <label className="settings-range">
+      <span>{label}<output>{value}{unit}</output></span>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        disabled={disabled}
+        onChange={(event) => onChange(Number(event.target.value))}
+      />
+    </label>
   );
 }

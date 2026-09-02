@@ -1,6 +1,6 @@
 # AlphaKiller
 
-Current version: **0.1 beta 2** (`0.1.0-beta.2`).
+Current version: **0.1 beta 3** (`0.1.0-beta.3`).
 
 AlphaKiller is an Electron image editor for cleaning transparent-pixel artifacts:
 anti-aliased edges, matte halos, and hidden edge RGB around transparent pixels.
@@ -22,6 +22,13 @@ JPEG, TIFF, PDF, or SVG export, white-ink printing, compositing, or texture use.
   alpha.
 - Defringe and Edge Finishing controls, including hard alpha cutoff and Rim
   Color modes: Off, Auto, and Solid.
+- OpenCV 5-powered Smart Edge refinement with thin-detail protection and
+  adjacent-color rim reconstruction.
+- Smart Delete/Reconstruct pen mode using local ROI segmentation, plus exact
+  stroke fallback and one-step undo.
+- Subpixel vector contours with signed offsets, topology preservation, fully
+  editable anchors and Bezier handles, exact curve insertion/deletion, and
+  magnetic two-anchor repair.
 - Source metadata, DPI, and pixel inspection.
 - PNG, flattened JPEG, transparent TIFF, transparent PDF, or vector contour SVG
   export through Electron's native save dialog.
@@ -170,8 +177,17 @@ AlphaKiller currently ships three Stage 1 background-removal choices:
 The local/browser `briaai/RMBG-2.0` and BiRefNet_HR paths remain future quality
 targets because their browser/ONNX paths are blocked by ORT runtime issues in
 this Electron integration. The hosted BRIA API path avoids those local ONNX
-constraints. The high-quality edge-refinement toggle is currently disabled
-because the tested ViTMatte repositories do not ship browser-ready ONNX assets.
+constraints. The **Structure + edges** toggle adds a staged quality path after
+the selected model. On WebGPU it uses `onnx-community/sam3-tracker-ONNX` with
+automatic points and a bounding box derived from the Stage 1 mask. SAM 3 locks
+the subject's topology, an adaptive trimap keeps model disagreements uncertain
+and protects thin centerlines, and
+`Xenova/vitmatte-small-distinctions-646` produces the final soft edge matte.
+The existing Residue cleanup slider blends from this detail-preserving matte
+toward the stricter Stage 1 result. If SAM 3 cannot run, AlphaKiller reports the
+fallback and still runs ViTMatte from the Stage 1 trimap. Model assets are
+downloaded on first use and cached afterwards; SAM 3's WebGPU conversion adds
+roughly a 300 MB first-use download.
 
 To use the hosted RMBG-2.0 provider:
 
@@ -217,6 +233,12 @@ The first local background-removal run downloads Hugging Face model assets and
 caches them locally. The BRIA API provider does not download local weights; it
 uploads the normalized PNG to BRIA and downloads the returned PNG result. See
 `THIRD_PARTY_LICENSES.md` before packaging or redistributing builds.
+
+To require the complete SAM 3 + ViTMatte path in the Electron smoke test:
+
+```bash
+ALPHAKILLER_SMOKE_REFINE=1 ALPHAKILLER_REQUIRE_STRUCTURE=1 npm run diagnose:bg-remove
+```
 
 To benchmark a specific background-removal model:
 

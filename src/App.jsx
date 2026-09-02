@@ -12,6 +12,7 @@ import {
   Hand,
   ImageDown,
   Layers,
+  Magnet,
   Maximize,
   Moon,
   Paintbrush,
@@ -25,6 +26,9 @@ import {
   SplitSquareHorizontal,
   Upload,
   Redo2,
+  Plus,
+  Spline,
+  Trash2,
   Undo2,
   Wand2,
   X,
@@ -32,7 +36,13 @@ import {
   ZoomOut
 } from "lucide-react";
 import UTIF from "utif";
-import { applyMaskToImage, cropImageDataToBounds, findVisibleAlphaBounds, protectPureWhite } from "./imageProcessing.js";
+import {
+  applyMaskToImage,
+  cropImageDataToBounds,
+  extractAlphaChannel,
+  findVisibleAlphaBounds,
+  protectPureWhite
+} from "./imageProcessing.js";
 import {
   applyJpegResolution,
   applyPngResolution,
@@ -44,14 +54,35 @@ import {
   readTiffResolution
 } from "./imageIO.js";
 import { SettingsPanel } from "./SettingsPanel.jsx";
-import { contourToSvg, traceVectorContour } from "./vectorTrace.js";
+import { traceContourEngine } from "./contourEngine.js";
+import {
+  deleteContourNode,
+  getContourNodeHandles,
+  hitTestContourHandle,
+  hitTestContourNode,
+  insertContourNode,
+  moveContourHandle,
+  moveContourNode
+} from "./contourEditing.js";
+import { createContourAnchor, hitTestContour } from "./magneticContour.js";
+import { contourToSvg } from "./vectorTrace.js";
 
 const DEFAULT_SETTINGS = {
-  defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2, tolerance: 180, passes: 1 },
-  edgeFinish: { enabled: false, cutoff: 128, rimColorMode: "off", edgeColor: "#000000", edgeWidth: 0 }
+  defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2, tolerance: 180, passes: 1, unmix: false, alphaReach: 220 },
+  edgeFinish: {
+    enabled: false,
+    treatment: "crisp",
+    cutoff: 128,
+    smartStrength: 65,
+    cleanupBalance: 45,
+    detailProtection: 75,
+    rimColorMode: "off",
+    edgeColor: "#000000",
+    edgeWidth: 0
+  }
 };
 
-const APP_VERSION_LABEL = "0.1 beta 2";
+const APP_VERSION_LABEL = "0.1 beta 3";
 
 const PRESETS = [
   {
@@ -66,7 +97,7 @@ const PRESETS = [
     description: "Binary transparency for masks and pixel art.",
     settings: {
       ...DEFAULT_SETTINGS,
-      edgeFinish: { ...DEFAULT_SETTINGS.edgeFinish, enabled: true, cutoff: 128 },
+      edgeFinish: { ...DEFAULT_SETTINGS.edgeFinish, enabled: true, treatment: "crisp", cutoff: 128 },
       defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false }
     }
   },
@@ -76,7 +107,7 @@ const PRESETS = [
     description: "Strong white halo removal for exported artwork.",
     settings: {
       ...DEFAULT_SETTINGS,
-      defringe: { enabled: true, matteColor: "#ffffff", strength: 120, radius: 4, tolerance: 230 }
+      defringe: { enabled: true, matteColor: "#ffffff", strength: 120, radius: 4, tolerance: 230, unmix: true, alphaReach: 240 }
     }
   },
   {
@@ -85,8 +116,8 @@ const PRESETS = [
     description: "Defringe, then crisp 1-bit edge with a black keyline for UV printing.",
     settings: {
       ...DEFAULT_SETTINGS,
-      defringe: { enabled: true, matteColor: "#ffffff", strength: 120, radius: 4, tolerance: 230 },
-      edgeFinish: { enabled: true, cutoff: 128, rimColorMode: "solid", edgeColor: "#000000", edgeWidth: 0 }
+      defringe: { enabled: true, matteColor: "#ffffff", strength: 120, radius: 4, tolerance: 230, unmix: true, alphaReach: 240 },
+      edgeFinish: { ...DEFAULT_SETTINGS.edgeFinish, enabled: true, treatment: "crisp", cutoff: 128, rimColorMode: "solid", edgeColor: "#000000", edgeWidth: 0 }
     }
   }
 ];
@@ -121,12 +152,26 @@ const PDF_FALLBACK_DPI = 300;
 const BG_REMOVE_EMPTY_MASK_LIMIT = 0.02;
 const BG_REMOVE_MODEL_KEY = "alphakiller:bg-remove-model";
 const BG_REMOVE_REFINE_KEY = "alphakiller:bg-remove-refine-default";
+const BG_REMOVE_SAFEGUARDS_KEY = "alphakiller:bg-remove-safeguards";
 const BRIA_PRESERVE_ALPHA_KEY = "alphakiller:bria-preserve-alpha";
 const BRIA_TOKEN_KEY = "alphakiller:bria-token";
 const HF_TOKEN_KEY = "alphakiller:hf-token";
 const CUSTOM_PRESETS_KEY = "alphakiller:custom-presets";
 const EXPORT_SETTINGS_KEY = "alphakiller:export-settings";
-const BG_REMOVE_REFINE_AVAILABLE = false;
+const BG_REMOVE_REFINE_AVAILABLE = true;
+const DEFAULT_BG_REMOVE_SAFEGUARDS = {
+  detailAnalysis: true,
+  detailTileSize: 512,
+  maxDetailTiles: 24,
+  seedThreshold: 32,
+  detailThreshold: 48,
+  preserveThreshold: 224,
+  edgeBlend: 78,
+  recoveryRadius: 24,
+  matteAwareProtection: true,
+  matteTolerance: 32,
+  matteBoundaryRadius: 6
+};
 const DEFAULT_CONTOUR_OPTIONS = {
   visible: false,
   alphaThreshold: 16,
@@ -232,6 +277,15 @@ export function App() {
   const activeProcessingJobRef = useRef(null);
   const queuedProcessingJobRef = useRef(null);
   const processingDebounceRef = useRef(null);
+  const segmentationStageRevisionRef = useRef(0);
+  const contourWorkerRef = useRef(null);
+  const contourJobIdRef = useRef(0);
+  const latestContourRequestRef = useRef(0);
+  const magneticRepairJobIdRef = useRef(0);
+  const activeMagneticRepairRef = useRef(null);
+  const smartBrushWorkerRef = useRef(null);
+  const smartBrushJobIdRef = useRef(0);
+  const activeSmartBrushJobRef = useRef(null);
   const bgRemoveWorkerRef = useRef(null);
   const bgRemoveJobIdRef = useRef(0);
   const latestBgRemoveRequestRef = useRef(0);
@@ -244,6 +298,8 @@ export function App() {
   const preSegmentationOriginalRef = useRef(null);
   const importedOriginalImageRef = useRef(null);
   const backgroundRemovedImageRef = useRef(null);
+  const backgroundStage1ImageRef = useRef(null);
+  const backgroundAggressiveImageRef = useRef(null);
   const preSuperScaleOriginalRef = useRef(null);
   const preSuperScaleProcessedRef = useRef(null);
   const superScaledImageRef = useRef(null);
@@ -268,6 +324,8 @@ export function App() {
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [canvasTool, setCanvasTool] = useState("pan");
   const [brushSize, setBrushSize] = useState(18);
+  const [smartBrushEnabled, setSmartBrushEnabled] = useState(false);
+  const [smartBrushStatus, setSmartBrushStatus] = useState("idle");
   const [status, setStatus] = useState("Ready");
   const [cursor, setCursor] = useState(null);
   const [toast, setToast] = useState(null);
@@ -278,6 +336,7 @@ export function App() {
   const [bgRemoveDevice, setBgRemoveDevice] = useState(null);
   const [bgRemoveModel, setBgRemoveModel] = useState(loadPersistedBgRemoveModel);
   const [bgRemoveRefine, setBgRemoveRefine] = useState(loadPersistedBgRemoveRefine);
+  const [bgRemoveSafeguards, setBgRemoveSafeguards] = useState(loadPersistedBgRemoveSafeguards);
   const [briaPreserveAlpha, setBriaPreserveAlpha] = useState(loadPersistedBriaPreserveAlpha);
   const [superScaleDialogOpen, setSuperScaleDialogOpen] = useState(false);
   const [superScaleFactor, setSuperScaleFactor] = useState(2);
@@ -291,6 +350,9 @@ export function App() {
   const [contourOptions, setContourOptions] = useState(DEFAULT_CONTOUR_OPTIONS);
   const [vectorContour, setVectorContour] = useState(null);
   const [vectorContourStale, setVectorContourStale] = useState(false);
+  const [contourSelection, setContourSelection] = useState(null);
+  const [magneticAnchor, setMagneticAnchor] = useState(null);
+  const [magneticRepairStatus, setMagneticRepairStatus] = useState("idle");
   const [exportDialogOpen, setExportDialogOpen] = useState(false);
   const [exportSettings, setExportSettings] = useState(loadPersistedExportSettings);
   const [settingsPanelOpen, setSettingsPanelOpen] = useState(false);
@@ -304,6 +366,7 @@ export function App() {
 
   const isBackgroundRemoving = bgRemoveStatus === "downloading" || bgRemoveStatus === "warming" || bgRemoveStatus === "inferring";
   const isSuperScaling = superScaleStatus === "running";
+  const isSmartBrushing = smartBrushStatus === "running";
   const canUndo = historyVersion >= 0 && historyRef.current.undo.length > 0;
   const canRedo = historyVersion >= 0 && historyRef.current.redo.length > 0;
   const reconstructionSource = preSegmentationOriginalRef.current;
@@ -337,6 +400,11 @@ export function App() {
     vectorContour.width === processedImageData.width &&
     vectorContour.height === processedImageData.height
   );
+  const selectedContourPath = contourSelection
+    ? vectorContour?.paths?.[contourSelection.pathIndex]
+    : null;
+  const selectedContourPoint = selectedContourPath?.points?.[contourSelection?.nodeIndex] || null;
+  const canDeleteContourNode = Boolean(selectedContourPath?.points?.length > 3);
 
   useEffect(() => {
     const preventBrowserZoomKey = (event) => {
@@ -366,10 +434,14 @@ export function App() {
 
     setStatus("Loading image");
     cancelBackgroundRemoval();
+    cancelSmartBrush();
     resetImageHistory();
     preSegmentationOriginalRef.current = null;
     importedOriginalImageRef.current = null;
     backgroundRemovedImageRef.current = null;
+    backgroundStage1ImageRef.current = null;
+    backgroundAggressiveImageRef.current = null;
+    refreshProcessingSegmentationStages();
     preSuperScaleOriginalRef.current = null;
     preSuperScaleProcessedRef.current = null;
     superScaledImageRef.current = null;
@@ -518,7 +590,41 @@ export function App() {
     };
 
     processingWorkerRef.current = worker;
+    postProcessingSegmentationStages(worker);
     return worker;
+  }
+
+  function postProcessingSegmentationStages(worker = processingWorkerRef.current) {
+    if (!worker) return;
+    const conservative = backgroundRemovedImageRef.current;
+    const aggressive = backgroundAggressiveImageRef.current;
+    const revision = segmentationStageRevisionRef.current;
+
+    if (
+      !conservative ||
+      !aggressive ||
+      conservative.width !== aggressive.width ||
+      conservative.height !== aggressive.height
+    ) {
+      worker.postMessage({ type: "clear-segmentation-stages", revision });
+      return;
+    }
+
+    const conservativeAlpha = extractAlphaChannel(conservative);
+    const aggressiveAlpha = extractAlphaChannel(aggressive);
+    worker.postMessage({
+      type: "set-segmentation-stages",
+      revision,
+      width: conservative.width,
+      height: conservative.height,
+      conservativeAlphaBuffer: conservativeAlpha.buffer,
+      aggressiveAlphaBuffer: aggressiveAlpha.buffer
+    }, [conservativeAlpha.buffer, aggressiveAlpha.buffer]);
+  }
+
+  function refreshProcessingSegmentationStages() {
+    segmentationStageRevisionRef.current += 1;
+    postProcessingSegmentationStages();
   }
 
   function startProcessingJob(job) {
@@ -533,7 +639,8 @@ export function App() {
       buffer,
       width: job.imageData.width,
       height: job.imageData.height,
-      settings: job.settings
+      settings: job.settings,
+      segmentationRevision: segmentationStageRevisionRef.current
     }, [buffer]);
   }
 
@@ -564,6 +671,304 @@ export function App() {
     }, PROCESSING_DEBOUNCE_MS);
   }
 
+  function ensureContourWorker() {
+    if (contourWorkerRef.current) return contourWorkerRef.current;
+    const worker = new Worker(new URL("./contourWorker.js", import.meta.url), { type: "module" });
+    worker.onmessage = (event) => {
+      const message = event.data;
+      const activeRepair = activeMagneticRepairRef.current;
+      if (activeRepair?.id === message.id && (message.type === "repair-result" || message.type === "repair-error")) {
+        activeMagneticRepairRef.current = null;
+        setMagneticRepairStatus("idle");
+        setMagneticAnchor(null);
+        if (message.type === "repair-result") {
+          pushContourUndoSnapshot(activeRepair.undoContour, activeRepair.undoSelection);
+          setVectorContour(message.contour);
+          setVectorContourStale(false);
+          setContourSelection(null);
+          setStatus(`Contour repaired (${message.solver})`);
+        } else {
+          setStatus("Contour repair failed");
+          setToast({ type: "warning", title: "Contour repair failed", message: message.error });
+        }
+        return;
+      }
+      if (message.id !== latestContourRequestRef.current) return;
+      if (message.type === "result") {
+        setVectorContour(message.contour);
+        setVectorContourStale(false);
+        setContourSelection(null);
+        return;
+      }
+      if (message.type === "error") {
+        setVectorContourStale(false);
+        setToast({
+          type: "warning",
+          title: "Contour fallback unavailable",
+          message: message.error || "AlphaKiller could not trace this alpha edge."
+        });
+      }
+    };
+    worker.onerror = (error) => {
+      console.error(error);
+      worker.terminate();
+      if (contourWorkerRef.current === worker) contourWorkerRef.current = null;
+      setVectorContourStale(false);
+    };
+    contourWorkerRef.current = worker;
+    return worker;
+  }
+
+  function requestVectorContour(imageData, options) {
+    const worker = ensureContourWorker();
+    const id = ++contourJobIdRef.current;
+    latestContourRequestRef.current = id;
+    const buffer = new Uint8ClampedArray(imageData.data).buffer;
+    setVectorContourStale(Boolean(vectorContour));
+    setContourSelection(null);
+    worker.postMessage({
+      type: "trace",
+      id,
+      revision: id,
+      width: imageData.width,
+      height: imageData.height,
+      buffer,
+      options: {
+        alphaThreshold: options.alphaThreshold,
+        simplifyTolerance: options.simplifyTolerance,
+        offsetPixels: options.offsetPixels,
+        minArea: 2
+      },
+      legacyFallback: true
+    }, [buffer]);
+  }
+
+  function selectContourNode(imagePoint) {
+    if (!hasCurrentVectorContour) return null;
+    const hit = hitTestContourNode(vectorContour, imagePoint, {
+      maxDistance: Math.max(2.5, 9 / Math.max(zoom, 0.001))
+    });
+    if (hit) {
+      const selection = { pathIndex: hit.pathIndex, nodeIndex: hit.nodeIndex };
+      setContourSelection(selection);
+      setStatus(`Contour node ${hit.nodeIndex + 1} selected`);
+      scheduleCanvasRender();
+      return selection;
+    }
+
+    const segment = hitTestContour(vectorContour, imagePoint, {
+      maxDistance: Math.max(3, 10 / Math.max(zoom, 0.001))
+    });
+    if (segment) {
+      const path = vectorContour.paths[segment.pathIndex];
+      const nodeIndex = segment.t < 0.5
+        ? segment.segmentIndex
+        : (segment.segmentIndex + 1) % path.points.length;
+      const selection = { pathIndex: segment.pathIndex, nodeIndex };
+      setContourSelection(selection);
+      scheduleCanvasRender();
+      return selection;
+    }
+
+    setContourSelection(null);
+    setStatus("Click a contour node to edit it");
+    scheduleCanvasRender();
+    return null;
+  }
+
+  function insertContourNodeAtHit(segmentHit) {
+    if (!hasCurrentVectorContour || !segmentHit) return;
+    const before = vectorContour;
+    const result = insertContourNode(before, segmentHit);
+    commitContourEdit(result.contour, {
+      undoFrom: before,
+      selection: result.selection,
+      statusText: "Contour node added"
+    });
+  }
+
+  function insertContourNodeAfterSelection() {
+    if (!hasCurrentVectorContour || !contourSelection) return;
+    const path = vectorContour.paths[contourSelection.pathIndex];
+    if (!path?.points?.length) return;
+    const segmentIndex = contourSelection.nodeIndex;
+    const start = path.points[segmentIndex];
+    const end = path.points[(segmentIndex + 1) % path.points.length];
+    insertContourNodeAtHit({
+      pathIndex: contourSelection.pathIndex,
+      segmentIndex,
+      t: 0.5,
+      point: { x: (start.x + end.x) / 2, y: (start.y + end.y) / 2 }
+    });
+  }
+
+  function deleteSelectedContourNode() {
+    if (!hasCurrentVectorContour || !contourSelection) return;
+    const before = vectorContour;
+    const result = deleteContourNode(before, contourSelection);
+    if (!result.deleted) {
+      setStatus("A closed contour needs at least three nodes");
+      return;
+    }
+    commitContourEdit(result.contour, {
+      undoFrom: before,
+      selection: result.selection,
+      statusText: "Contour node deleted"
+    });
+  }
+
+  function nudgeSelectedContourNode(deltaX, deltaY) {
+    if (!hasCurrentVectorContour || !contourSelection) return;
+    const point = vectorContour.paths[contourSelection.pathIndex]?.points?.[contourSelection.nodeIndex];
+    if (!point) return;
+    const before = vectorContour;
+    const next = moveContourNode(before, contourSelection, {
+      x: point.x + deltaX,
+      y: point.y + deltaY
+    });
+    commitContourEdit(next, {
+      undoFrom: before,
+      selection: contourSelection,
+      statusText: "Contour node nudged"
+    });
+  }
+
+  function addMagneticContourAnchor(imagePoint) {
+    if (!vectorContour || vectorContourStale || magneticRepairStatus === "running") return;
+    const anchor = createContourAnchor(vectorContour, imagePoint, {
+      maxDistance: Math.max(3, 14 / zoom)
+    });
+    if (!anchor) {
+      setStatus("Click closer to the vector contour");
+      return;
+    }
+    if (!magneticAnchor || magneticAnchor.pathIndex !== anchor.pathIndex) {
+      setMagneticAnchor(anchor);
+      setStatus("Magnetic repair: choose the end anchor");
+      scheduleCanvasRender();
+      return;
+    }
+
+    const worker = ensureContourWorker();
+    const id = ++magneticRepairJobIdRef.current;
+    const buffer = new Uint8ClampedArray(processedImageData.data).buffer;
+    activeMagneticRepairRef.current = {
+      id,
+      undoContour: cloneContourData(vectorContour),
+      undoSelection: contourSelection ? { ...contourSelection } : null
+    };
+    setMagneticRepairStatus("running");
+    setStatus("Magnetic repair following artwork edge");
+    worker.postMessage({
+      type: "repair",
+      id,
+      width: processedImageData.width,
+      height: processedImageData.height,
+      buffer,
+      contour: vectorContour,
+      startAnchor: magneticAnchor,
+      endAnchor: anchor,
+      options: {
+        roiPadding: Math.max(32, Math.round(64 / Math.max(zoom, 0.5))),
+        smoothing: contourOptions.simplifyTolerance,
+        simplifyTolerance: 0.65
+      }
+    }, [buffer]);
+  }
+
+  function ensureSmartBrushWorker() {
+    if (smartBrushWorkerRef.current) return smartBrushWorkerRef.current;
+    const worker = new Worker(new URL("./smartBrushWorker.js", import.meta.url), { type: "module" });
+
+    worker.onmessage = (event) => {
+      const message = event.data;
+      const activeJob = activeSmartBrushJobRef.current;
+      if (!activeJob || activeJob.id !== message.id) return;
+      activeSmartBrushJobRef.current = null;
+      setSmartBrushStatus("idle");
+
+      if (message.type !== "result") {
+        commitDocumentImageEdit(activeJob.exactFallback, {
+          undoFrom: activeJob.undoFrom,
+          statusText: `${activeJob.label} applied`
+        });
+        setToast({
+          type: "warning",
+          title: "Smart brush used exact fallback",
+          message: message.error || "The local vision pass could not refine this stroke."
+        });
+        return;
+      }
+
+      const nextImageData = new ImageData(new Uint8ClampedArray(message.buffer), message.width, message.height);
+      commitDocumentImageEdit(nextImageData, {
+        undoFrom: activeJob.undoFrom,
+        statusText: `${activeJob.label} applied (${message.engine === "opencv" ? "OpenCV 5" : "local"})`
+      });
+      if (message.fallbackReason) {
+        setToast({
+          type: "info",
+          title: "Smart brush completed",
+          message: "The correction used AlphaKiller's deterministic fallback for this region."
+        });
+      }
+    };
+
+    worker.onerror = (error) => {
+      console.error(error);
+      const activeJob = activeSmartBrushJobRef.current;
+      worker.terminate();
+      if (smartBrushWorkerRef.current === worker) smartBrushWorkerRef.current = null;
+      activeSmartBrushJobRef.current = null;
+      setSmartBrushStatus("idle");
+      if (activeJob) {
+        commitDocumentImageEdit(activeJob.exactFallback, {
+          undoFrom: activeJob.undoFrom,
+          statusText: `${activeJob.label} applied`
+        });
+      }
+    };
+
+    smartBrushWorkerRef.current = worker;
+    return worker;
+  }
+
+  function cancelSmartBrush() {
+    activeSmartBrushJobRef.current = null;
+    smartBrushWorkerRef.current?.terminate();
+    smartBrushWorkerRef.current = null;
+    setSmartBrushStatus("idle");
+  }
+
+  function runSmartBrushCorrection(interaction) {
+    const worker = ensureSmartBrushWorker();
+    const id = ++smartBrushJobIdRef.current;
+    const mode = interaction.kind;
+    const label = mode === "restore" ? "Smart Reconstruct" : "Smart Delete";
+    const currentBuffer = new Uint8ClampedArray(interaction.undoImageData.data).buffer;
+    const restoreSource = mode === "restore" ? preSegmentationOriginalRef.current : interaction.undoImageData;
+    const sourceBuffer = new Uint8ClampedArray(restoreSource.data).buffer;
+    activeSmartBrushJobRef.current = {
+      id,
+      label,
+      undoFrom: interaction.undoImageData,
+      exactFallback: new ImageData(new Uint8ClampedArray(interaction.draftData), interaction.width, interaction.height)
+    };
+    setSmartBrushStatus("running");
+    setStatus(`${label} refining region`);
+    worker.postMessage({
+      type: "run",
+      id,
+      mode,
+      width: interaction.width,
+      height: interaction.height,
+      currentBuffer,
+      sourceBuffer,
+      strokes: [{ points: interaction.strokePoints, brushSize: interaction.brushSize }],
+      brushSize: interaction.brushSize
+    }, [currentBuffer, sourceBuffer]);
+  }
+
   function ensureBgRemoveWorker() {
     if (bgRemoveWorkerRef.current) {
       return bgRemoveWorkerRef.current;
@@ -585,7 +990,7 @@ export function App() {
         setBgRemoveStatus(nextStatus);
         setBgRemoveProgress(message.progress);
         if (message.device) setBgRemoveDevice(message.device);
-        setStatus(BG_REMOVE_LABELS[nextStatus] || "Removing background");
+        setStatus(bgRemoveStageLabel(message.stage, nextStatus));
         return;
       }
 
@@ -612,12 +1017,19 @@ export function App() {
       }
 
       const maskBuffer = message.maskBuffer || message.buffer;
+      const aggressiveMaskBuffer = message.aggressiveMaskBuffer || maskBuffer;
+      const stage1MaskBuffer = message.stage1MaskBuffer || maskBuffer;
       const nextImageData = applyMaskToImage(activeJob.imageData, maskBuffer);
+      const aggressiveImageData = applyMaskToImage(activeJob.imageData, aggressiveMaskBuffer);
+      const stage1ImageData = applyMaskToImage(activeJob.imageData, stage1MaskBuffer);
       if (!preSegmentationOriginalRef.current) {
         preSegmentationOriginalRef.current = cloneImageData(activeJob.imageData);
         setHasPreSegmentationOriginal(true);
       }
       backgroundRemovedImageRef.current = cloneImageData(nextImageData);
+      backgroundStage1ImageRef.current = cloneImageData(stage1ImageData);
+      backgroundAggressiveImageRef.current = cloneImageData(aggressiveImageData);
+      refreshProcessingSegmentationStages();
       setHasBackgroundRemovedStage(true);
 
       commitDocumentImageEdit(nextImageData, {
@@ -629,10 +1041,18 @@ export function App() {
       setBgRemoveDevice(message.device);
       const completedModel = message.modelId || activeJob.modelId || bgRemoveModel;
       const completedModelLabel = BG_REMOVE_MODELS[completedModel]?.shortLabel || "AI";
+      const usedStructureLock = message.stagesRun?.includes("structure");
+      const usedEdgeRefinement = message.stagesRun?.includes("stage2");
+      const warning = message.warnings?.find(Boolean);
+      const refinementSummary = usedStructureLock
+        ? " with SAM 3 structure lock and edge refinement"
+        : usedEdgeRefinement
+          ? " with edge refinement"
+          : "";
       setToast({
-        type: "success",
-        title: "Background removed",
-        message: `${completedModelLabel} mask applied in ${(message.durationMs / 1000).toFixed(1)}s${message.device === "cpu" ? " using CPU" : ""}${message.stagesRun?.includes("stage2") ? " with edge refinement" : ""}.`
+        type: warning ? "warning" : "success",
+        title: warning ? "Background removed with fallback" : "Background removed",
+        message: `${completedModelLabel} mask applied in ${(message.durationMs / 1000).toFixed(1)}s${message.device === "cpu" ? " using CPU" : ""}${refinementSummary}.${warning ? ` ${warning}` : ""}`
       });
     };
 
@@ -688,8 +1108,10 @@ export function App() {
       options: {
         tta: true,
         refine: job.refine && BG_REMOVE_REFINE_AVAILABLE,
+        structure: job.refine && BG_REMOVE_REFINE_AVAILABLE,
         modelId: job.modelId,
-        tileThreshold: 2048,
+        tileThreshold: 1024,
+        safeguards: job.safeguards,
         hfToken: job.hfToken
       }
     }, [buffer]);
@@ -724,7 +1146,9 @@ export function App() {
         setToast({
           type: "info",
           title: "First-time download may be large",
-          message: `${model.label || "Background removal"} model assets are cached locally after the first successful download.`
+          message: bgRemoveRefine
+            ? `${model.label || "Background removal"}, SAM 3, and ViTMatte assets are cached locally after their first successful download.`
+            : `${model.label || "Background removal"} model assets are cached locally after the first successful download.`
         });
       }
     }
@@ -746,6 +1170,7 @@ export function App() {
       visibleBefore: originalImageData,
       refine: bgRemoveRefine,
       modelId: bgRemoveModel,
+      safeguards: bgRemoveSafeguards,
       hfToken
     });
   }
@@ -791,6 +1216,9 @@ export function App() {
         setHasPreSegmentationOriginal(true);
       }
       backgroundRemovedImageRef.current = cloneImageData(nextImageData);
+      backgroundStage1ImageRef.current = cloneImageData(nextImageData);
+      backgroundAggressiveImageRef.current = cloneImageData(nextImageData);
+      refreshProcessingSegmentationStages();
       setHasBackgroundRemovedStage(true);
 
       if (sourceObjectUrlRef.current) {
@@ -921,12 +1349,17 @@ export function App() {
     if (!snapshot) return;
 
     const restored = cloneImageData(snapshot);
-    preSegmentationOriginalRef.current = null;
-    setHasPreSegmentationOriginal(false);
     commitDocumentImageEdit(restored, {
       undoFrom: originalImageData,
       statusText: "Original restored"
     });
+    preSegmentationOriginalRef.current = null;
+    backgroundRemovedImageRef.current = null;
+    backgroundStage1ImageRef.current = null;
+    backgroundAggressiveImageRef.current = null;
+    refreshProcessingSegmentationStages();
+    setHasPreSegmentationOriginal(false);
+    setHasBackgroundRemovedStage(false);
     setBgRemoveStatus("idle");
     setBgRemoveProgress(0);
     setToast(null);
@@ -970,6 +1403,9 @@ export function App() {
     cropRefToBounds(importedOriginalImageRef, bounds, sourceWidth, sourceHeight);
     cropRefToBounds(preSegmentationOriginalRef, bounds, sourceWidth, sourceHeight);
     cropRefToBounds(backgroundRemovedImageRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(backgroundStage1ImageRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(backgroundAggressiveImageRef, bounds, sourceWidth, sourceHeight);
+    refreshProcessingSegmentationStages();
     cropRefToBounds(preSuperScaleOriginalRef, bounds, sourceWidth, sourceHeight);
     cropRefToBounds(preSuperScaleProcessedRef, bounds, sourceWidth, sourceHeight);
     cropRefToBounds(superScaledImageRef, bounds, sourceWidth, sourceHeight);
@@ -1093,6 +1529,12 @@ export function App() {
     persistLocalStorage(BRIA_PRESERVE_ALPHA_KEY, value ? "true" : "false");
   }
 
+  function updateBgRemoveSafeguards(nextValue) {
+    const normalized = normalizeBgRemoveSafeguards(nextValue);
+    setBgRemoveSafeguards(normalized);
+    persistLocalStorage(BG_REMOVE_SAFEGUARDS_KEY, JSON.stringify(normalized));
+  }
+
   function saveSettingsToken(token) {
     const clean = sanitizeToken(token);
     if (clean) {
@@ -1175,8 +1617,23 @@ export function App() {
     setHistoryVersion((version) => version + 1);
   }
 
-  function makeHistorySnapshot({ imageData = originalImageData, includeImage = false } = {}) {
+  function makeHistorySnapshot({
+    imageData = originalImageData,
+    includeImage = false,
+    kind = "document",
+    contour = vectorContour,
+    selection = contourSelection
+  } = {}) {
+    if (kind === "contour") {
+      return {
+        kind,
+        vectorContour: cloneContourData(contour),
+        contourOptions: structuredClone(contourOptions),
+        contourSelection: selection ? { ...selection } : null
+      };
+    }
     return {
+      kind,
       imageData: includeImage && imageData ? cloneImageData(imageData) : null,
       resolution: cloneResolution(source?.resolution),
       settings: normalizePresetSettings(settings),
@@ -1190,6 +1647,8 @@ export function App() {
       preSegmentationOriginal: cloneRefImageData(preSegmentationOriginalRef),
       importedOriginal: cloneRefImageData(importedOriginalImageRef),
       backgroundRemoved: cloneRefImageData(backgroundRemovedImageRef),
+      backgroundStage1: cloneRefImageData(backgroundStage1ImageRef),
+      backgroundAggressive: cloneRefImageData(backgroundAggressiveImageRef),
       preSuperScaleOriginal: cloneRefImageData(preSuperScaleOriginalRef),
       preSuperScaleProcessed: cloneRefImageData(preSuperScaleProcessedRef),
       superScaled: cloneRefImageData(superScaledImageRef),
@@ -1206,6 +1665,9 @@ export function App() {
     preSegmentationOriginalRef.current = snapshot.preSegmentationOriginal ? cloneImageData(snapshot.preSegmentationOriginal) : null;
     importedOriginalImageRef.current = snapshot.importedOriginal ? cloneImageData(snapshot.importedOriginal) : null;
     backgroundRemovedImageRef.current = snapshot.backgroundRemoved ? cloneImageData(snapshot.backgroundRemoved) : null;
+    backgroundStage1ImageRef.current = snapshot.backgroundStage1 ? cloneImageData(snapshot.backgroundStage1) : null;
+    backgroundAggressiveImageRef.current = snapshot.backgroundAggressive ? cloneImageData(snapshot.backgroundAggressive) : null;
+    refreshProcessingSegmentationStages();
     preSuperScaleOriginalRef.current = snapshot.preSuperScaleOriginal ? cloneImageData(snapshot.preSuperScaleOriginal) : null;
     preSuperScaleProcessedRef.current = snapshot.preSuperScaleProcessed ? cloneImageData(snapshot.preSuperScaleProcessed) : null;
     superScaledImageRef.current = snapshot.superScaled ? cloneImageData(snapshot.superScaled) : null;
@@ -1281,7 +1743,37 @@ export function App() {
     replaceDocumentImage(imageData, statusText, { resolution });
   }
 
+  function pushContourUndoSnapshot(contour = vectorContour, selection = contourSelection) {
+    clearSettingsUndoGroup();
+    pushUndoSnapshot(makeHistorySnapshot({ kind: "contour", contour, selection }));
+  }
+
+  function commitContourEdit(nextContour, {
+    undoFrom = vectorContour,
+    undoSelection = contourSelection,
+    selection = contourSelection,
+    statusText = "Contour updated"
+  } = {}) {
+    if (!nextContour || nextContour === undoFrom) return;
+    pushContourUndoSnapshot(undoFrom, undoSelection);
+    setVectorContour(nextContour);
+    setVectorContourStale(false);
+    setContourSelection(selection);
+    setStatus(statusText);
+    scheduleCanvasRender();
+  }
+
   function applyHistorySnapshot(snapshot, statusText) {
+    if (snapshot.kind === "contour") {
+      setVectorContour(cloneContourData(snapshot.vectorContour));
+      setVectorContourStale(false);
+      setContourOptions(snapshot.contourOptions || DEFAULT_CONTOUR_OPTIONS);
+      setContourSelection(snapshot.contourSelection ? { ...snapshot.contourSelection } : null);
+      setMagneticAnchor(null);
+      setStatus(statusText);
+      scheduleCanvasRender();
+      return;
+    }
     restoreStageSnapshot(snapshot.stageSnapshot);
 
     if (snapshot.imageData) {
@@ -1300,7 +1792,10 @@ export function App() {
     const previous = history.undo.pop();
     if (!previous) return;
 
-    history.redo.push(makeHistorySnapshot({ includeImage: Boolean(previous.imageData) }));
+    history.redo.push(makeHistorySnapshot({
+      includeImage: Boolean(previous.imageData),
+      kind: previous.kind || "document"
+    }));
     if (history.redo.length > HISTORY_LIMIT) {
       history.redo.shift();
     }
@@ -1314,7 +1809,10 @@ export function App() {
     const next = history.redo.pop();
     if (!next) return;
 
-    history.undo.push(makeHistorySnapshot({ includeImage: Boolean(next.imageData) }));
+    history.undo.push(makeHistorySnapshot({
+      includeImage: Boolean(next.imageData),
+      kind: next.kind || "document"
+    }));
     if (history.undo.length > HISTORY_LIMIT) {
       history.undo.shift();
     }
@@ -1337,19 +1835,14 @@ export function App() {
     if (vectorContour) {
       setVectorContourStale(true);
     }
+    setMagneticAnchor(null);
+    setContourSelection(null);
   }, [processedImageData]);
 
   useEffect(() => {
     if (!contourOptions.visible || !processedImageData) return;
     const id = window.setTimeout(() => {
-      const contour = traceVectorContour(processedImageData, {
-        alphaThreshold: contourOptions.alphaThreshold,
-        simplifyTolerance: contourOptions.simplifyTolerance,
-        offsetPixels: contourOptions.offsetPixels,
-        minArea: 2
-      });
-      setVectorContour(contour);
-      setVectorContourStale(false);
+      requestVectorContour(processedImageData, contourOptions);
     }, 80);
 
     return () => window.clearTimeout(id);
@@ -1372,6 +1865,9 @@ export function App() {
     clearBgRemoveTimeout();
     clearSuperScaleTimeout();
     processingWorkerRef.current?.terminate();
+    contourWorkerRef.current?.postMessage({ type: "dispose" });
+    contourWorkerRef.current?.terminate();
+    smartBrushWorkerRef.current?.terminate();
     bgRemoveWorkerRef.current?.terminate();
   }, []);
 
@@ -1385,7 +1881,42 @@ export function App() {
     if (canvasTool === "restore" && !canReconstruct) {
       setCanvasTool("pan");
     }
-  }, [canvasTool, canReconstruct]);
+    if ((canvasTool === "contour-repair" || canvasTool === "contour-edit") && !hasCurrentVectorContour) {
+      setCanvasTool("pan");
+      setMagneticAnchor(null);
+      setContourSelection(null);
+    }
+  }, [canvasTool, canReconstruct, hasCurrentVectorContour]);
+
+  useEffect(() => {
+    if (canvasTool !== "contour-edit" || !contourSelection || !hasCurrentVectorContour) return;
+    const onContourKeyDown = (event) => {
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return;
+      if (event.key === "Delete" || event.key === "Backspace") {
+        event.preventDefault();
+        deleteSelectedContourNode();
+        return;
+      }
+      if (event.key === "Escape") {
+        setContourSelection(null);
+        scheduleCanvasRender();
+        return;
+      }
+      const direction = {
+        ArrowLeft: [-1, 0],
+        ArrowRight: [1, 0],
+        ArrowUp: [0, -1],
+        ArrowDown: [0, 1]
+      }[event.key];
+      if (!direction) return;
+      event.preventDefault();
+      const step = event.altKey ? 0.1 : event.shiftKey ? 10 : 1;
+      nudgeSelectedContourNode(direction[0] * step, direction[1] * step);
+    };
+    window.addEventListener("keydown", onContourKeyDown);
+    return () => window.removeEventListener("keydown", onContourKeyDown);
+  }, [canvasTool, contourSelection, hasCurrentVectorContour, vectorContour]);
 
   function updateCompareLayer(side, feature, value) {
     const setter = side === "before" ? setCompareBeforeLayers : setCompareAfterLayers;
@@ -1487,6 +2018,12 @@ export function App() {
       vectorContour.height === frameImageData.height
     ) {
       drawVectorContour(ctx, vectorContour, x, y, zoom, contourOptions.color);
+      if (canvasTool === "contour-edit") {
+        drawContourEditor(ctx, vectorContour, contourSelection, x, y, zoom, contourOptions.color);
+      }
+      if (canvasTool === "contour-repair" && magneticAnchor) {
+        drawMagneticAnchor(ctx, magneticAnchor.point, x, y, zoom, contourOptions.color);
+      }
     }
 
     const brushPoint = brushPointRef.current;
@@ -1500,7 +2037,7 @@ export function App() {
         canvasTool
       );
     }
-  }, [source, originalImageData, processedImageData, compareMode, compareBeforeLayers, compareAfterLayers, split, zoom, pan, background, customBackground, canvasTool, brushSize, canvasMode, isBrushTool, hasSuperScaleStage, contourOptions, vectorContour, vectorContourStale, hasCurrentVectorContour]);
+  }, [source, originalImageData, processedImageData, compareMode, compareBeforeLayers, compareAfterLayers, split, zoom, pan, background, customBackground, canvasTool, brushSize, canvasMode, isBrushTool, hasSuperScaleStage, contourOptions, vectorContour, vectorContourStale, hasCurrentVectorContour, contourSelection, magneticAnchor]);
 
   useEffect(() => {
     renderCanvasRef.current = renderCanvas;
@@ -1740,6 +2277,8 @@ export function App() {
       return;
     }
 
+    interaction.strokePoints.push({ x: imagePoint.x, y: imagePoint.y });
+
     eraseLinePixels(
       interaction.draftData,
       interaction.width,
@@ -1771,6 +2310,8 @@ export function App() {
       interaction.lastImagePoint = null;
       return;
     }
+
+    interaction.strokePoints.push({ x: imagePoint.x, y: imagePoint.y });
 
     const from = interaction.lastImagePoint || imagePoint;
     reconstructLinePixels(
@@ -1873,12 +2414,57 @@ export function App() {
   };
 
   const onCanvasPointerDown = (event) => {
-    if (!source || !processedImageData || !canvasRef.current) return;
+    if (!source || !processedImageData || !canvasRef.current || isSmartBrushing) return;
     if (event.button !== 0 && event.button !== 1) return;
 
     const rect = canvasRef.current.getBoundingClientRect();
     const point = getCanvasPoint(event, canvasRef.current);
     const frame = getImageFrame(source, zoom, pan, rect.width, rect.height);
+    if (canvasTool === "contour-edit" && event.button === 0) {
+      const imagePoint = getContourImagePoint(point, frame, zoom);
+      if (!imagePoint) return;
+      const nodeHit = hitTestContourNode(vectorContour, imagePoint, {
+        maxDistance: Math.max(2.5, 9 / Math.max(zoom, 0.001))
+      });
+      const handleHit = !nodeHit && contourSelection
+        ? hitTestContourHandle(vectorContour, contourSelection, imagePoint, {
+            maxDistance: Math.max(2.5, 9 / Math.max(zoom, 0.001))
+          })
+        : null;
+      const selection = nodeHit
+        ? { pathIndex: nodeHit.pathIndex, nodeIndex: nodeHit.nodeIndex }
+        : handleHit ? contourSelection : null;
+
+      if (!selection) {
+        selectContourNode(imagePoint);
+        event.preventDefault();
+        return;
+      }
+
+      setContourSelection(selection);
+      interactionRef.current = {
+        kind: handleHit ? "contour-handle" : "contour-node",
+        handleKind: handleHit?.kind || null,
+        selection,
+        pointerId: event.pointerId,
+        frame,
+        undoContour: cloneContourData(vectorContour),
+        draftContour: vectorContour,
+        undoSelection: contourSelection ? { ...contourSelection } : null,
+        changed: false
+      };
+      canvasRef.current.setPointerCapture(event.pointerId);
+      setCanvasMode(interactionRef.current.kind);
+      setStatus(handleHit ? `Moving ${handleHit.kind} curve handle` : `Moving contour node ${selection.nodeIndex + 1}`);
+      event.preventDefault();
+      return;
+    }
+    if (canvasTool === "contour-repair") {
+      const imagePoint = getImagePoint(point, frame, zoom);
+      if (imagePoint) addMagneticContourAnchor(imagePoint);
+      event.preventDefault();
+      return;
+    }
     const splitX = frame.x + frame.width * (split / 100);
     const overSplit = compareMode === "split" &&
       point.y >= frame.y - SPLIT_HIT_RADIUS &&
@@ -1904,6 +2490,7 @@ export function App() {
       restoreSourceData: restoreSourceImageData?.data || null,
       restoreSourceCanvas: restoreSourceImageData ? imageDataToCanvas(restoreSourceImageData) : null,
       lastImagePoint: null,
+      strokePoints: [],
       changed: false,
       brushSize
     };
@@ -1930,6 +2517,23 @@ export function App() {
     if (!canvasRef.current) return;
     const point = getCanvasPoint(event, canvasRef.current);
     const interaction = interactionRef.current;
+
+    if (interaction?.kind === "contour-node" || interaction?.kind === "contour-handle") {
+      const imagePoint = getContourImagePoint(point, interaction.frame, zoom);
+      if (!imagePoint) return;
+      const next = interaction.kind === "contour-node"
+        ? moveContourNode(interaction.draftContour, interaction.selection, imagePoint)
+        : moveContourHandle(interaction.draftContour, interaction.selection, interaction.handleKind, imagePoint);
+      if (next !== interaction.draftContour) {
+        interaction.changed = true;
+        interaction.draftContour = next;
+        setVectorContour(next);
+        setVectorContourStale(false);
+        scheduleCanvasRender();
+      }
+      updateCursorFromPoint(point);
+      return;
+    }
 
     if (interaction?.kind === "pan") {
       setPan({
@@ -1983,21 +2587,47 @@ export function App() {
     if (interactionRef.current && canvasRef.current?.hasPointerCapture?.(event.pointerId)) {
       canvasRef.current.releasePointerCapture(event.pointerId);
     }
-    if (interaction?.kind === "delete" || interaction?.kind === "restore") {
+    if (interaction?.kind === "contour-node" || interaction?.kind === "contour-handle") {
       if (interaction.changed) {
-        commitDocumentImageEdit(
-          new ImageData(new Uint8ClampedArray(interaction.draftData), interaction.width, interaction.height),
-          {
-            undoFrom: interaction.undoImageData,
-            statusText: interaction.kind === "restore" ? "Reconstruct Pen applied" : "Delete Pen applied"
-          }
-        );
+        pushContourUndoSnapshot(interaction.undoContour, interaction.undoSelection);
+        setStatus(interaction.kind === "contour-node" ? "Contour node moved" : "Curve handle moved");
+      } else {
+        setStatus("Contour node selected");
+      }
+    } else if (interaction?.kind === "delete" || interaction?.kind === "restore") {
+      if (interaction.changed) {
+        if (smartBrushEnabled) {
+          runSmartBrushCorrection(interaction);
+        } else {
+          commitDocumentImageEdit(
+            new ImageData(new Uint8ClampedArray(interaction.draftData), interaction.width, interaction.height),
+            {
+              undoFrom: interaction.undoImageData,
+              statusText: interaction.kind === "restore" ? "Reconstruct Pen applied" : "Delete Pen applied"
+            }
+          );
+        }
       } else {
         setStatus("Ready");
       }
     }
     interactionRef.current = null;
     setCanvasMode("idle");
+  };
+
+  const onCanvasDoubleClick = (event) => {
+    if (canvasTool !== "contour-edit" || !hasCurrentVectorContour || !canvasRef.current) return;
+    const rect = canvasRef.current.getBoundingClientRect();
+    const point = getCanvasPoint(event, canvasRef.current);
+    const frame = getImageFrame(source, zoom, pan, rect.width, rect.height);
+    const imagePoint = getContourImagePoint(point, frame, zoom);
+    if (!imagePoint) return;
+    const segment = hitTestContour(vectorContour, imagePoint, {
+      maxDistance: Math.max(3, 12 / Math.max(zoom, 0.001))
+    });
+    if (!segment) return;
+    insertContourNodeAtHit(segment);
+    event.preventDefault();
   };
 
   const showPage = (page) => {
@@ -2053,10 +2683,10 @@ export function App() {
           <Save size={16} />
         </button>
         <span className="divider" />
-        <button className="icon-button" title="Undo" aria-label="Undo" disabled={!canUndo || isBackgroundRemoving || isSuperScaling} onClick={undoImageEdit}>
+        <button className="icon-button" title="Undo" aria-label="Undo" disabled={!canUndo || isBackgroundRemoving || isSuperScaling || isSmartBrushing} onClick={undoImageEdit}>
           <Undo2 size={16} />
         </button>
-        <button className="icon-button" title="Redo" aria-label="Redo" disabled={!canRedo || isBackgroundRemoving || isSuperScaling} onClick={redoImageEdit}>
+        <button className="icon-button" title="Redo" aria-label="Redo" disabled={!canRedo || isBackgroundRemoving || isSuperScaling || isSmartBrushing} onClick={redoImageEdit}>
           <Redo2 size={16} />
         </button>
         <span className="divider" />
@@ -2101,11 +2731,20 @@ export function App() {
           />
           <output>{brushSize}px</output>
         </label>
+        <label className={`hq-toggle ${smartBrushEnabled ? "enabled" : ""}`} title="Refine Delete and Reconstruct strokes with OpenCV 5">
+          <input
+            type="checkbox"
+            checked={smartBrushEnabled}
+            disabled={!isBrushTool || isSmartBrushing}
+            onChange={(event) => setSmartBrushEnabled(event.target.checked)}
+          />
+          <span>Smart pen</span>
+        </label>
         <button
           className="icon-button bg-remove-button"
           title="Remove Background"
           aria-label="Remove Background"
-          disabled={!originalImageData || isBackgroundRemoving || isSuperScaling}
+          disabled={!originalImageData || isBackgroundRemoving || isSuperScaling || isSmartBrushing}
           onClick={runBackgroundRemoval}
         >
           <Sparkles size={16} />
@@ -2114,28 +2753,52 @@ export function App() {
           className="icon-button"
           title="Trim transparent padding"
           aria-label="Trim transparent padding"
-          disabled={!processedImageData || isBackgroundRemoving || isSuperScaling}
+          disabled={!processedImageData || isBackgroundRemoving || isSuperScaling || isSmartBrushing}
           onClick={trimTransparentPadding}
         >
           <Crop size={16} />
         </button>
         <button
+          className={`icon-button ${canvasTool === "contour-edit" ? "active" : ""}`}
+          title="Edit contour nodes"
+          aria-label="Edit contour nodes"
+          disabled={!hasCurrentVectorContour || magneticRepairStatus === "running" || isSmartBrushing}
+          onClick={() => {
+            setMagneticAnchor(null);
+            setCanvasTool((current) => current === "contour-edit" ? "pan" : "contour-edit");
+          }}
+        >
+          <Spline size={16} />
+        </button>
+        <button
+          className={`icon-button ${canvasTool === "contour-repair" ? "active" : ""}`}
+          title="Magnetic contour repair: choose two points on the contour"
+          aria-label="Magnetic contour repair"
+          disabled={!hasCurrentVectorContour || magneticRepairStatus === "running" || isSmartBrushing}
+          onClick={() => {
+            setMagneticAnchor(null);
+            setCanvasTool((current) => current === "contour-repair" ? "pan" : "contour-repair");
+          }}
+        >
+          <Magnet size={16} />
+        </button>
+        <button
           className="icon-button super-scale-button"
           title="Super Scale"
           aria-label="Super Scale"
-          disabled={!originalImageData || isBackgroundRemoving || isSuperScaling}
+          disabled={!originalImageData || isBackgroundRemoving || isSuperScaling || isSmartBrushing}
           onClick={() => setSuperScaleDialogOpen(true)}
         >
           <Layers size={16} />
         </button>
-        <label className={`hq-toggle ${bgRemoveRefine ? "enabled" : ""}`} title={BG_REMOVE_REFINE_AVAILABLE ? "High-quality edges" : "Edge refinement unavailable in the browser build"}>
+        <label className={`hq-toggle ${bgRemoveRefine ? "enabled" : ""}`} title={BG_REMOVE_REFINE_AVAILABLE ? "SAM 3 structure lock and ViTMatte edge refinement" : "Edge refinement unavailable in the browser build"}>
           <input
             type="checkbox"
             checked={bgRemoveRefine}
             disabled={!originalImageData || isBackgroundRemoving || !BG_REMOVE_REFINE_AVAILABLE}
             onChange={(event) => updateBgRemoveRefine(event.target.checked)}
           />
-          <span>High-quality edges</span>
+          <span>Structure + edges</span>
         </label>
         <span className="divider" />
         <Segmented
@@ -2209,7 +2872,7 @@ export function App() {
           </div>
         </aside>
 
-        <section className={`canvas-shell ${source ? "has-image" : ""} ${canvasTool === "delete" ? "is-eraser" : ""} ${canvasTool === "restore" ? "is-reconstruct" : ""} ${canvasMode === "pan" ? "is-panning" : ""} ${canvasMode === "split" ? "is-splitting" : ""} ${canvasMode === "delete" ? "is-deleting" : ""} ${canvasMode === "restore" ? "is-restoring" : ""} ${canvasMode === "hover-split" ? "can-split" : ""}`}>
+        <section className={`canvas-shell ${source ? "has-image" : ""} ${canvasTool === "delete" ? "is-eraser" : ""} ${canvasTool === "restore" ? "is-reconstruct" : ""} ${canvasTool === "contour-edit" ? "is-contour-edit" : ""} ${canvasTool === "contour-repair" ? "is-contour-repair" : ""} ${canvasMode === "pan" ? "is-panning" : ""} ${canvasMode === "split" ? "is-splitting" : ""} ${canvasMode === "delete" ? "is-deleting" : ""} ${canvasMode === "restore" ? "is-restoring" : ""} ${canvasMode === "contour-node" || canvasMode === "contour-handle" ? "is-contour-dragging" : ""} ${canvasMode === "hover-split" ? "can-split" : ""}`}>
           {isBackgroundRemoving && (
             <div className="bg-remove-progress">
               <span>{BG_REMOVE_LABELS[bgRemoveStatus]}</span>
@@ -2274,6 +2937,7 @@ export function App() {
             onPointerMove={onCanvasPointerMove}
             onPointerUp={endCanvasInteraction}
             onPointerCancel={endCanvasInteraction}
+            onDoubleClick={onCanvasDoubleClick}
             onMouseLeave={() => {
               if (!interactionRef.current) {
                 setCursor(null);
@@ -2325,6 +2989,12 @@ export function App() {
             <RangeControl label="Matte tolerance" value={settings.defringe.tolerance ?? 255} min={0} max={255} onChange={(value) => updateSetting("defringe", "tolerance", value)} />
             <RangeControl label="Edge depth" value={settings.defringe.radius} min={1} max={4} onChange={(value) => updateSetting("defringe", "radius", value)} />
             <RangeControl label="Passes" value={settings.defringe.passes ?? 1} min={1} max={5} onChange={(value) => updateSetting("defringe", "passes", value)} />
+            <div className="toggle-row">
+              <span>Physical matte unmix</span>
+              <Switch checked={settings.defringe.unmix === true} onChange={(value) => updateSetting("defringe", "unmix", value)} />
+            </div>
+            <RangeControl label="Opaque reach" value={settings.defringe.alphaReach ?? 220} min={64} max={254} onChange={(value) => updateSetting("defringe", "alphaReach", value)} />
+            <p className="contour-summary">Unmix reconstructs edge color from the selected matte. Opaque reach limits how far into confident subject pixels it may operate.</p>
           </ToolSection>
 
           <ToolSection
@@ -2333,7 +3003,32 @@ export function App() {
             enabled={settings.edgeFinish.enabled}
             onToggle={(value) => updateSetting("edgeFinish", "enabled", value)}
           >
-            <RangeControl label="Cutoff" value={settings.edgeFinish.cutoff} min={1} max={254} onChange={(value) => updateSetting("edgeFinish", "cutoff", value)} />
+            <div className="range-control">
+              <span>Edge treatment</span>
+              <div className="segmented" role="radiogroup" aria-label="Edge treatment">
+                {[["smart", "Smart"], ["crisp", "Crisp"]].map(([id, label]) => (
+                  <button
+                    key={id}
+                    type="button"
+                    className={settings.edgeFinish.treatment === id ? "active" : ""}
+                    role="radio"
+                    aria-checked={settings.edgeFinish.treatment === id}
+                    onClick={() => updateSetting("edgeFinish", "treatment", id)}
+                  >
+                    {label}
+                  </button>
+                ))}
+              </div>
+            </div>
+            {settings.edgeFinish.treatment === "smart" ? (
+              <>
+                <RangeControl label="Edge smoothing" value={settings.edgeFinish.smartStrength} min={0} max={100} unit="%" onChange={(value) => updateSetting("edgeFinish", "smartStrength", value)} />
+                <RangeControl label="Residue cleanup" value={settings.edgeFinish.cleanupBalance} min={0} max={100} unit="%" onChange={(value) => updateSetting("edgeFinish", "cleanupBalance", value)} />
+                <RangeControl label="Protect fine detail" value={settings.edgeFinish.detailProtection} min={0} max={100} unit="%" onChange={(value) => updateSetting("edgeFinish", "detailProtection", value)} />
+              </>
+            ) : (
+              <RangeControl label="Cutoff" value={settings.edgeFinish.cutoff} min={1} max={254} onChange={(value) => updateSetting("edgeFinish", "cutoff", value)} />
+            )}
             <div className="range-control">
               <span>Rim color</span>
               <div className="segmented" role="radiogroup" aria-label="Rim color">
@@ -2357,7 +3052,7 @@ export function App() {
             {normalizeRimColorMode(settings.edgeFinish.rimColorMode) === "solid" && (
               <ColorControl label="Rim color" value={settings.edgeFinish.edgeColor ?? "#000000"} onChange={(value) => updateSetting("edgeFinish", "edgeColor", value)} />
             )}
-            <RangeControl label="Edge width" value={settings.edgeFinish.edgeWidth ?? 0} min={0} max={16} unit="px" onChange={(value) => updateSetting("edgeFinish", "edgeWidth", value)} />
+            <RangeControl label={settings.edgeFinish.treatment === "smart" ? "Rim reach" : "Edge width"} value={settings.edgeFinish.edgeWidth ?? 0} min={0} max={16} unit="px" onChange={(value) => updateSetting("edgeFinish", "edgeWidth", value)} />
           </ToolSection>
 
           <ToolSection
@@ -2370,6 +3065,34 @@ export function App() {
             <RangeControl label="Offset" value={contourOptions.offsetPixels} min={-48} max={48} unit="px" onChange={(value) => updateContourOption("offsetPixels", value)} />
             <RangeControl label="Curve smoothing" value={contourOptions.simplifyTolerance} min={0} max={12} unit="px" onChange={(value) => updateContourOption("simplifyTolerance", value)} />
             <ColorControl label="Stroke" value={contourOptions.color} onChange={(value) => updateContourOption("color", value)} />
+            {canvasTool === "contour-edit" && selectedContourPoint && (
+              <div className="contour-node-editor">
+                <div>
+                  <span>Node {contourSelection.nodeIndex + 1} / {selectedContourPath.points.length}</span>
+                  <output>X {formatContourCoordinate(selectedContourPoint.x)}</output>
+                  <output>Y {formatContourCoordinate(selectedContourPoint.y)}</output>
+                </div>
+                <button
+                  type="button"
+                  className="icon-button"
+                  title="Add node after selected node"
+                  aria-label="Add contour node"
+                  onClick={insertContourNodeAfterSelection}
+                >
+                  <Plus size={14} />
+                </button>
+                <button
+                  type="button"
+                  className="icon-button"
+                  title="Delete selected node"
+                  aria-label="Delete contour node"
+                  disabled={!canDeleteContourNode}
+                  onClick={deleteSelectedContourNode}
+                >
+                  <Trash2 size={14} />
+                </button>
+              </div>
+            )}
             <p className={`contour-summary ${vectorContourStale ? "stale" : ""}`}>
               {vectorContour
                 ? vectorContourStale
@@ -2387,7 +3110,7 @@ export function App() {
         <span>Zoom {Math.round(zoom * 100)}%</span>
         <span>{source ? `${source.width} x ${source.height}` : "No image"}</span>
         <span>{cursor ? `Alpha ${cursor.a}` : "Alpha -"}</span>
-        <span>{canvasTool === "delete" ? `Delete Pen ${brushSize}px` : canvasTool === "restore" ? `Reconstruct Pen ${brushSize}px` : "Pan tool"}</span>
+        <span>{canvasTool === "delete" ? `Delete Pen ${brushSize}px` : canvasTool === "restore" ? `Reconstruct Pen ${brushSize}px` : canvasTool === "contour-edit" ? "Edit contour nodes" : canvasTool === "contour-repair" ? "Magnetic contour repair" : "Pan tool"}</span>
         <span>{isSuperScaling ? `SS BRIA ${Math.round(superScaleProgress * 100)}%` : isBackgroundRemoving ? `AI ${BG_REMOVE_LABELS[bgRemoveStatus]}${bgRemoveDevice === "cpu" ? " (CPU)" : bgRemoveDevice === "api" ? " (API)" : ""}` : `AI ${BG_REMOVE_MODELS[bgRemoveModel]?.shortLabel || "-"}`}</span>
         <span>Bg {background}</span>
       </footer>
@@ -2397,6 +3120,7 @@ export function App() {
           models={BG_REMOVE_MODELS}
           selectedModel={bgRemoveModel}
           refineDefault={bgRemoveRefine}
+          safeguards={bgRemoveSafeguards}
           briaPreserveAlpha={briaPreserveAlpha}
           disabled={isBackgroundRemoving}
           refineAvailable={BG_REMOVE_REFINE_AVAILABLE}
@@ -2405,6 +3129,8 @@ export function App() {
           tokenValue={loadStoredBriaToken()}
           onModelChange={updateBgRemoveModel}
           onRefineDefaultChange={updateBgRemoveRefine}
+          onSafeguardsChange={updateBgRemoveSafeguards}
+          onSafeguardsReset={() => updateBgRemoveSafeguards(DEFAULT_BG_REMOVE_SAFEGUARDS)}
           onBriaPreserveAlphaChange={updateBriaPreserveAlpha}
           onTokenSave={saveSettingsToken}
           onClose={() => setSettingsPanelOpen(false)}
@@ -3140,6 +3866,76 @@ function drawVectorContour(ctx, contour, x, y, zoom, color) {
   ctx.restore();
 }
 
+function drawContourEditor(ctx, contour, selection, x, y, zoom, color) {
+  const handles = selection ? getContourNodeHandles(contour, selection) : null;
+  ctx.save();
+  ctx.lineWidth = 1;
+
+  if (handles) {
+    const anchorX = x + handles.anchor.x * zoom;
+    const anchorY = y + handles.anchor.y * zoom;
+    ctx.strokeStyle = "rgba(255,255,255,.58)";
+    ctx.setLineDash([3, 3]);
+    for (const handle of [handles.in, handles.out]) {
+      if (!handle) continue;
+      ctx.beginPath();
+      ctx.moveTo(anchorX, anchorY);
+      ctx.lineTo(x + handle.x * zoom, y + handle.y * zoom);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+  }
+
+  for (let pathIndex = 0; pathIndex < contour.paths.length; pathIndex += 1) {
+    const points = contour.paths[pathIndex].points || [];
+    for (let nodeIndex = 0; nodeIndex < points.length; nodeIndex += 1) {
+      const point = points[nodeIndex];
+      const selected = selection?.pathIndex === pathIndex && selection?.nodeIndex === nodeIndex;
+      ctx.beginPath();
+      ctx.arc(x + point.x * zoom, y + point.y * zoom, selected ? 6 : 3.5, 0, Math.PI * 2);
+      ctx.fillStyle = selected ? color : "#0a0b0d";
+      ctx.strokeStyle = selected ? "#ffffff" : color;
+      ctx.lineWidth = selected ? 2 : 1.25;
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+
+  if (handles) {
+    for (const handle of [handles.in, handles.out]) {
+      if (!handle) continue;
+      ctx.beginPath();
+      ctx.arc(x + handle.x * zoom, y + handle.y * zoom, 4.5, 0, Math.PI * 2);
+      ctx.fillStyle = "#ffffff";
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 1.5;
+      ctx.fill();
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawMagneticAnchor(ctx, point, x, y, zoom, color) {
+  ctx.save();
+  ctx.fillStyle = "#0a0b0d";
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.arc(x + point.x * zoom, y + point.y * zoom, 6, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.stroke();
+  ctx.restore();
+}
+
+function cloneContourData(contour) {
+  return contour ? structuredClone(contour) : null;
+}
+
+function formatContourCoordinate(value) {
+  return Number(value).toFixed(2).replace(/\.00$/, "");
+}
+
 function drawPixelGrid(ctx, x, y, width, height, zoom) {
   ctx.save();
   ctx.strokeStyle = "rgba(255,255,255,.12)";
@@ -3203,8 +3999,16 @@ function percent(value) {
 function bgRemoveStageToStatus(stage) {
   if (stage === "download") return "downloading";
   if (stage === "warming") return "warming";
-  if (stage === "infer" || stage === "infer-stage1" || stage === "infer-stage2" || stage === "compose") return "inferring";
+  if (stage === "infer" || stage === "infer-stage1" || stage === "infer-structure" || stage === "infer-stage2" || stage === "compose") return "inferring";
   return "inferring";
+}
+
+function bgRemoveStageLabel(stage, status) {
+  if (stage === "infer-stage1") return "Finding subject";
+  if (stage === "infer-structure") return "Locking subject structure";
+  if (stage === "infer-stage2") return "Refining alpha edge";
+  if (stage === "compose") return "Composing alpha matte";
+  return BG_REMOVE_LABELS[status] || "Removing background";
 }
 
 function getBgRemoveErrorMessage(message = "") {
@@ -3325,6 +4129,39 @@ function loadPersistedBgRemoveRefine() {
   }
 }
 
+function loadPersistedBgRemoveSafeguards() {
+  try {
+    const raw = window.localStorage?.getItem(BG_REMOVE_SAFEGUARDS_KEY);
+    return normalizeBgRemoveSafeguards(raw ? JSON.parse(raw) : null);
+  } catch {
+    return normalizeBgRemoveSafeguards(null);
+  }
+}
+
+function normalizeBgRemoveSafeguards(value) {
+  const source = value && typeof value === "object" ? value : {};
+  const seedThreshold = boundedIntegerSetting(source.seedThreshold, DEFAULT_BG_REMOVE_SAFEGUARDS.seedThreshold, 4, 128);
+  return {
+    detailAnalysis: source.detailAnalysis ?? DEFAULT_BG_REMOVE_SAFEGUARDS.detailAnalysis,
+    detailTileSize: Math.round(boundedIntegerSetting(source.detailTileSize, DEFAULT_BG_REMOVE_SAFEGUARDS.detailTileSize, 384, 768) / 64) * 64,
+    maxDetailTiles: boundedIntegerSetting(source.maxDetailTiles, DEFAULT_BG_REMOVE_SAFEGUARDS.maxDetailTiles, 4, 48),
+    seedThreshold,
+    detailThreshold: boundedIntegerSetting(source.detailThreshold, DEFAULT_BG_REMOVE_SAFEGUARDS.detailThreshold, 4, 192),
+    preserveThreshold: boundedIntegerSetting(source.preserveThreshold, DEFAULT_BG_REMOVE_SAFEGUARDS.preserveThreshold, seedThreshold + 1, 255),
+    edgeBlend: boundedIntegerSetting(source.edgeBlend, DEFAULT_BG_REMOVE_SAFEGUARDS.edgeBlend, 0, 100),
+    recoveryRadius: boundedIntegerSetting(source.recoveryRadius, DEFAULT_BG_REMOVE_SAFEGUARDS.recoveryRadius, 1, 96),
+    matteAwareProtection: source.matteAwareProtection ?? DEFAULT_BG_REMOVE_SAFEGUARDS.matteAwareProtection,
+    matteTolerance: boundedIntegerSetting(source.matteTolerance, DEFAULT_BG_REMOVE_SAFEGUARDS.matteTolerance, 0, 128),
+    matteBoundaryRadius: boundedIntegerSetting(source.matteBoundaryRadius, DEFAULT_BG_REMOVE_SAFEGUARDS.matteBoundaryRadius, 1, 24)
+  };
+}
+
+function boundedIntegerSetting(value, fallback, min, max) {
+  const numeric = Number(value);
+  const normalized = Number.isFinite(numeric) ? Math.round(numeric) : fallback;
+  return Math.max(min, Math.min(max, normalized));
+}
+
 function loadPersistedBriaPreserveAlpha() {
   try {
     const value = window.localStorage?.getItem(BRIA_PRESERVE_ALPHA_KEY);
@@ -3438,9 +4275,15 @@ function createProcessingSettings(settings) {
 function normalizeEdgeFinishSettings(settings) {
   if (settings?.edgeFinish) {
     const merged = { ...DEFAULT_SETTINGS.edgeFinish, ...settings.edgeFinish };
+    const hasExplicitTreatment = settings.edgeFinish.treatment === "smart" || settings.edgeFinish.treatment === "crisp";
     return {
       enabled: Boolean(merged.enabled),
+      // Existing saved presets predate Smart treatment and must retain their crisp output.
+      treatment: hasExplicitTreatment ? settings.edgeFinish.treatment : "crisp",
       cutoff: normalizeCutoff(merged.cutoff),
+      smartStrength: normalizePercent(merged.smartStrength, DEFAULT_SETTINGS.edgeFinish.smartStrength),
+      cleanupBalance: normalizePercent(merged.cleanupBalance, DEFAULT_SETTINGS.edgeFinish.cleanupBalance),
+      detailProtection: normalizePercent(merged.detailProtection, DEFAULT_SETTINGS.edgeFinish.detailProtection),
       rimColorMode: normalizeRimColorMode(merged.rimColorMode, merged.edgeColorEnabled),
       edgeColor: normalizeHexColor(merged.edgeColor, DEFAULT_SETTINGS.edgeFinish.edgeColor),
       edgeWidth: Math.min(16, Math.max(0, Math.round(Number(merged.edgeWidth) || 0)))
@@ -3463,15 +4306,22 @@ function normalizeCutoff(value) {
   return Math.min(254, Math.max(1, Math.round(Number(value) || 128)));
 }
 
+function normalizePercent(value, fallback = 0) {
+  const numeric = Number(value);
+  return Math.min(100, Math.max(0, Math.round(Number.isFinite(numeric) ? numeric : fallback)));
+}
+
 function normalizeHexColor(value, fallback) {
   return /^#[0-9a-f]{6}$/i.test(String(value || "")) ? value : fallback;
 }
 
 function normalizeDefringeSettings(defringe) {
   const merged = { ...DEFAULT_SETTINGS.defringe, ...(defringe || {}) };
-  // Edge depth saturates at 4 (alphaLimit caps at 254); clamp legacy 5/6 values.
+  // Clamp legacy presets to the supported processing ranges.
   merged.radius = Math.min(4, Math.max(1, Math.round(Number(merged.radius) || 1)));
   merged.passes = Math.min(5, Math.max(1, Math.round(Number(merged.passes) || 1)));
+  merged.unmix = merged.unmix === true;
+  merged.alphaReach = Math.min(254, Math.max(64, Math.round(Number(merged.alphaReach) || DEFAULT_SETTINGS.defringe.alphaReach)));
   return merged;
 }
 
@@ -3547,7 +4397,7 @@ function getPdfExportResolution(resolution) {
 
 function buildExportContour(format, imageData, options) {
   if (format !== "svg" && (format !== "pdf" || !options.visible)) return null;
-  return traceVectorContour(imageData, {
+  return traceContourEngine(imageData, {
     alphaThreshold: options.alphaThreshold,
     simplifyTolerance: options.simplifyTolerance,
     offsetPixels: options.offsetPixels,
@@ -3584,6 +4434,18 @@ function getImagePoint(point, frame, zoom) {
     return null;
   }
 
+  return { x, y };
+}
+
+function getContourImagePoint(point, frame, zoom) {
+  const x = (point.x - frame.x) / zoom;
+  const y = (point.y - frame.y) / zoom;
+  const sourceWidth = frame.width / zoom;
+  const sourceHeight = frame.height / zoom;
+  const hitMargin = 12 / Math.max(zoom, 0.001);
+  if (x < -hitMargin || y < -hitMargin || x > sourceWidth + hitMargin || y > sourceHeight + hitMargin) {
+    return null;
+  }
   return { x, y };
 }
 

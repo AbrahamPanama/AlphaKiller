@@ -1,6 +1,6 @@
 {
   "name": "alphakiller",
-  "version": "0.1.0-beta.2",
+  "version": "0.1.0-beta.3",
   "description": "Desktop image cleanup tool for transparent pixel and anti-aliasing artifacts.",
   "main": "electron/main.js",
   "type": "module",
@@ -14,7 +14,10 @@
     "diagnose:bg-remove": "node scripts/bg-remove-smoke.mjs",
     "diagnose:rmbg2:api": "node scripts/rmbg2-api-smoke.mjs",
     "diagnose:pdf": "node scripts/pdf-export-smoke.mjs",
+    "diagnose:opencv": "node scripts/opencv/check-runtime.mjs",
+    "diagnose:vision": "node scripts/vision-acceptance.mjs",
     "benchmark:bg-remove": "node scripts/bg-remove-benchmark.mjs",
+    "benchmark:vision": "node scripts/vision-benchmark.mjs",
     "build": "vite build",
     "dist:mac": "npm run build && electron-builder --mac dmg --arm64",
     "dist:mac:arm64": "npm run build && electron-builder --mac dmg --arm64",
@@ -84,6 +87,7 @@
   "dependencies": {
     "@huggingface/transformers": "^4.2.0",
     "@vitejs/plugin-react": "^5.0.4",
+    "@techstark/opencv-js": "5.0.0-release.1",
     "lucide-react": "^0.468.0",
     "react": "^19.2.0",
     "react-dom": "^19.2.0",

@@ -1,15 +1,80 @@
-export function applyProcessing(sourceImageData, settings) {
-  const working = cloneImageData(sourceImageData);
+import { smartEdgePolish } from "./smartEdge.js";
+
+export function applyProcessing(sourceImageData, settings, runtime = {}) {
+  let working = cloneImageData(sourceImageData);
+
+  if (
+    settings.edgeFinish?.enabled &&
+    settings.edgeFinish.treatment === "smart" &&
+    runtime.segmentationStages
+  ) {
+    working = applySegmentationCleanupBalance(
+      working,
+      runtime.segmentationStages.conservativeAlpha,
+      runtime.segmentationStages.aggressiveAlpha,
+      settings.edgeFinish.cleanupBalance
+    );
+  }
 
   if (settings.defringe.enabled) {
     defringe(working, settings.defringe);
   }
 
   if (settings.edgeFinish?.enabled) {
-    edgeFinish(working, settings.edgeFinish);
+    if (settings.edgeFinish.treatment === "smart") {
+      working = applySmartEdgeFinish(working, settings.edgeFinish, runtime);
+    } else {
+      edgeFinish(working, settings.edgeFinish);
+    }
   }
 
   return working;
+}
+
+function applySmartEdgeFinish(imageData, settings, runtime) {
+  const strength = clampUnit((Number(settings.smartStrength) || 0) / 100);
+  const detailProtection = clampUnit((Number(settings.detailProtection) || 0) / 100);
+  const cleanupBalance = clampUnit((Number(settings.cleanupBalance) || 0) / 100);
+  const rimColorMode = normalizeRimColorMode(settings);
+  const rimReach = Math.max(2, normalizeRimWidth(settings.edgeWidth) || 8);
+  const polished = smartEdgePolish(imageData, {
+    alpha: {
+      radius: Math.max(2, Math.round(2 + strength * 6)),
+      iterations: strength > 0.72 ? 2 : 1,
+      strength,
+      detailProtection,
+      thinFeatureWidth: Math.max(3, Math.round(4 + detailProtection * 5)),
+      thicknessProbeRadius: Math.max(6, rimReach + 2),
+      residualSuppression: cleanupBalance
+    },
+    rim: {
+      enabled: rimColorMode === "auto",
+      maxDistance: rimReach,
+      blend: strength
+    }
+  }, runtime);
+
+  if (rimColorMode === "solid") {
+    applySolidSoftRim(polished, settings.edgeColor, settings.cutoff, rimReach, strength);
+  }
+  return polished;
+}
+
+function applySolidSoftRim(imageData, edgeColor, cutoff, rimReach, strength) {
+  const color = hexToRgb(edgeColor || "#000000");
+  const maxAlpha = Math.min(254, Math.max(1, clampByte(cutoff ?? 128) + rimReach * 8));
+  for (let index = 0; index < imageData.data.length; index += 4) {
+    const alpha = imageData.data[index + 3];
+    if (alpha <= 0 || alpha > maxAlpha) continue;
+    const edgeWeight = (1 - alpha / (maxAlpha + 1)) * strength;
+    imageData.data[index] = clampByte(imageData.data[index] + (color.r - imageData.data[index]) * edgeWeight);
+    imageData.data[index + 1] = clampByte(imageData.data[index + 1] + (color.g - imageData.data[index + 1]) * edgeWeight);
+    imageData.data[index + 2] = clampByte(imageData.data[index + 2] + (color.b - imageData.data[index + 2]) * edgeWeight);
+  }
+}
+
+function clampUnit(value) {
+  return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0));
 }
 
 // Nudge pure white (RGB 255,255,255 — the CMYK 0,0,0,0 paper-white) on visible pixels down to a
@@ -126,6 +191,127 @@ export function applyMaskToImage(originalImageData, maskBuffer, options = {}) {
   }
 
   return output;
+}
+
+export function extractAlphaChannel(imageData) {
+  if (!imageData || !Number.isInteger(imageData.width) || !Number.isInteger(imageData.height)) {
+    throw new TypeError("Expected an ImageData-like object");
+  }
+  const pixelCount = imageData.width * imageData.height;
+  if (!imageData?.data || imageData.data.length < pixelCount * 4) {
+    throw new RangeError("Image data is smaller than its declared dimensions");
+  }
+
+  const alpha = new Uint8Array(pixelCount);
+  for (let pixel = 0, index = 3; pixel < pixelCount; pixel += 1, index += 4) {
+    alpha[pixel] = imageData.data[index];
+  }
+  return alpha;
+}
+
+export function applySegmentationCleanupBalance(
+  imageData,
+  conservativeAlphaBuffer,
+  aggressiveAlphaBuffer,
+  cleanupBalance = 0
+) {
+  const output = cloneImageData(imageData);
+  const conservativeAlpha = conservativeAlphaBuffer instanceof Uint8Array
+    ? conservativeAlphaBuffer
+    : new Uint8Array(conservativeAlphaBuffer);
+  const aggressiveAlpha = aggressiveAlphaBuffer instanceof Uint8Array
+    ? aggressiveAlphaBuffer
+    : new Uint8Array(aggressiveAlphaBuffer);
+  const pixelCount = imageData.width * imageData.height;
+
+  if (conservativeAlpha.length < pixelCount || aggressiveAlpha.length < pixelCount) {
+    throw new RangeError("Segmentation stage alpha is smaller than the image");
+  }
+
+  const amount = clampUnit((Number(cleanupBalance) || 0) / 100);
+  for (let pixel = 0, index = 3; pixel < pixelCount; pixel += 1, index += 4) {
+    const conservative = conservativeAlpha[pixel];
+    const aggressive = aggressiveAlpha[pixel];
+    const current = imageData.data[index];
+    const stageAlpha = clampByte(conservative + (aggressive - conservative) * amount);
+
+    // Manual edits override the generated stage blend in either direction.
+    // Delete strokes remain deleted; reconstruct strokes remain restored.
+    if (current < conservative) {
+      output.data[index] = Math.min(current, stageAlpha);
+    } else if (current > conservative) {
+      output.data[index] = Math.max(current, stageAlpha);
+    } else {
+      output.data[index] = stageAlpha;
+    }
+  }
+
+  return output;
+}
+
+export function constrainRefinedMask(baseMaskBuffer, refinedMaskBuffer, options = {}) {
+  const baseMask = baseMaskBuffer instanceof Uint8Array
+    ? baseMaskBuffer
+    : new Uint8Array(baseMaskBuffer);
+  const refinedMask = refinedMaskBuffer instanceof Uint8Array
+    ? refinedMaskBuffer
+    : new Uint8Array(refinedMaskBuffer);
+
+  if (baseMask.length !== refinedMask.length) {
+    throw new Error("Base and refined masks must have matching dimensions");
+  }
+
+  const backgroundLimit = clampByte(options.backgroundLimit ?? 13);
+  const maxAlphaBoost = clampByte(options.maxAlphaBoost ?? 0);
+  const output = new Uint8Array(baseMask.length);
+
+  for (let pixel = 0; pixel < output.length; pixel += 1) {
+    const baseAlpha = baseMask[pixel];
+    if (baseAlpha <= backgroundLimit) {
+      output[pixel] = 0;
+      continue;
+    }
+
+    // Matting may remove uncertain background, but it must not turn the
+    // trimap's expanded background band into a new silhouette. A non-zero
+    // boost is reserved for explicitly-tested future models.
+    const boostScale = 1 - baseAlpha / 255;
+    const maxAllowed = Math.min(255, baseAlpha + Math.round(maxAlphaBoost * boostScale));
+    output[pixel] = Math.min(refinedMask[pixel], maxAllowed);
+  }
+
+  return output;
+}
+
+export function cropPaddedMask(maskBuffer, paddedWidth, paddedHeight, contentWidth, contentHeight) {
+  const mask = maskBuffer instanceof Uint8Array ? maskBuffer : new Uint8Array(maskBuffer);
+  const dimensions = [paddedWidth, paddedHeight, contentWidth, contentHeight];
+  if (dimensions.some((value) => !Number.isInteger(value) || value <= 0)) {
+    throw new RangeError("Mask dimensions must be positive integers");
+  }
+  if (mask.length < paddedWidth * paddedHeight) {
+    throw new RangeError("Padded mask is smaller than its declared dimensions");
+  }
+  if (contentWidth > paddedWidth || contentHeight > paddedHeight) {
+    throw new RangeError("Mask content dimensions exceed the padded mask");
+  }
+
+  if (contentWidth === paddedWidth && contentHeight === paddedHeight) {
+    return {
+      data: new Uint8Array(mask.slice(0, contentWidth * contentHeight)),
+      width: contentWidth,
+      height: contentHeight
+    };
+  }
+
+  // ViTMatte pads to its size divisor on the bottom and right. Crop that
+  // padding before resizing, otherwise every edge is compressed toward 0,0.
+  const output = new Uint8Array(contentWidth * contentHeight);
+  for (let y = 0; y < contentHeight; y += 1) {
+    const sourceStart = y * paddedWidth;
+    output.set(mask.subarray(sourceStart, sourceStart + contentWidth), y * contentWidth);
+  }
+  return { data: output, width: contentWidth, height: contentHeight };
 }
 
 export function buildTrimap(maskBuffer, width, height, options = {}) {
@@ -415,12 +601,16 @@ function erodeMask(mask, width, height, radius) {
   return output;
 }
 
-function defringe(imageData, { matteColor, strength, radius, tolerance, passes }) {
+function defringe(imageData, { matteColor, strength, radius, tolerance, passes, unmix, alphaReach }) {
   const data = imageData.data;
   const matte = hexToRgb(matteColor);
   const amount = (Math.max(0, strength) / 100) * DEFRINGE_STRENGTH_POTENCY;
   const matteTolerance = Math.max(0, tolerance ?? 255);
-  const alphaLimit = Math.min(254, 80 + radius * 45);
+  const legacyAlphaLimit = Math.min(254, 80 + radius * 45);
+  const alphaLimit = Math.min(254, Math.max(1, Number.isFinite(Number(alphaReach))
+    ? Math.round(Number(alphaReach))
+    : legacyAlphaLimit));
+  const physicalUnmix = unmix === true;
   // Each pass recomputes the matte match from the already-corrected colors, so extra passes push
   // stubborn matte residue further out — equivalent to exporting and defringing the file again.
   const passCount = Math.min(5, Math.max(1, Math.round(Number(passes) || 1)));
@@ -434,7 +624,9 @@ function defringe(imageData, { matteColor, strength, radius, tolerance, passes }
       const match = getMatteMatch(data[i], data[i + 1], data[i + 2], matte, matteTolerance);
       if (match <= 0) continue;
 
-      const correction = (1 - alpha) * amount * match;
+      const correction = physicalUnmix
+        ? Math.min(4, (1 - alpha) / alpha) * Math.min(2, Math.max(0, strength) / 100) * match
+        : (1 - alpha) * amount * match;
       data[i] = clampByte(data[i] + ((data[i] - matte.r) * correction));
       data[i + 1] = clampByte(data[i + 1] + ((data[i + 1] - matte.g) * correction));
       data[i + 2] = clampByte(data[i + 2] + ((data[i + 2] - matte.b) * correction));

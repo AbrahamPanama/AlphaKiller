@@ -9,6 +9,7 @@ own licenses and terms.
 | Component | Role | License / notice |
 |---|---|---|
 | `@huggingface/transformers` | Browser/worker model runtime | Apache-2.0 |
+| `@techstark/opencv-js` / OpenCV 5.0.0 | Lazy worker-side computer vision runtime | Apache-2.0; exact package version is pinned and mirrors the official OpenCV JavaScript build. |
 | `onnxruntime-web` | ONNX execution engine used by Transformers.js | MIT |
 | `react`, `react-dom` | Renderer UI | MIT |
 | `electron` | Desktop shell | MIT |
@@ -33,7 +34,8 @@ the runtime.
 |---|---|---|
 | `briaai/RMBG-1.4` | Default Stage 1 background-removal model | Review the Hugging Face model card and BRIA terms before redistribution or commercial use. |
 | `onnx-community/BEN2-ONNX` | WebGPU-only Quality background-removal model | MIT; downloaded on demand from Hugging Face. |
-| `hustvl/vitmatte-base-distinctions-646` | Investigated high-quality edge refinement | Apache-2.0, but currently not used because the repo has no browser-ready ONNX assets. |
+| `onnx-community/sam3-tracker-ONNX` | Optional Stage 2 subject-structure locking | Transformers.js ONNX conversion of Meta SAM 3; downloaded on demand. Use and redistribution remain subject to Meta's SAM License. |
+| `Xenova/vitmatte-small-distinctions-646` | Optional Stage 2 high-quality edge refinement | Browser-ready ONNX conversion of ViTMatte; review the model card before redistribution. |
 | `briaai/RMBG-2.0` | Planned/future quality target | Gated on Hugging Face and not the current default implementation. |
 | `ZhengPeng7/BiRefNet_HR` | Investigated future quality tier | MIT-licensed project, but current browser/ORT compatibility is blocked; see `BIREFNET_HR_PLAN.md`. |
 

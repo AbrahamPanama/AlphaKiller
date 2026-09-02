@@ -1,0 +1,31 @@
+{
+  "schemaVersion": 1,
+  "status": "not-built",
+  "opencv": {
+    "version": "5.0.0",
+    "commit": "40738fb16ceddb5fb3fea747585f7ce6abb0605b",
+    "repository": "https://github.com/opencv/opencv"
+  },
+  "toolchain": {
+    "emscriptenVersion": "4.0.20",
+    "containerImage": "emscripten/emsdk@sha256:460fff8f8ac87e11b16447fbd66538a686eafa0e4fb977aa0989ed19fe2079f7"
+  },
+  "build": {
+    "profile": "wasm-simd-single-thread",
+    "simd": true,
+    "threads": false,
+    "modules": ["core", "imgproc", "photo", "js"]
+  },
+  "artifacts": {
+    "module": {
+      "file": "opencv.mjs",
+      "bytes": 0,
+      "sha256": null
+    },
+    "wasm": {
+      "file": "opencv.wasm",
+      "bytes": 0,
+      "sha256": null
+    }
+  }
+}

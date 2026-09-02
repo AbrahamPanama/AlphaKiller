@@ -11,9 +11,13 @@ globalThis.ImageData = class ImageData {
 
 const {
   applyMaskToImage,
+  applySegmentationCleanupBalance,
   buildTrimap,
+  constrainRefinedMask,
   cropImageDataToBounds,
+  cropPaddedMask,
   dilateBand,
+  extractAlphaChannel,
   findVisibleAlphaBounds,
   applyProcessing,
   protectPureWhite
@@ -31,6 +35,24 @@ const {
   contourToSvg,
   traceVectorContour
 } = await import("../src/vectorTrace.js");
+const {
+  applyAdaptiveTrimapLocks,
+  applyCertainBackgroundVeto,
+  buildAdaptiveStructureTrimap,
+  buildCertainBackgroundMask,
+  deriveSamPrompts,
+  selectSamStructuralMask
+} = await import("../src/structureMatting.js");
+const {
+  accumulateSegmentationTile,
+  createSegmentationTiles,
+  estimateBorderMatteColor,
+  finishSegmentationTiles,
+  fuseGuidedSegmentationMasks,
+  scoreMaskBoundary,
+  tileHasMaskBoundary,
+  tileHasMaskSupport
+} = await import("../src/tiledSegmentation.js");
 
 function makeImageData(width, height, pixels) {
   return new ImageData(new Uint8ClampedArray(pixels), width, height);
@@ -75,6 +97,31 @@ function testApplyMaskToImage() {
   ]);
 }
 
+function testSegmentationCleanupBalanceIsReversibleAndRespectsManualEdits() {
+  const image = makeImageData(4, 1, [
+    10, 20, 30, 200,
+    40, 50, 60, 0,
+    70, 80, 90, 255,
+    100, 110, 120, 100
+  ]);
+  const conservative = new Uint8Array([200, 200, 100, 100]);
+  const aggressive = new Uint8Array([40, 40, 0, 100]);
+  const balanced = applySegmentationCleanupBalance(image, conservative, aggressive, 50);
+
+  assert.deepEqual(Array.from(extractAlphaChannel(balanced)), [120, 0, 255, 100]);
+  assert.deepEqual(Array.from(balanced.data.filter((_, index) => index % 4 !== 3)), [
+    10, 20, 30,
+    40, 50, 60,
+    70, 80, 90,
+    100, 110, 120
+  ]);
+
+  const detail = applySegmentationCleanupBalance(image, conservative, aggressive, 0);
+  const clean = applySegmentationCleanupBalance(image, conservative, aggressive, 100);
+  assert.deepEqual(Array.from(extractAlphaChannel(detail)), [200, 0, 255, 100]);
+  assert.deepEqual(Array.from(extractAlphaChannel(clean)), [40, 0, 255, 100]);
+}
+
 function testBuildTrimap() {
   const mask = new Uint8Array([
     0, 12, 13, 128,
@@ -96,6 +143,53 @@ function testBuildTrimap() {
   ]);
 }
 
+function testConstrainRefinedMaskPreventsMattingHaloGrowth() {
+  const base = new Uint8Array([0, 13, 14, 64, 128, 242, 255]);
+  const refined = new Uint8Array([255, 255, 255, 255, 255, 255, 220]);
+  const output = constrainRefinedMask(base, refined, {
+    backgroundLimit: 13,
+    maxAlphaBoost: 0
+  });
+
+  assert.deepEqual(Array.from(output), [0, 0, 14, 64, 128, 242, 220]);
+  assert.equal(output[0], 0, "refinement must not create alpha outside Stage 1 support");
+  assert.equal(output[1], 0, "definite Stage 1 background must remain transparent");
+  assert.equal(output[3], base[3], "refinement must not strengthen a soft edge");
+  assert.equal(output[6], refined[6], "opaque foreground may still be refined downward");
+}
+
+function testCropPaddedMaskRemovesBottomRightPadding() {
+  const paddedWidth = 352;
+  const paddedHeight = 544;
+  const contentWidth = 333;
+  const contentHeight = 517;
+  const padded = new Uint8Array(paddedWidth * paddedHeight).fill(239);
+
+  for (let y = 0; y < contentHeight; y += 1) {
+    for (let x = 0; x < contentWidth; x += 1) {
+      padded[y * paddedWidth + x] = (x * 3 + y * 5) % 229;
+    }
+  }
+
+  const cropped = cropPaddedMask(
+    padded,
+    paddedWidth,
+    paddedHeight,
+    contentWidth,
+    contentHeight
+  );
+
+  assert.equal(cropped.width, contentWidth);
+  assert.equal(cropped.height, contentHeight);
+  assert.equal(cropped.data.length, contentWidth * contentHeight);
+  assert.equal(cropped.data[0], 0);
+  assert.equal(
+    cropped.data[cropped.data.length - 1],
+    ((contentWidth - 1) * 3 + (contentHeight - 1) * 5) % 229
+  );
+  assert(!cropped.data.includes(239), "ViTMatte padding leaked into the cropped matte");
+}
+
 function testDilateBand() {
   const source = new Uint8Array([
     0, 0, 0,
@@ -109,6 +203,302 @@ function testDilateBand() {
     128, 128, 128,
     128, 128, 128
   ]);
+}
+
+function testSamPromptsCoverDistributedForeground() {
+  const width = 12;
+  const height = 8;
+  const mask = new Uint8Array(width * height);
+  for (let y = 1; y <= 5; y += 1) {
+    for (let x = 1; x <= 4; x += 1) mask[y * width + x] = 255;
+  }
+  for (let y = 2; y <= 6; y += 1) {
+    for (let x = 8; x <= 10; x += 1) mask[y * width + x] = 230;
+  }
+
+  const prompts = deriveSamPrompts(mask, width, height, { maxPoints: 8 });
+  assert(prompts, "SAM prompts were not generated");
+  assert(prompts.points.some((point) => point.x <= 4), "left foreground received no SAM prompt");
+  assert(prompts.points.some((point) => point.x >= 8), "right foreground received no SAM prompt");
+  assert(prompts.box[0] <= 1 && prompts.box[1] <= 1);
+  assert(prompts.box[2] >= 11 && prompts.box[3] >= 7);
+}
+
+function testSamStructuralCandidateUsesModelAndStage1Agreement() {
+  const width = 5;
+  const height = 5;
+  const pixelCount = width * height;
+  const base = new Uint8Array(pixelCount);
+  for (let y = 1; y <= 3; y += 1) {
+    for (let x = 1; x <= 3; x += 1) base[y * width + x] = 255;
+  }
+  const logits = new Float32Array(pixelCount * 3).fill(-4);
+  // Candidate 0 is an implausibly broad mask despite its acceptable model score.
+  logits.fill(2, 0, pixelCount);
+  // Candidate 1 agrees with Stage 1.
+  for (let y = 1; y <= 3; y += 1) {
+    for (let x = 1; x <= 3; x += 1) logits[pixelCount + y * width + x] = 3;
+  }
+  // Candidate 2 collapses to one pixel.
+  logits[pixelCount * 2 + 2 * width + 2] = 4;
+
+  const selected = selectSamStructuralMask(
+    { data: logits, dims: [1, 1, 3, height, width] },
+    { data: new Float32Array([0.72, 0.9, 0.95]) },
+    base,
+    width,
+    height
+  );
+  assert(selected, "no plausible SAM candidate was selected");
+  assert.equal(selected.candidate, 1);
+  assert.equal(selected.mask[2 * width + 2], 255);
+  assert.equal(selected.mask[0], 0);
+}
+
+function testAdaptiveTrimapProtectsHighlightsAndThinStructure() {
+  const width = 9;
+  const height = 9;
+  const base = new Uint8Array(width * height);
+  const structure = new Uint8Array(width * height);
+  for (let y = 1; y <= 7; y += 1) {
+    for (let x = 1; x <= 7; x += 1) {
+      base[y * width + x] = 255;
+      structure[y * width + x] = 255;
+    }
+  }
+
+  const highlight = 4 * width + 4;
+  const thinTip = 4;
+  const baseOnlyDetail = 4 * width;
+  const farBackground = 8;
+  base[highlight] = 0;
+  structure[thinTip] = 255;
+  base[thinTip] = 0;
+  base[baseOnlyDetail] = 255;
+
+  const { trimap, stats } = buildAdaptiveStructureTrimap(base, structure, width, height, {
+    innerRadius: 2,
+    outerRadius: 1
+  });
+  assert.equal(trimap[highlight], 255, "deep structural highlight was not protected");
+  assert.equal(trimap[thinTip], 255, "thin structural centerline was eroded");
+  assert.equal(trimap[baseOnlyDetail], 128, "model disagreement must remain unknown");
+  assert.equal(trimap[farBackground], 0, "distant agreed background was not locked");
+  assert(stats.recoveredInterior > 0);
+  assert(stats.protectedThinCores > 0);
+
+  const refined = new Uint8Array(width * height).fill(80);
+  const locked = applyAdaptiveTrimapLocks(refined, trimap, width, height);
+  assert.equal(locked[highlight], 255);
+  assert.equal(locked[thinTip], 255);
+  assert.equal(locked[baseOnlyDetail], 80);
+  assert.equal(locked[farBackground], 0);
+}
+
+function testCertainBackgroundVetoUsesColorTopologyAndStage1Confidence() {
+  const width = 12;
+  const height = 10;
+  const source = new Uint8ClampedArray(width * height * 4);
+  const base = new Uint8Array(width * height);
+  const refined = new Uint8Array(width * height).fill(255);
+  const setSource = (x, y, color) => {
+    const index = (y * width + x) * 4;
+    source[index] = color[0];
+    source[index + 1] = color[1];
+    source[index + 2] = color[2];
+    source[index + 3] = 255;
+  };
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) setSource(x, y, [254, 254, 254]);
+  }
+  // Colored subject enclosing both a legitimate white highlight and a blank hole.
+  for (let y = 2; y <= 8; y += 1) {
+    for (let x = 3; x <= 9; x += 1) {
+      setSource(x, y, [20, 170, 190]);
+      base[y * width + x] = 255;
+    }
+  }
+  const highlight = 4 * width + 4;
+  setSource(4, 4, [254, 254, 254]);
+  base[highlight] = 255;
+
+  const enclosedHole = [
+    4 * width + 7,
+    4 * width + 8,
+    5 * width + 7,
+    5 * width + 8
+  ];
+  for (const pixel of enclosedHole) {
+    const x = pixel % width;
+    const y = Math.floor(pixel / width);
+    setSource(x, y, [254, 254, 254]);
+    base[pixel] = 0;
+  }
+
+  const petal = 6 * width + 1;
+  setSource(1, 6, [245, 105, 170]);
+  base[petal] = 255;
+  const borderArtifact = width + 10;
+
+  const evidence = buildCertainBackgroundMask(source, base, width, height, {
+    channels: 4,
+    tolerance: 10,
+    minEnclosedArea: 4
+  });
+  assert.equal(evidence.stats.applied, true);
+  assert.equal(evidence.mask[borderArtifact], 1, "border-connected blank field was not vetoed");
+  assert.equal(evidence.mask[enclosedHole[0]], 1, "low-confidence enclosed background was not vetoed");
+  assert.equal(evidence.mask[highlight], 0, "high-confidence interior highlight was mistaken for background");
+  assert.equal(evidence.mask[petal], 0, "detached colored detail was mistaken for background");
+  assert.equal(evidence.stats.enclosedComponents, 1);
+
+  const cleaned = applyCertainBackgroundVeto(refined, evidence.mask, width, height);
+  assert.equal(cleaned[borderArtifact], 0);
+  assert.equal(cleaned[enclosedHole[0]], 0);
+  assert.equal(cleaned[highlight], 255);
+  assert.equal(cleaned[petal], 255);
+}
+
+function testGuidedTileFusionRecoversConnectedDetailWithoutBackgroundIslands() {
+  const width = 12;
+  const height = 7;
+  const globalMask = new Uint8Array(width * height);
+  const detailMask = new Uint8Array(width * height);
+
+  for (let y = 2; y <= 4; y += 1) {
+    for (let x = 2; x <= 5; x += 1) {
+      globalMask[y * width + x] = 255;
+      detailMask[y * width + x] = 255;
+    }
+    globalMask[y * width + 6] = 120;
+    detailMask[y * width + 6] = 20;
+    detailMask[y * width + 7] = 220;
+    detailMask[y * width + 8] = 220;
+  }
+
+  const protectedHighlight = 3 * width + 4;
+  const uncertainBoundary = 3 * width + 6;
+  const connectedExtension = 3 * width + 8;
+  const disconnectedArtifact = width + 10;
+  detailMask[protectedHighlight] = 0;
+  detailMask[disconnectedArtifact] = 255;
+
+  const { mask, stats } = fuseGuidedSegmentationMasks(
+    globalMask,
+    detailMask,
+    width,
+    height,
+    { recoveryRadius: 3 }
+  );
+
+  assert.equal(mask[protectedHighlight], 255, "tile pass erased confident foreground");
+  assert(mask[uncertainBoundary] < globalMask[uncertainBoundary], "tile pass did not tighten an uncertain edge");
+  assert(mask[connectedExtension] > 180, "connected tile detail was not recovered");
+  assert.equal(mask[disconnectedArtifact], 0, "disconnected tile artifact leaked into the subject");
+  assert(stats.recoveredPixels > 0);
+  assert(stats.contractedPixels > 0);
+  assert(stats.rejectedDetailPixels > 0);
+  assert(stats.protectedForegroundPixels > 0);
+}
+
+function testTileCreationSupportFilteringAndCosineBlend() {
+  const width = 5;
+  const height = 1;
+  const tiles = createSegmentationTiles(width, height, 4, 3);
+  assert.deepEqual(tiles, [
+    { x: 0, y: 0, width: 4, height: 1 },
+    { x: 1, y: 0, width: 4, height: 1 }
+  ]);
+
+  const guide = new Uint8Array([0, 0, 0, 200, 0]);
+  assert.equal(tileHasMaskSupport(guide, width, height, tiles[0], 24), true);
+  assert.equal(tileHasMaskSupport(new Uint8Array(width), width, height, tiles[1], 24), false);
+
+  const accum = new Float32Array(width);
+  const weights = new Float32Array(width);
+  accumulateSegmentationTile(new Uint8Array(4).fill(100), tiles[0], width, height, accum, weights, 3);
+  accumulateSegmentationTile(new Uint8Array(4).fill(200), tiles[1], width, height, accum, weights, 3);
+  const blended = finishSegmentationTiles(accum, weights);
+
+  assert.equal(blended[0], 100);
+  assert.equal(blended[4], 200);
+  assert(blended[1] < blended[2] && blended[2] < blended[3], "tile overlap was not blended smoothly");
+  assert(Math.abs(blended[2] - 150) <= 1, "overlap midpoint is not evenly blended");
+}
+
+function testBoundaryTileSelectionTargetsOnlySilhouetteDetail() {
+  const width = 8;
+  const height = 8;
+  const guide = new Uint8Array(width * height);
+  for (let y = 2; y <= 5; y += 1) {
+    for (let x = 2; x <= 5; x += 1) guide[y * width + x] = 255;
+  }
+
+  const blank = { x: 0, y: 0, width: 2, height: 2 };
+  const interior = { x: 3, y: 3, width: 2, height: 2 };
+  const boundary = { x: 1, y: 1, width: 3, height: 3 };
+  assert.equal(scoreMaskBoundary(guide, width, height, blank), 0);
+  assert.equal(scoreMaskBoundary(guide, width, height, interior), 0);
+  assert(scoreMaskBoundary(guide, width, height, boundary) > 0);
+  assert.equal(tileHasMaskBoundary(guide, width, height, boundary), true);
+  assert.equal(tileHasMaskBoundary(guide, width, height, interior), false);
+}
+
+function testMatteAwareProtectionOnlyRelaxesBorderFringe() {
+  const width = 7;
+  const height = 5;
+  const globalMask = new Uint8Array(width * height);
+  const detailMask = new Uint8Array(width * height);
+  const source = new Uint8ClampedArray(width * height * 4).fill(255);
+  for (let y = 1; y <= 3; y += 1) {
+    for (let x = 2; x <= 4; x += 1) {
+      const pixel = y * width + x;
+      globalMask[pixel] = 255;
+      detailMask[pixel] = 255;
+      source[pixel * 4] = 170;
+      source[pixel * 4 + 1] = 80;
+      source[pixel * 4 + 2] = 120;
+    }
+  }
+
+  const fringe = 2 * width + 5;
+  const interiorWhite = 2 * width + 3;
+  const darkEdge = 2 * width + 2;
+  globalMask[fringe] = 240;
+  detailMask[fringe] = 0;
+  source[fringe * 4] = 252;
+  source[fringe * 4 + 1] = 252;
+  source[fringe * 4 + 2] = 252;
+  source[interiorWhite * 4] = 253;
+  source[interiorWhite * 4 + 1] = 253;
+  source[interiorWhite * 4 + 2] = 253;
+  detailMask[interiorWhite] = 0;
+  source[darkEdge * 4] = 20;
+  source[darkEdge * 4 + 1] = 18;
+  source[darkEdge * 4 + 2] = 16;
+  detailMask[darkEdge] = 0;
+
+  const matte = estimateBorderMatteColor(source, width, height, { channels: 4 });
+  assert.deepEqual([matte.r, matte.g, matte.b], [255, 255, 255]);
+
+  const baseline = fuseGuidedSegmentationMasks(globalMask, detailMask, width, height, {
+    recoveryRadius: 3
+  });
+  const aware = fuseGuidedSegmentationMasks(globalMask, detailMask, width, height, {
+    recoveryRadius: 3,
+    matteAwareProtection: true,
+    matteTolerance: 32,
+    matteBoundaryRadius: 1,
+    sourcePixels: source,
+    sourceChannels: 4
+  });
+
+  assert.equal(baseline.mask[fringe], 240, "legacy protection should retain confident fringe");
+  assert(aware.mask[fringe] < 240, "matte-aware protection did not contract border fringe");
+  assert.equal(aware.mask[interiorWhite], 255, "interior white highlight lost protection");
+  assert.equal(aware.mask[darkEdge], 255, "dark subject edge lost protection");
+  assert(aware.stats.matteAwareContractions > 0);
 }
 
 function testFindVisibleAlphaBoundsAndCrop() {
@@ -306,6 +696,23 @@ function testDefringePasses() {
   assert.equal(run(0), onePass);
 }
 
+function testPhysicalMatteUnmixAndOpaqueReach() {
+  const pixel = [240, 240, 240, 64];
+  const legacy = applyProcessing(makeImageData(1, 1, pixel), processingSettings({
+    defringe: { enabled: true, matteColor: "#ffffff", strength: 100, radius: 4, tolerance: 255, alphaReach: 254, unmix: false }
+  }));
+  const unmixed = applyProcessing(makeImageData(1, 1, pixel), processingSettings({
+    defringe: { enabled: true, matteColor: "#ffffff", strength: 100, radius: 4, tolerance: 255, alphaReach: 254, unmix: true }
+  }));
+  assert(unmixed.data[0] < legacy.data[0], "physical unmix should remove more matte from low-alpha color");
+
+  const highAlpha = makeImageData(1, 1, [240, 240, 240, 230]);
+  const limited = applyProcessing(highAlpha, processingSettings({
+    defringe: { enabled: true, matteColor: "#ffffff", strength: 100, radius: 4, tolerance: 255, alphaReach: 220, unmix: true }
+  }));
+  assert.deepEqual(Array.from(limited.data), [240, 240, 240, 230]);
+}
+
 function testPngResolutionMetadata() {
   const png = minimalPng();
   const output = applyPngResolution(png, { xDpi: 300, yDpi: 150 });
@@ -491,8 +898,19 @@ function minimalJpeg() {
 }
 
 testApplyMaskToImage();
+testSegmentationCleanupBalanceIsReversibleAndRespectsManualEdits();
 testBuildTrimap();
+testConstrainRefinedMaskPreventsMattingHaloGrowth();
+testCropPaddedMaskRemovesBottomRightPadding();
 testDilateBand();
+testSamPromptsCoverDistributedForeground();
+testSamStructuralCandidateUsesModelAndStage1Agreement();
+testAdaptiveTrimapProtectsHighlightsAndThinStructure();
+testCertainBackgroundVetoUsesColorTopologyAndStage1Confidence();
+testGuidedTileFusionRecoversConnectedDetailWithoutBackgroundIslands();
+testTileCreationSupportFilteringAndCosineBlend();
+testBoundaryTileSelectionTargetsOnlySilhouetteDetail();
+testMatteAwareProtectionOnlyRelaxesBorderFringe();
 testFindVisibleAlphaBoundsAndCrop();
 testEdgeFinishOffRimColorBinarizesWithoutRecoloring();
 testEdgeFinishSolidRimColorUsesConfiguredColor();
@@ -502,6 +920,7 @@ testDefringeTolerance();
 testDefringeTolerancePotency();
 testDefringeStrengthPotency();
 testDefringePasses();
+testPhysicalMatteUnmixAndOpaqueReach();
 testPngResolutionMetadata();
 testJpegResolutionMetadata();
 testTiffExportPreservesAlphaAndResolution();

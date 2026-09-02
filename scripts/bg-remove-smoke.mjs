@@ -15,6 +15,8 @@ const APP_URL = `http://127.0.0.1:${APP_PORT}/`;
 const BG_REMOVE_TIMEOUT_MS = Number(process.env.BG_REMOVE_SMOKE_TIMEOUT_MS || 180_000);
 const TEST_IMAGE_SIZE = Number(process.env.BG_REMOVE_SMOKE_SIZE || 320);
 const BG_REMOVE_MODEL = process.env.ALPHAKILLER_BG_MODEL || "";
+const SMOKE_REFINE = process.env.ALPHAKILLER_SMOKE_REFINE === "1";
+const REQUIRE_STRUCTURE = process.env.ALPHAKILLER_REQUIRE_STRUCTURE === "1";
 
 let viteProcess = null;
 
@@ -94,6 +96,10 @@ async function runElectronSmoke() {
     await settleViteDevReload(page);
     await uploadTestImage(page);
 
+    if (SMOKE_REFINE) {
+      await page.getByRole("checkbox", { name: "Structure + edges" }).check();
+    }
+
     await page.getByRole("button", { name: "Remove Background" }).click();
     try {
       await page.waitForFunction(() => {
@@ -117,6 +123,13 @@ async function runElectronSmoke() {
 
     if (!state.hasRestore) {
       throw new Error(`Background removal did not produce a restorable result. Toast: ${state.toastText || "none"}`);
+    }
+
+    if (SMOKE_REFINE && !state.toastText.includes("edge refinement")) {
+      throw new Error(`Refine was enabled but stage 2 did not run. Toast: ${state.toastText || "none"}`);
+    }
+    if (REQUIRE_STRUCTURE && !state.toastText.includes("SAM 3 structure lock")) {
+      throw new Error(`SAM 3 structure locking did not run. Toast: ${state.toastText || "none"}`);
     }
 
     await page.locator(".restore-button").click();
