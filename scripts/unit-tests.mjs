@@ -71,6 +71,12 @@ function processingSettings(overrides = {}) {
       tolerance: 255,
       ...(overrides.defringe || {})
     },
+    threshold: {
+      enabled: false,
+      threshold: 128,
+      softness: 8,
+      ...(overrides.threshold || {})
+    },
     edgeFinish: {
       enabled: false,
       cutoff: 128,
@@ -525,6 +531,37 @@ function testFindVisibleAlphaBoundsAndCrop() {
   ]);
 }
 
+function testAlphaThresholdBinaryCutoffPreservesRgb() {
+  const image = makeImageData(4, 1, [
+    10, 20, 30, 0,
+    40, 50, 60, 127,
+    70, 80, 90, 128,
+    100, 110, 120, 255
+  ]);
+  const output = applyProcessing(image, processingSettings({
+    threshold: { enabled: true, threshold: 128, softness: 0 }
+  }));
+
+  assert.deepEqual([output.data[3], output.data[7], output.data[11], output.data[15]], [0, 0, 255, 255]);
+  assert.deepEqual(Array.from(output.data.slice(4, 7)), [40, 50, 60]);
+  assert.deepEqual(Array.from(output.data.slice(8, 11)), [70, 80, 90]);
+}
+
+function testAlphaThresholdSoftTransition() {
+  const image = makeImageData(5, 1, [
+    1, 1, 1, 96,
+    2, 2, 2, 112,
+    3, 3, 3, 128,
+    4, 4, 4, 144,
+    5, 5, 5, 160
+  ]);
+  const output = applyProcessing(image, processingSettings({
+    threshold: { enabled: true, threshold: 128, softness: 32 }
+  }));
+
+  assert.deepEqual([output.data[3], output.data[7], output.data[11], output.data[15], output.data[19]], [0, 40, 128, 215, 255]);
+}
+
 function testEdgeFinishOffRimColorBinarizesWithoutRecoloring() {
   const image = makeImageData(2, 1, [
     10, 20, 30, 127,
@@ -969,6 +1006,8 @@ testTileCreationSupportFilteringAndCosineBlend();
 testBoundaryTileSelectionTargetsOnlySilhouetteDetail();
 testMatteAwareProtectionOnlyRelaxesBorderFringe();
 testFindVisibleAlphaBoundsAndCrop();
+testAlphaThresholdBinaryCutoffPreservesRgb();
+testAlphaThresholdSoftTransition();
 testEdgeFinishOffRimColorBinarizesWithoutRecoloring();
 testEdgeFinishSolidRimColorUsesConfiguredColor();
 testEdgeFinishAutoRimColorUsesAdjacentVisiblePixel();

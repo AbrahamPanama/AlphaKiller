@@ -28,6 +28,10 @@ export function applyProcessing(sourceImageData, settings, runtime = {}) {
     }
   }
 
+  if (settings.threshold?.enabled) {
+    alphaThreshold(working, settings.threshold);
+  }
+
   return working;
 }
 
@@ -400,6 +404,27 @@ const DEFRINGE_STRENGTH_POTENCY = 2;
 
 function cloneImageData(imageData) {
   return new ImageData(new Uint8ClampedArray(imageData.data), imageData.width, imageData.height);
+}
+
+function alphaThreshold(imageData, settings = {}) {
+  const threshold = clampByte(settings.threshold ?? 128);
+  const softness = Math.min(64, Math.max(0, Number(settings.softness) || 0));
+  const low = threshold - softness;
+  const high = threshold + softness;
+
+  for (let index = 3; index < imageData.data.length; index += 4) {
+    const alpha = imageData.data[index];
+    if (softness === 0) {
+      imageData.data[index] = alpha >= threshold ? 255 : 0;
+    } else if (alpha <= low) {
+      imageData.data[index] = 0;
+    } else if (alpha >= high) {
+      imageData.data[index] = 255;
+    } else {
+      const progress = (alpha - low) / Math.max(1, high - low);
+      imageData.data[index] = Math.round(smoothstep(progress) * 255);
+    }
+  }
 }
 
 // Edge Finishing: binarize alpha at `cutoff` for crisp, print-ready (1-bit) edges,

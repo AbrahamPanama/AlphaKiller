@@ -21,8 +21,9 @@ JPEG, TIFF, PDF, or SVG export, white-ink printing, compositing, or texture use.
   pixels.
 - Toolbar trim command that crops transparent padding from the current cleaned
   alpha.
-- Defringe and Edge Finishing controls, including hard alpha cutoff and Rim
-  Color modes: Off, Auto, and Solid.
+- Defringe, Edge Finishing, and independent Alpha Threshold controls, including
+  a soft transition or true 1-bit cutoff and Rim Color modes: Off, Auto, and
+  Solid.
 - OpenCV 5-powered Smart Edge refinement with thin-detail protection and
   adjacent-color rim reconstruction.
 - Smart Delete/Reconstruct pen mode using local ROI segmentation, plus exact

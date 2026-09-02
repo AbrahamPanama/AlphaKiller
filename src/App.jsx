@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  Activity,
   Check,
   ChevronDown,
   Crop,
@@ -69,6 +70,7 @@ import { contourToSvg } from "./vectorTrace.js";
 
 const DEFAULT_SETTINGS = {
   defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2, tolerance: 180, passes: 1, unmix: false, alphaReach: 220 },
+  threshold: { enabled: false, threshold: 128, softness: 8 },
   edgeFinish: {
     enabled: false,
     treatment: "crisp",
@@ -97,7 +99,7 @@ const PRESETS = [
     description: "Binary transparency for masks and pixel art.",
     settings: {
       ...DEFAULT_SETTINGS,
-      edgeFinish: { ...DEFAULT_SETTINGS.edgeFinish, enabled: true, treatment: "crisp", cutoff: 128 },
+      threshold: { ...DEFAULT_SETTINGS.threshold, enabled: true, threshold: 128, softness: 0 },
       defringe: { ...DEFAULT_SETTINGS.defringe, enabled: false }
     }
   },
@@ -3089,6 +3091,16 @@ export function App() {
           </ToolSection>
 
           <ToolSection
+            icon={<Activity size={15} />}
+            title="Alpha Threshold"
+            enabled={settings.threshold.enabled}
+            onToggle={(value) => updateSetting("threshold", "enabled", value)}
+          >
+            <RangeControl label="Threshold" value={settings.threshold.threshold} min={0} max={255} onChange={(value) => updateSetting("threshold", "threshold", value)} />
+            <RangeControl label="Softness" value={settings.threshold.softness} min={0} max={64} onChange={(value) => updateSetting("threshold", "softness", value)} />
+          </ToolSection>
+
+          <ToolSection
             icon={<Pipette size={15} />}
             title="Vector Contour"
             enabled={contourOptions.visible}
@@ -4327,6 +4339,7 @@ function normalizeCustomPreset(preset) {
 function normalizePresetSettings(settings) {
   return {
     defringe: normalizeDefringeSettings(settings?.defringe),
+    threshold: normalizeThresholdSettings(settings?.threshold),
     edgeFinish: normalizeEdgeFinishSettings(settings)
   };
 }
@@ -4352,12 +4365,23 @@ function normalizeEdgeFinishSettings(settings) {
       edgeWidth: Math.min(16, Math.max(0, Math.round(Number(merged.edgeWidth) || 0)))
     };
   }
-  // Migrate legacy Threshold + Hardening into the unified Edge Finishing operator.
-  const legacyThreshold = settings?.threshold;
+  // Legacy hardening is still approximated by the unified Edge Finishing operator.
+  // Alpha Threshold is a first-class operator again and is normalized separately.
   const legacyHardening = settings?.hardening;
-  const enabled = Boolean(legacyThreshold?.enabled || legacyHardening?.enabled);
-  const cutoff = normalizeCutoff(legacyThreshold?.threshold);
+  const enabled = Boolean(legacyHardening?.enabled);
+  const cutoff = normalizeCutoff(DEFAULT_SETTINGS.edgeFinish.cutoff);
   return { ...DEFAULT_SETTINGS.edgeFinish, enabled, cutoff };
+}
+
+function normalizeThresholdSettings(threshold) {
+  const merged = { ...DEFAULT_SETTINGS.threshold, ...(threshold || {}) };
+  const thresholdValue = Number(merged.threshold);
+  const softnessValue = Number(merged.softness);
+  return {
+    enabled: Boolean(merged.enabled),
+    threshold: Math.min(255, Math.max(0, Math.round(Number.isFinite(thresholdValue) ? thresholdValue : DEFAULT_SETTINGS.threshold.threshold))),
+    softness: Math.min(64, Math.max(0, Math.round(Number.isFinite(softnessValue) ? softnessValue : DEFAULT_SETTINGS.threshold.softness)))
+  };
 }
 
 function normalizeRimColorMode(mode, legacyEdgeColorEnabled = false) {
