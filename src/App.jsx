@@ -155,6 +155,7 @@ const BG_REMOVE_REFINE_KEY = "alphakiller:bg-remove-refine-default";
 const BG_REMOVE_SAFEGUARDS_KEY = "alphakiller:bg-remove-safeguards";
 const BRIA_PRESERVE_ALPHA_KEY = "alphakiller:bria-preserve-alpha";
 const BRIA_TOKEN_KEY = "alphakiller:bria-token";
+const PHOTOROOM_TOKEN_KEY = "alphakiller:photoroom-token";
 const HF_TOKEN_KEY = "alphakiller:hf-token";
 const CUSTOM_PRESETS_KEY = "alphakiller:custom-presets";
 const EXPORT_SETTINGS_KEY = "alphakiller:export-settings";
@@ -217,12 +218,23 @@ const BG_REMOVE_MODELS = {
     notice: "Requires WebGPU. MIT-licensed and commercial-safe.",
     requiresWebGpu: true
   },
+  "photoroom-api": {
+    label: "PhotoRoom API",
+    shortLabel: "PhotoRoom",
+    badge: "New",
+    description: "Hosted full-resolution background removal with PhotoRoom edge matting.",
+    notice: "Uploads the image to PhotoRoom. Requires Electron and a PhotoRoom API key.",
+    providerName: "PhotoRoom",
+    requiresElectron: true,
+    remote: true
+  },
   "bria-api": {
     label: "Experimental (BRIA RMBG-2.0)",
     shortLabel: "BRIA 2.0",
     badge: "Experimental",
     description: "Hosted RMBG-2.0. Available for comparison, but current artwork edges are inconsistent.",
     notice: "Uploads image to BRIA. Requires Electron and a BRIA API token.",
+    providerName: "BRIA",
     requiresElectron: true,
     remote: true
   }
@@ -1139,8 +1151,8 @@ export function App() {
       if (model.remote) {
         setToast({
           type: "info",
-          title: "BRIA API background removal",
-          message: "AlphaKiller sends a normalized PNG to BRIA and applies the returned alpha matte to the cleanup pipeline."
+          title: `${model.providerName || "Remote"} API background removal`,
+          message: `AlphaKiller sends a normalized PNG to ${model.providerName || "the selected provider"} and applies the returned matte to the cleanup pipeline.`
         });
       } else {
         setToast({
@@ -1153,11 +1165,12 @@ export function App() {
       }
     }
 
-    if (bgRemoveModel === "bria-api") {
-      runBriaApiBackgroundRemoval({
+    if (model.remote) {
+      runRemoteApiBackgroundRemoval({
         requestId,
         imageData: inputImageData,
-        visibleBefore: originalImageData
+        visibleBefore: originalImageData,
+        provider: bgRemoveModel
       });
       return;
     }
@@ -1175,9 +1188,11 @@ export function App() {
     });
   }
 
-  async function runBriaApiBackgroundRemoval(job) {
+  async function runRemoteApiBackgroundRemoval(job) {
     const id = ++bgRemoveJobIdRef.current;
-    activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData, modelId: "bria-api" };
+    const providerModel = BG_REMOVE_MODELS[job.provider];
+    const providerName = providerModel?.providerName || "Remote provider";
+    activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData, modelId: job.provider };
     setBgRemoveStatus("inferring");
     setBgRemoveProgress(0.08);
     setBgRemoveDevice("api");
@@ -1197,10 +1212,12 @@ export function App() {
       setBgRemoveProgress(0.28);
 
       const result = await window.alphaKiller.removeBackground({
-        provider: "bria-api",
+        provider: job.provider,
         pngBytes,
-        preserveAlpha: briaPreserveAlpha,
-        apiToken: loadStoredBriaToken()
+        preserveAlpha: job.provider === "bria-api" ? briaPreserveAlpha : false,
+        apiToken: job.provider === "photoroom-api"
+          ? loadStoredPhotoroomToken()
+          : loadStoredBriaToken()
       });
       if (!isActiveBgRemoveJob(id, job.requestId)) return;
       setBgRemoveProgress(0.82);
@@ -1239,13 +1256,13 @@ export function App() {
       setToast({
         type: "success",
         title: "Background removed",
-        message: `BRIA sent ${job.imageData.width} x ${job.imageData.height} (${formatBytes(pngBytes.byteLength)}) and returned ${resultWidth} x ${resultHeight} in ${((result.durationMs || 0) / 1000).toFixed(1)}s${result.requestId ? ` (request ${result.requestId})` : ""}.`
+        message: `${providerName} sent ${job.imageData.width} x ${job.imageData.height} (${formatBytes(pngBytes.byteLength)}) and returned ${resultWidth} x ${resultHeight} in ${((result.durationMs || 0) / 1000).toFixed(1)}s${result.requestId ? ` (request ${result.requestId})` : ""}.`
       });
     } catch (error) {
       if (!isActiveBgRemoveJob(id, job.requestId)) return;
       clearBgRemoveTimeout();
       activeBgRemoveJobRef.current = null;
-      finishBgRemoveError(error?.message || "BRIA API background removal failed.");
+      finishBgRemoveError(error?.message || `${providerName} API background removal failed.`);
     }
   }
 
@@ -1535,7 +1552,7 @@ export function App() {
     persistLocalStorage(BG_REMOVE_SAFEGUARDS_KEY, JSON.stringify(normalized));
   }
 
-  function saveSettingsToken(token) {
+  function saveBriaSettingsToken(token) {
     const clean = sanitizeToken(token);
     if (clean) {
       persistLocalStorage(BRIA_TOKEN_KEY, clean);
@@ -1543,6 +1560,17 @@ export function App() {
     } else {
       removeLocalStorage(BRIA_TOKEN_KEY);
       setToast({ type: "success", title: "Token cleared", message: "Stored BRIA API token removed from this browser profile." });
+    }
+  }
+
+  function savePhotoroomSettingsToken(token) {
+    const clean = sanitizeToken(token);
+    if (clean) {
+      persistLocalStorage(PHOTOROOM_TOKEN_KEY, clean);
+      setToast({ type: "success", title: "Key saved", message: "PhotoRoom API key stored for this browser profile." });
+    } else {
+      removeLocalStorage(PHOTOROOM_TOKEN_KEY);
+      setToast({ type: "success", title: "Key cleared", message: "Stored PhotoRoom API key removed from this browser profile." });
     }
   }
 
@@ -2987,14 +3015,17 @@ export function App() {
             <ColorControl label="Matte" value={settings.defringe.matteColor} onChange={(value) => updateSetting("defringe", "matteColor", value)} />
             <RangeControl label="Strength" value={settings.defringe.strength} min={0} max={200} unit="%" onChange={(value) => updateSetting("defringe", "strength", value)} />
             <RangeControl label="Matte tolerance" value={settings.defringe.tolerance ?? 255} min={0} max={255} onChange={(value) => updateSetting("defringe", "tolerance", value)} />
-            <RangeControl label="Edge depth" value={settings.defringe.radius} min={1} max={4} onChange={(value) => updateSetting("defringe", "radius", value)} />
-            <RangeControl label="Passes" value={settings.defringe.passes ?? 1} min={1} max={5} onChange={(value) => updateSetting("defringe", "passes", value)} />
-            <div className="toggle-row">
-              <span>Physical matte unmix</span>
-              <Switch checked={settings.defringe.unmix === true} onChange={(value) => updateSetting("defringe", "unmix", value)} />
-            </div>
-            <RangeControl label="Opaque reach" value={settings.defringe.alphaReach ?? 220} min={64} max={254} onChange={(value) => updateSetting("defringe", "alphaReach", value)} />
-            <p className="contour-summary">Unmix reconstructs edge color from the selected matte. Opaque reach limits how far into confident subject pixels it may operate.</p>
+            <RangeControl label="Edge radius" value={settings.defringe.radius} min={1} max={4} unit="px" onChange={(value) => updateSetting("defringe", "radius", value)} />
+            <AdvancedControls>
+              <RangeControl label="Passes" value={settings.defringe.passes ?? 1} min={1} max={5} onChange={(value) => updateSetting("defringe", "passes", value)} />
+              <div className="toggle-row">
+                <span>Physical matte unmix</span>
+                <Switch checked={settings.defringe.unmix === true} onChange={(value) => updateSetting("defringe", "unmix", value)} />
+              </div>
+              {settings.defringe.unmix === true && (
+                <RangeControl label="Opaque reach" value={settings.defringe.alphaReach ?? 220} min={64} max={254} onChange={(value) => updateSetting("defringe", "alphaReach", value)} />
+              )}
+            </AdvancedControls>
           </ToolSection>
 
           <ToolSection
@@ -3003,56 +3034,58 @@ export function App() {
             enabled={settings.edgeFinish.enabled}
             onToggle={(value) => updateSetting("edgeFinish", "enabled", value)}
           >
-            <div className="range-control">
-              <span>Edge treatment</span>
-              <div className="segmented" role="radiogroup" aria-label="Edge treatment">
-                {[["smart", "Smart"], ["crisp", "Crisp"]].map(([id, label]) => (
-                  <button
-                    key={id}
-                    type="button"
-                    className={settings.edgeFinish.treatment === id ? "active" : ""}
-                    role="radio"
-                    aria-checked={settings.edgeFinish.treatment === id}
-                    onClick={() => updateSetting("edgeFinish", "treatment", id)}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-            </div>
             {settings.edgeFinish.treatment === "smart" ? (
               <>
-                <RangeControl label="Edge smoothing" value={settings.edgeFinish.smartStrength} min={0} max={100} unit="%" onChange={(value) => updateSetting("edgeFinish", "smartStrength", value)} />
                 <RangeControl label="Residue cleanup" value={settings.edgeFinish.cleanupBalance} min={0} max={100} unit="%" onChange={(value) => updateSetting("edgeFinish", "cleanupBalance", value)} />
+                <RangeControl label="Edge smoothing" value={settings.edgeFinish.smartStrength} min={0} max={100} unit="%" onChange={(value) => updateSetting("edgeFinish", "smartStrength", value)} />
                 <RangeControl label="Protect fine detail" value={settings.edgeFinish.detailProtection} min={0} max={100} unit="%" onChange={(value) => updateSetting("edgeFinish", "detailProtection", value)} />
               </>
             ) : (
               <RangeControl label="Cutoff" value={settings.edgeFinish.cutoff} min={1} max={254} onChange={(value) => updateSetting("edgeFinish", "cutoff", value)} />
             )}
-            <div className="range-control">
-              <span>Rim color</span>
-              <div className="segmented" role="radiogroup" aria-label="Rim color">
-                {RIM_COLOR_MODE_OPTIONS.map((item) => {
-                  const active = normalizeRimColorMode(settings.edgeFinish.rimColorMode) === item.id;
-                  return (
+            <AdvancedControls>
+              <div className="range-control">
+                <span>Edge treatment</span>
+                <div className="segmented" role="radiogroup" aria-label="Edge treatment">
+                  {[["smart", "Smart"], ["crisp", "Crisp"]].map(([id, label]) => (
                     <button
-                      key={item.id}
+                      key={id}
                       type="button"
-                      className={active ? "active" : ""}
+                      className={settings.edgeFinish.treatment === id ? "active" : ""}
                       role="radio"
-                      aria-checked={active}
-                      onClick={() => updateSetting("edgeFinish", "rimColorMode", item.id)}
+                      aria-checked={settings.edgeFinish.treatment === id}
+                      onClick={() => updateSetting("edgeFinish", "treatment", id)}
                     >
-                      {item.label}
+                      {label}
                     </button>
-                  );
-                })}
+                  ))}
+                </div>
               </div>
-            </div>
-            {normalizeRimColorMode(settings.edgeFinish.rimColorMode) === "solid" && (
-              <ColorControl label="Rim color" value={settings.edgeFinish.edgeColor ?? "#000000"} onChange={(value) => updateSetting("edgeFinish", "edgeColor", value)} />
-            )}
-            <RangeControl label={settings.edgeFinish.treatment === "smart" ? "Rim reach" : "Edge width"} value={settings.edgeFinish.edgeWidth ?? 0} min={0} max={16} unit="px" onChange={(value) => updateSetting("edgeFinish", "edgeWidth", value)} />
+              <div className="range-control">
+                <span>Rim color</span>
+                <div className="segmented" role="radiogroup" aria-label="Rim color">
+                  {RIM_COLOR_MODE_OPTIONS.map((item) => {
+                    const active = normalizeRimColorMode(settings.edgeFinish.rimColorMode) === item.id;
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        className={active ? "active" : ""}
+                        role="radio"
+                        aria-checked={active}
+                        onClick={() => updateSetting("edgeFinish", "rimColorMode", item.id)}
+                      >
+                        {item.label}
+                      </button>
+                    );
+                  })}
+                </div>
+              </div>
+              {normalizeRimColorMode(settings.edgeFinish.rimColorMode) === "solid" && (
+                <ColorControl label="Rim color" value={settings.edgeFinish.edgeColor ?? "#000000"} onChange={(value) => updateSetting("edgeFinish", "edgeColor", value)} />
+              )}
+              <RangeControl label={settings.edgeFinish.treatment === "smart" ? "Rim reach" : "Edge width"} value={settings.edgeFinish.edgeWidth ?? 0} min={0} max={16} unit="px" onChange={(value) => updateSetting("edgeFinish", "edgeWidth", value)} />
+            </AdvancedControls>
           </ToolSection>
 
           <ToolSection
@@ -3061,10 +3094,12 @@ export function App() {
             enabled={contourOptions.visible}
             onToggle={(value) => updateContourOption("visible", value)}
           >
-            <RangeControl label="Opacity cutoff" value={contourOptions.alphaThreshold} min={0} max={255} onChange={(value) => updateContourOption("alphaThreshold", value)} />
             <RangeControl label="Offset" value={contourOptions.offsetPixels} min={-48} max={48} unit="px" onChange={(value) => updateContourOption("offsetPixels", value)} />
             <RangeControl label="Curve smoothing" value={contourOptions.simplifyTolerance} min={0} max={12} unit="px" onChange={(value) => updateContourOption("simplifyTolerance", value)} />
             <ColorControl label="Stroke" value={contourOptions.color} onChange={(value) => updateContourOption("color", value)} />
+            <AdvancedControls>
+              <RangeControl label="Opacity cutoff" value={contourOptions.alphaThreshold} min={0} max={255} onChange={(value) => updateContourOption("alphaThreshold", value)} />
+            </AdvancedControls>
             {canvasTool === "contour-edit" && selectedContourPoint && (
               <div className="contour-node-editor">
                 <div>
@@ -3126,13 +3161,15 @@ export function App() {
           refineAvailable={BG_REMOVE_REFINE_AVAILABLE}
           hasWebGpu={hasWebGpu}
           hasElectronBackgroundRemoval={hasElectronBackgroundRemoval}
-          tokenValue={loadStoredBriaToken()}
+          photoroomTokenValue={loadStoredPhotoroomToken()}
+          briaTokenValue={loadStoredBriaToken()}
           onModelChange={updateBgRemoveModel}
           onRefineDefaultChange={updateBgRemoveRefine}
           onSafeguardsChange={updateBgRemoveSafeguards}
           onSafeguardsReset={() => updateBgRemoveSafeguards(DEFAULT_BG_REMOVE_SAFEGUARDS)}
           onBriaPreserveAlphaChange={updateBriaPreserveAlpha}
-          onTokenSave={saveSettingsToken}
+          onPhotoroomTokenSave={savePhotoroomSettingsToken}
+          onBriaTokenSave={saveBriaSettingsToken}
           onClose={() => setSettingsPanelOpen(false)}
         />
       )}
@@ -3315,6 +3352,18 @@ function ToolSection({ icon, title, enabled, onToggle, children }) {
       </header>
       <div className="tool-body">{children}</div>
     </section>
+  );
+}
+
+function AdvancedControls({ children }) {
+  return (
+    <details className="tool-advanced">
+      <summary>
+        <span>Advanced controls</span>
+        <ChevronDown size={14} aria-hidden="true" />
+      </summary>
+      <div className="tool-advanced-body">{children}</div>
+    </details>
   );
 }
 
@@ -4014,7 +4063,21 @@ function bgRemoveStageLabel(stage, status) {
 function getBgRemoveErrorMessage(message = "") {
   const lower = message.toLowerCase();
   if (lower.includes("no handler registered") || lower.includes("background-removal:run")) {
-    return "Electron needs to be restarted so the background-removal IPC handler is registered. Stop the current dev app and launch it again with BRIA_API_TOKEN set.";
+    return "Electron needs to be restarted so the background-removal IPC handler is registered.";
+  }
+  if (lower.includes("photoroom")) {
+    if (lower.includes("missing photoroom_api_key")) {
+      return "Missing PhotoRoom API key. Add it in Settings or launch Electron with PHOTOROOM_API_KEY set.";
+    }
+    if (lower.includes("key") && (lower.includes("rejected") || lower.includes("access"))) {
+      return "The PhotoRoom API key was rejected. Check the key and the account's API access.";
+    }
+    if (lower.includes("6,000") || lower.includes("36 megapixels")) {
+      return "PhotoRoom supports images up to 6,000 pixels on either side and 36 megapixels.";
+    }
+    if (lower.includes("format") || lower.includes("png")) {
+      return "PhotoRoom rejected the input or output format. AlphaKiller requires a full-resolution PNG response.";
+    }
   }
   if (lower.includes("bria")) {
     if (lower.includes("missing bria_api_token")) {
@@ -4336,6 +4399,14 @@ function loadStoredHfToken() {
 function loadStoredBriaToken() {
   try {
     return sanitizeToken(window.localStorage?.getItem(BRIA_TOKEN_KEY));
+  } catch {
+    return "";
+  }
+}
+
+function loadStoredPhotoroomToken() {
+  try {
+    return sanitizeToken(window.localStorage?.getItem(PHOTOROOM_TOKEN_KEY));
   } catch {
     return "";
   }

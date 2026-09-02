@@ -22,6 +22,7 @@ own licenses and terms.
 
 | Provider | Current use | Notice |
 |---|---|---|
+| PhotoRoom API | Hosted full-resolution background-removal provider | Requires a PhotoRoom API key and is governed by PhotoRoom's API terms. Images are uploaded to PhotoRoom for processing. |
 | BRIA API RMBG-2.0 | Experimental hosted background-removal provider | Requires a BRIA API token and is governed by BRIA's API terms. Images are uploaded to BRIA for processing. |
 
 ## Remote Model Weights

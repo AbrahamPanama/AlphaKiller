@@ -10,8 +10,9 @@ JPEG, TIFF, PDF, or SVG export, white-ink printing, compositing, or texture use.
 ## Current MVP
 
 - PNG/JPEG/WebP/TIFF drag-and-drop or file-picker import.
-- AI background removal with BRIA API RMBG-2.0, a Fast local RMBG-1.4 path,
-  a WebGPU-only Quality BEN2 path, and a restore-original safety affordance.
+- AI background removal with PhotoRoom and BRIA hosted APIs, a Fast local
+  RMBG-1.4 path, a WebGPU-only Quality BEN2 path, and a restore-original safety
+  affordance.
 - Canvas preview with checker, black, white, gray, and custom backgrounds.
 - Before, after, split, alpha mask, and difference views.
 - Mouse wheel zoom, drag-to-pan, fit/100% zoom controls, and draggable
@@ -158,7 +159,7 @@ that the output includes a PDF header and alpha soft mask.
 
 ## Background Removal Status
 
-AlphaKiller currently ships three Stage 1 background-removal choices:
+AlphaKiller currently ships four Stage 1 background-removal choices:
 
 - **Fast (RMBG-1.4)**: the recommended default. It is currently the fastest,
   most reliable, and best-looking path for AlphaKiller edge quality. No Hugging
@@ -166,6 +167,9 @@ AlphaKiller currently ships three Stage 1 background-removal choices:
 - **Second Best (BEN2)**: the free/commercial-safe local fallback. It uses
   `onnx-community/BEN2-ONNX` and requires WebGPU in AlphaKiller because the CPU
   path is too slow for the app watchdog.
+- **PhotoRoom API**: the hosted full-resolution quality option. It runs through
+  Electron IPC, uploads a normalized PNG to PhotoRoom, requires a PhotoRoom API
+  key, and rejects responses that change the source pixel dimensions.
 - **Experimental (BRIA RMBG-2.0)**: a hosted comparison provider. It runs
   through Electron IPC, uploads the normalized PNG to BRIA, and applies the
   returned alpha matte to AlphaKiller's cleanup pipeline. Current artwork-edge
@@ -200,6 +204,15 @@ BRIA_API_TOKEN=your_bria_api_token BRIA_PRESERVE_ALPHA=false npm run diagnose:rm
 The Settings panel can store a local BRIA API token override for development.
 For cleaner production hygiene, prefer launching Electron with `BRIA_API_TOKEN`
 instead. Do not put BRIA API tokens in source, screenshots, or renderer logs.
+
+To use PhotoRoom, add the key in Settings or launch Electron with:
+
+```bash
+PHOTOROOM_API_KEY=your_photoroom_api_key npm run dev
+```
+
+The renderer only passes the key to Electron for the selected request. Do not
+commit PhotoRoom keys or include them in screenshots and logs.
 
 If you need to probe a different Hugging Face model:
 

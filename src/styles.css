@@ -844,6 +844,41 @@ button {
   pointer-events: none;
 }
 
+.tool-advanced {
+  margin-top: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border-soft);
+}
+
+.tool-advanced summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  color: var(--text-3);
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  list-style: none;
+  text-transform: uppercase;
+}
+
+.tool-advanced summary::-webkit-details-marker {
+  display: none;
+}
+
+.tool-advanced summary svg {
+  color: var(--text-3);
+  transition: transform 140ms ease;
+}
+
+.tool-advanced[open] summary svg {
+  transform: rotate(180deg);
+}
+
+.tool-advanced-body {
+  padding-top: 2px;
+}
+
 .range-control,
 .color-control,
 .toggle-row {
@@ -1070,6 +1105,24 @@ input[type="range"] {
   color: var(--text-3);
   font-size: 11px;
   line-height: 1.35;
+}
+
+.credential-field {
+  display: grid;
+  gap: 7px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.credential-field:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.credential-label {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
 }
 
 .settings-advanced {

@@ -53,6 +53,9 @@ const {
   tileHasMaskBoundary,
   tileHasMaskSupport
 } = await import("../src/tiledSegmentation.js");
+const {
+  removeBackgroundWithPhotoroomApi
+} = await import("../electron/backgroundRemoval/photoroomApiProvider.js");
 
 function makeImageData(width, height, pixels) {
   return new ImageData(new Uint8ClampedArray(pixels), width, height);
@@ -866,8 +869,58 @@ function testVectorContourOffset() {
   assert.ok(contracted.paths[0].area < base.paths[0].area);
 }
 
-function minimalPng() {
-  return new Uint8Array([
+async function testPhotoroomProviderRequest() {
+  const source = minimalPng(2, 3);
+  let capturedUrl = "";
+  let capturedOptions = null;
+
+  const result = await removeBackgroundWithPhotoroomApi({
+    pngBytes: source,
+    apiToken: "test-photoroom-key",
+    fetchImpl: async (url, options) => {
+      capturedUrl = url;
+      capturedOptions = options;
+      return new Response(minimalPng(2, 3), {
+        status: 200,
+        headers: {
+          "content-type": "image/png",
+          "x-request-id": "request-123"
+        }
+      });
+    }
+  });
+
+  assert.equal(capturedUrl, "https://sdk.photoroom.com/v1/segment");
+  assert.equal(capturedOptions.method, "POST");
+  assert.equal(capturedOptions.headers["x-api-key"], "test-photoroom-key");
+  assert.equal(capturedOptions.body.get("format"), "png");
+  assert.equal(capturedOptions.body.get("channels"), "rgba");
+  assert.equal(capturedOptions.body.get("size"), "full");
+  assert.equal(capturedOptions.body.get("crop"), "false");
+
+  const uploadedImage = capturedOptions.body.get("image_file");
+  assert.ok(uploadedImage instanceof Blob);
+  assert.equal(uploadedImage.type, "image/png");
+  assert.equal(uploadedImage.size, source.byteLength);
+  assert.equal(result.provider, "photoroom-api");
+  assert.equal(result.width, 2);
+  assert.equal(result.height, 3);
+  assert.equal(result.requestId, "request-123");
+}
+
+async function testPhotoroomProviderRejectsDimensionChanges() {
+  await assert.rejects(
+    removeBackgroundWithPhotoroomApi({
+      pngBytes: minimalPng(2, 3),
+      apiToken: "test-photoroom-key",
+      fetchImpl: async () => new Response(minimalPng(3, 2), { status: 200 })
+    }),
+    /returned 3 x 2, but AlphaKiller sent 2 x 3/
+  );
+}
+
+function minimalPng(width = 1, height = 1) {
+  const bytes = new Uint8Array([
     0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
     0x00, 0x00, 0x00, 0x0d,
     0x49, 0x48, 0x44, 0x52,
@@ -879,6 +932,10 @@ function minimalPng() {
     0x49, 0x45, 0x4e, 0x44,
     0x00, 0x00, 0x00, 0x00
   ]);
+  const view = new DataView(bytes.buffer);
+  view.setUint32(16, width);
+  view.setUint32(20, height);
+  return bytes;
 }
 
 function boundsForPoints(points) {
@@ -933,5 +990,7 @@ testVectorContourSvg();
 testVectorContourSvgUsesCurvesWhenSmoothed();
 testVectorContourOffset();
 testVectorContourExpandsPastBorder();
+await testPhotoroomProviderRequest();
+await testPhotoroomProviderRejectsDimensionChanges();
 
 console.log("Unit tests passed.");
