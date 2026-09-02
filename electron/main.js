@@ -28,7 +28,7 @@ function createWindow() {
     height: 900,
     minWidth: 1040,
     minHeight: 680,
-    title: "AlphaKiller 0.1 beta 3",
+    title: "AlphaKiller 0.1 beta 4",
     icon: process.platform === "win32" ? windowsIconPath : undefined,
     backgroundColor: "#0d0e10",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",

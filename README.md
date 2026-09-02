@@ -1,6 +1,6 @@
 # AlphaKiller
 
-Current version: **0.1 beta 3** (`0.1.0-beta.3`).
+Current version: **0.1 beta 4** (`0.1.0-beta.4`).
 
 AlphaKiller is an Electron image editor for cleaning transparent-pixel artifacts:
 anti-aliased edges, matte halos, and hidden edge RGB around transparent pixels.

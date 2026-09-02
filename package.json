@@ -1,6 +1,6 @@
 {
   "name": "alphakiller",
-  "version": "0.1.0-beta.3",
+  "version": "0.1.0-beta.4",
   "description": "Desktop image cleanup tool for transparent pixel and anti-aliasing artifacts.",
   "main": "electron/main.js",
   "type": "module",

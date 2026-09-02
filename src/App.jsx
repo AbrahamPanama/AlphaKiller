@@ -84,7 +84,7 @@ const DEFAULT_SETTINGS = {
   }
 };
 
-const APP_VERSION_LABEL = "0.1 beta 3";
+const APP_VERSION_LABEL = "0.1 beta 4";
 
 const PRESETS = [
   {
