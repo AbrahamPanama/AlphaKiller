@@ -1,0 +1,17 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "alphakiller-web",
+      "runtimeExecutable": "npx",
+      "runtimeArgs": ["vite", "--host", "127.0.0.1", "--port", "5174"],
+      "port": 5174
+    },
+    {
+      "name": "boxmaker-web",
+      "runtimeExecutable": "npm",
+      "runtimeArgs": ["--prefix", "/Users/abrahamsaenz/Desktop/BoxMaker", "run", "dev"],
+      "port": 5173
+    }
+  ]
+}

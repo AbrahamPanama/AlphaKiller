@@ -1072,6 +1072,24 @@ input[type="range"] {
   font-style: normal;
 }
 
+.credential-field {
+  display: grid;
+  gap: 7px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.credential-field:last-child {
+  padding-bottom: 0;
+  border-bottom: 0;
+}
+
+.credential-label {
+  color: var(--text-2);
+  font-size: 12px;
+  font-weight: 700;
+}
+
 .token-row {
   display: grid;
   grid-template-columns: 18px minmax(0, 1fr) auto;

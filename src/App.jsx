@@ -116,6 +116,7 @@ const BG_REMOVE_MODEL_KEY = "alphakiller:bg-remove-model";
 const BG_REMOVE_REFINE_KEY = "alphakiller:bg-remove-refine-default";
 const BRIA_PRESERVE_ALPHA_KEY = "alphakiller:bria-preserve-alpha";
 const BRIA_TOKEN_KEY = "alphakiller:bria-token";
+const PHOTOROOM_TOKEN_KEY = "alphakiller:photoroom-token";
 const HF_TOKEN_KEY = "alphakiller:hf-token";
 const CUSTOM_PRESETS_KEY = "alphakiller:custom-presets";
 const BG_REMOVE_REFINE_AVAILABLE = false;
@@ -157,12 +158,23 @@ const BG_REMOVE_MODELS = {
     notice: "Requires WebGPU. MIT-licensed and commercial-safe.",
     requiresWebGpu: true
   },
+  "photoroom-api": {
+    label: "PhotoRoom API",
+    shortLabel: "PhotoRoom",
+    badge: "New",
+    description: "Hosted full-resolution background removal with PhotoRoom edge matting.",
+    notice: "Uploads the image to PhotoRoom. Requires Electron and a PhotoRoom API key.",
+    providerName: "PhotoRoom",
+    requiresElectron: true,
+    remote: true
+  },
   "bria-api": {
     label: "Experimental (BRIA RMBG-2.0)",
     shortLabel: "BRIA 2.0",
     badge: "Experimental",
     description: "Hosted RMBG-2.0. Available for comparison, but current artwork edges are inconsistent.",
     notice: "Uploads image to BRIA. Requires Electron and a BRIA API token.",
+    providerName: "BRIA",
     requiresElectron: true,
     remote: true
   }
@@ -650,8 +662,8 @@ export function App() {
       if (model.remote) {
         setToast({
           type: "info",
-          title: "BRIA API background removal",
-          message: "AlphaKiller sends a normalized PNG to BRIA and applies the returned alpha matte to the cleanup pipeline."
+          title: `${model.providerName || "Remote"} API background removal`,
+          message: `AlphaKiller sends a normalized PNG to ${model.providerName || "the selected provider"} and applies the returned matte to the cleanup pipeline.`
         });
       } else {
         setToast({
@@ -662,11 +674,12 @@ export function App() {
       }
     }
 
-    if (bgRemoveModel === "bria-api") {
-      runBriaApiBackgroundRemoval({
+    if (model.remote) {
+      runRemoteApiBackgroundRemoval({
         requestId,
         imageData: inputImageData,
-        visibleBefore: originalImageData
+        visibleBefore: originalImageData,
+        provider: bgRemoveModel
       });
       return;
     }
@@ -683,9 +696,11 @@ export function App() {
     });
   }
 
-  async function runBriaApiBackgroundRemoval(job) {
+  async function runRemoteApiBackgroundRemoval(job) {
     const id = ++bgRemoveJobIdRef.current;
-    activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData, modelId: "bria-api" };
+    const providerModel = BG_REMOVE_MODELS[job.provider];
+    const providerName = providerModel?.providerName || "Remote provider";
+    activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData, modelId: job.provider };
     setBgRemoveStatus("inferring");
     setBgRemoveProgress(0.08);
     setBgRemoveDevice("api");
@@ -705,10 +720,12 @@ export function App() {
       setBgRemoveProgress(0.28);
 
       const result = await window.alphaKiller.removeBackground({
-        provider: "bria-api",
+        provider: job.provider,
         pngBytes,
-        preserveAlpha: briaPreserveAlpha,
-        apiToken: loadStoredBriaToken()
+        preserveAlpha: job.provider === "bria-api" ? briaPreserveAlpha : false,
+        apiToken: job.provider === "photoroom-api"
+          ? loadStoredPhotoroomToken()
+          : loadStoredBriaToken()
       });
       if (!isActiveBgRemoveJob(id, job.requestId)) return;
       setBgRemoveProgress(0.82);
@@ -744,13 +761,13 @@ export function App() {
       setToast({
         type: "success",
         title: "Background removed",
-        message: `BRIA sent ${job.imageData.width} x ${job.imageData.height} (${formatBytes(pngBytes.byteLength)}) and returned ${resultWidth} x ${resultHeight} in ${((result.durationMs || 0) / 1000).toFixed(1)}s${result.requestId ? ` (request ${result.requestId})` : ""}.`
+        message: `${providerName} sent ${job.imageData.width} x ${job.imageData.height} (${formatBytes(pngBytes.byteLength)}) and returned ${resultWidth} x ${resultHeight} in ${((result.durationMs || 0) / 1000).toFixed(1)}s${result.requestId ? ` (request ${result.requestId})` : ""}.`
       });
     } catch (error) {
       if (!isActiveBgRemoveJob(id, job.requestId)) return;
       clearBgRemoveTimeout();
       activeBgRemoveJobRef.current = null;
-      finishBgRemoveError(error?.message || "BRIA API background removal failed.");
+      finishBgRemoveError(error?.message || `${providerName} API background removal failed.`);
     }
   }
 
@@ -964,7 +981,7 @@ export function App() {
     persistLocalStorage(BRIA_PRESERVE_ALPHA_KEY, value ? "true" : "false");
   }
 
-  function saveSettingsToken(token) {
+  function saveBriaSettingsToken(token) {
     const clean = sanitizeToken(token);
     if (clean) {
       persistLocalStorage(BRIA_TOKEN_KEY, clean);
@@ -972,6 +989,17 @@ export function App() {
     } else {
       removeLocalStorage(BRIA_TOKEN_KEY);
       setToast({ type: "success", title: "Token cleared", message: "Stored BRIA API token removed from this browser profile." });
+    }
+  }
+
+  function savePhotoroomSettingsToken(token) {
+    const clean = sanitizeToken(token);
+    if (clean) {
+      persistLocalStorage(PHOTOROOM_TOKEN_KEY, clean);
+      setToast({ type: "success", title: "Key saved", message: "PhotoRoom API key stored for this browser profile." });
+    } else {
+      removeLocalStorage(PHOTOROOM_TOKEN_KEY);
+      setToast({ type: "success", title: "Key cleared", message: "Stored PhotoRoom API key removed from this browser profile." });
     }
   }
 
@@ -2101,11 +2129,13 @@ export function App() {
           refineAvailable={BG_REMOVE_REFINE_AVAILABLE}
           hasWebGpu={hasWebGpu}
           hasElectronBackgroundRemoval={hasElectronBackgroundRemoval}
-          tokenValue={loadStoredBriaToken()}
+          photoroomTokenValue={loadStoredPhotoroomToken()}
+          briaTokenValue={loadStoredBriaToken()}
           onModelChange={updateBgRemoveModel}
           onRefineDefaultChange={updateBgRemoveRefine}
           onBriaPreserveAlphaChange={updateBriaPreserveAlpha}
-          onTokenSave={saveSettingsToken}
+          onPhotoroomTokenSave={savePhotoroomSettingsToken}
+          onBriaTokenSave={saveBriaSettingsToken}
           onClose={() => setSettingsPanelOpen(false)}
         />
       )}
@@ -2656,7 +2686,21 @@ function bgRemoveStageToStatus(stage) {
 function getBgRemoveErrorMessage(message = "") {
   const lower = message.toLowerCase();
   if (lower.includes("no handler registered") || lower.includes("background-removal:run")) {
-    return "Electron needs to be restarted so the background-removal IPC handler is registered. Stop the current dev app and launch it again with BRIA_API_TOKEN set.";
+    return "Electron needs to be restarted so the background-removal IPC handler is registered.";
+  }
+  if (lower.includes("photoroom")) {
+    if (lower.includes("missing photoroom_api_key")) {
+      return "Missing PhotoRoom API key. Add it in Settings or launch Electron with PHOTOROOM_API_KEY set.";
+    }
+    if (lower.includes("key") && (lower.includes("rejected") || lower.includes("access"))) {
+      return "The PhotoRoom API key was rejected. Check the key and the account's API access.";
+    }
+    if (lower.includes("6,000") || lower.includes("36 megapixels")) {
+      return "PhotoRoom supports images up to 6,000 pixels on either side and 36 megapixels.";
+    }
+    if (lower.includes("format") || lower.includes("png")) {
+      return "PhotoRoom rejected the input or output format. AlphaKiller requires a full-resolution PNG response.";
+    }
   }
   if (lower.includes("bria")) {
     if (lower.includes("missing bria_api_token")) {
@@ -2847,6 +2891,14 @@ function loadStoredHfToken() {
 function loadStoredBriaToken() {
   try {
     return sanitizeToken(window.localStorage?.getItem(BRIA_TOKEN_KEY));
+  } catch {
+    return "";
+  }
+}
+
+function loadStoredPhotoroomToken() {
+  try {
+    return sanitizeToken(window.localStorage?.getItem(PHOTOROOM_TOKEN_KEY));
   } catch {
     return "";
   }

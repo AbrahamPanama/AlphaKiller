@@ -10,14 +10,17 @@ export function SettingsPanel({
   refineAvailable,
   hasWebGpu,
   hasElectronBackgroundRemoval,
-  tokenValue,
+  photoroomTokenValue,
+  briaTokenValue,
   onModelChange,
   onRefineDefaultChange,
   onBriaPreserveAlphaChange,
-  onTokenSave,
+  onPhotoroomTokenSave,
+  onBriaTokenSave,
   onClose
 }) {
-  const [tokenDraft, setTokenDraft] = useState(tokenValue || "");
+  const [photoroomTokenDraft, setPhotoroomTokenDraft] = useState(photoroomTokenValue || "");
+  const [briaTokenDraft, setBriaTokenDraft] = useState(briaTokenValue || "");
 
   return (
     <div className="settings-popover" role="dialog" aria-label="Settings">
@@ -30,7 +33,7 @@ export function SettingsPanel({
 
       <section className="settings-section">
         <span className="settings-label">Background model</span>
-        <p className="settings-hint">Use RMBG-1.4 first. BEN2 is the backup. BRIA 2.0 is experimental until its edge quality is proven on AlphaKiller artwork.</p>
+        <p className="settings-hint">PhotoRoom is the new hosted option. Local models and BRIA remain available for comparison.</p>
         <div className="model-options" role="radiogroup" aria-label="Background removal model">
           {Object.entries(models).map(([id, model]) => {
             const modelDisabled = disabled ||
@@ -62,7 +65,7 @@ export function SettingsPanel({
         </div>
       </section>
 
-      <section className="settings-section">
+      {selectedModel === "bria-api" && <section className="settings-section">
         <label className="settings-check">
           <input
             type="checkbox"
@@ -75,7 +78,7 @@ export function SettingsPanel({
             <small>Turn off to let RMBG-2.0 rebuild the alpha instead of keeping source transparency.</small>
           </span>
         </label>
-      </section>
+      </section>}
 
       <section className="settings-section">
         <label className="settings-check">
@@ -93,29 +96,55 @@ export function SettingsPanel({
       </section>
 
       <section className="settings-section">
-        <label className="settings-label" htmlFor="bria-token-input">BRIA API token</label>
-        <p className="settings-hint">Optional local override for Experimental BRIA 2.0. The safer production path is launching Electron with BRIA_API_TOKEN.</p>
-        <div className="token-row">
-          <KeyRound size={14} />
-          <input
-            id="bria-token-input"
-            type="password"
-            value={tokenDraft}
-            onChange={(event) => setTokenDraft(event.target.value)}
-            placeholder="Optional BRIA API token"
-            spellCheck={false}
-          />
-          <button type="button" onClick={() => onTokenSave(tokenDraft)}>
-            Save
-          </button>
-        </div>
-        <button className="text-button" type="button" onClick={() => {
-          setTokenDraft("");
-          onTokenSave("");
-        }}>
-          Clear stored token
-        </button>
+        <span className="settings-label">API credentials</span>
+        <p className="settings-hint">Stored only in this Electron browser profile. Environment variables remain the safer production option.</p>
+        <ApiTokenField
+          id="photoroom-token-input"
+          label="PhotoRoom API key"
+          hint="Used by the PhotoRoom API background-removal provider. Environment variable: PHOTOROOM_API_KEY."
+          value={photoroomTokenDraft}
+          placeholder="PhotoRoom API key"
+          onChange={setPhotoroomTokenDraft}
+          onSave={onPhotoroomTokenSave}
+        />
+        <ApiTokenField
+          id="bria-token-input"
+          label="BRIA API token"
+          hint="Used by BRIA background removal and Super Scale. Environment variable: BRIA_API_TOKEN."
+          value={briaTokenDraft}
+          placeholder="BRIA API token"
+          onChange={setBriaTokenDraft}
+          onSave={onBriaTokenSave}
+        />
       </section>
+    </div>
+  );
+}
+
+function ApiTokenField({ id, label, hint, value, placeholder, onChange, onSave }) {
+  return (
+    <div className="credential-field">
+      <label className="credential-label" htmlFor={id}>{label}</label>
+      <p className="settings-hint">{hint}</p>
+      <div className="token-row">
+        <KeyRound size={14} />
+        <input
+          id={id}
+          type="password"
+          value={value}
+          onChange={(event) => onChange(event.target.value)}
+          placeholder={placeholder}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <button type="button" onClick={() => onSave(value)}>Save</button>
+      </div>
+      <button className="text-button" type="button" onClick={() => {
+        onChange("");
+        onSave("");
+      }}>
+        Clear stored key
+      </button>
     </div>
   );
 }
