@@ -1,8 +1,7 @@
 import { bufferFromPngPayload, readPngDimensions } from "./validateImagePayload.js";
+import { PHOTOROOM_LIMITS } from "./photoroomLimits.js";
 
 const PHOTOROOM_SEGMENT_URL = "https://sdk.photoroom.com/v1/segment";
-const MAX_PHOTOROOM_EDGE = 6000;
-const MAX_PHOTOROOM_PIXELS = 36_000_000;
 
 export async function removeBackgroundWithPhotoroomApi({
   pngBytes,
@@ -20,6 +19,9 @@ export async function removeBackgroundWithPhotoroomApi({
   }
 
   const bytes = bufferFromPngPayload(pngBytes);
+  if (bytes.byteLength > PHOTOROOM_LIMITS.maxBytes) {
+    throw new Error("PhotoRoom supports input files up to 50 MB.");
+  }
   const inputDimensions = readPngDimensions(bytes);
   validatePhotoroomDimensions(inputDimensions);
 
@@ -35,6 +37,7 @@ export async function removeBackgroundWithPhotoroomApi({
     method: "POST",
     signal,
     headers: {
+      Accept: "image/png, application/json",
       "x-api-key": token.trim()
     },
     body: form
@@ -79,9 +82,9 @@ function validatePhotoroomDimensions({ width, height }) {
   if (
     width < 1 ||
     height < 1 ||
-    width > MAX_PHOTOROOM_EDGE ||
-    height > MAX_PHOTOROOM_EDGE ||
-    width * height > MAX_PHOTOROOM_PIXELS
+    width > PHOTOROOM_LIMITS.maxEdge ||
+    height > PHOTOROOM_LIMITS.maxEdge ||
+    width * height > PHOTOROOM_LIMITS.maxPixels
   ) {
     throw new Error(
       "PhotoRoom supports images up to 6,000 pixels on either side and 36 megapixels."
@@ -92,7 +95,9 @@ function validatePhotoroomDimensions({ width, height }) {
 async function getPhotoroomErrorMessage(response) {
   const payload = await readErrorPayload(response);
   const detail = payload?.message || payload?.error || payload?.detail;
-  if (detail) return String(detail);
+  if (detail) {
+    return `PhotoRoom request failed with HTTP ${response.status}: ${String(detail)}`;
+  }
 
   if (response.status === 401 || response.status === 403) {
     return "PhotoRoom API key was rejected or does not have access.";

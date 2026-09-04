@@ -1,6 +1,6 @@
 # AlphaKiller
 
-Current version: **0.1 beta 4** (`0.1.0-beta.4`).
+Current version: **0.1 beta 5** (`0.1.0-beta.5`).
 
 AlphaKiller is an Electron image editor for cleaning transparent-pixel artifacts:
 anti-aliased edges, matte halos, and hidden edge RGB around transparent pixels.
@@ -19,8 +19,9 @@ JPEG, TIFF, PDF, or SVG export, white-ink printing, compositing, or texture use.
   before/after split handle.
 - Delete Pen tool with variable brush size for manually removing unwanted
   pixels.
-- Toolbar trim command that crops transparent padding from the current cleaned
-  alpha.
+- Separate Auto Crop and Crop Tool commands. Auto Crop trims transparent
+  padding from the cleaned alpha; Crop Tool supports free selection plus
+  Original, 1:1, 4:5, 5:4, 3:2, 2:3, 16:9, and 9:16 aspect ratios.
 - Defringe, Edge Finishing, and independent Alpha Threshold controls, including
   a soft transition or true 1-bit cutoff and Rim Color modes: Off, Auto, and
   Solid.
@@ -61,8 +62,12 @@ Releases instead.
 
 ## Import and Export Metadata
 
-AlphaKiller does not scale images during cleanup. Exported PNG, JPEG, TIFF, PDF,
-and SVG files therefore keep the current pixel dimensions. When the imported file contains
+AlphaKiller does not scale the working document during cleanup. For oversized
+images, the app offers a smaller temporary processing copy before PhotoRoom or
+a local background-removal model runs; its returned alpha is mapped back to the
+full-resolution document. Local models also offer a full-size attempt. Exported PNG,
+JPEG, TIFF, PDF, and SVG files therefore keep the current pixel dimensions
+unless the user applies Crop or Super Scale. When the imported file contains
 print-resolution metadata, AlphaKiller preserves that DPI on export:
 
 - PNG `pHYs` metadata is read and written back on PNG export.
@@ -119,13 +124,17 @@ Build a macOS DMG:
 npm run dist:mac
 ```
 
-The default macOS build targets Apple Silicon (`arm64`). Windows compatibility
-is handled separately by `npm run dist:win`, which produces both `x64` and
-`ia32` 32-bit x86 installers. Portable Windows executables are still available
-with `npm run dist:win:portable` for troubleshooting or no-install scenarios.
+The default macOS build targets Apple Silicon (`arm64`) and stays unsigned for
+local development. Version tags such as `v0.1.0-beta.5` run the protected macOS
+release workflow, which requires Apple signing secrets and publishes a signed,
+notarized app inside a DMG on GitHub Releases. Windows compatibility is handled
+separately by `npm run dist:win`, which produces both `x64` and `ia32` 32-bit
+x86 installers. Portable Windows executables are still available with
+`npm run dist:win:portable` for troubleshooting or no-install scenarios.
 
 For macOS-specific development and packaging notes, see
-[`MACOS_DEV_COMPAT.md`](./MACOS_DEV_COMPAT.md).
+[`MACOS_DEV_COMPAT.md`](./MACOS_DEV_COMPAT.md), including the required GitHub
+Actions secrets and release-tag procedure.
 
 Run the core verification suite:
 
@@ -170,7 +179,10 @@ AlphaKiller currently ships four Stage 1 background-removal choices:
   path is too slow for the app watchdog.
 - **PhotoRoom API**: the hosted full-resolution quality option. It runs through
   Electron IPC, uploads a normalized PNG to PhotoRoom, requires a PhotoRoom API
-  key, and rejects responses that change the source pixel dimensions.
+  key, and rejects responses that unexpectedly change the requested pixel
+  dimensions. Images beyond PhotoRoom's 6,000 px, 36 MP, or 50 MB request limit
+  offer a user-approved processing resize; the document dimensions and DPI are
+  preserved while the returned alpha is mapped back to the original pixels.
 - **Experimental (BRIA RMBG-2.0)**: a hosted comparison provider. It runs
   through Electron IPC, uploads the normalized PNG to BRIA, and applies the
   returned alpha matte to AlphaKiller's cleanup pipeline. Current artwork-edge
@@ -271,7 +283,8 @@ npm run benchmark:bg-remove -- --model ben2
 
 ## Known Limitations
 
-- Electron packaging/signing is not configured yet.
+- Local macOS packages and all Windows packages are unsigned; distributable
+  macOS builds are signed and notarized only by the release-tag workflow.
 - BRIA API mode requires Electron and `BRIA_API_TOKEN`.
 - BEN2 Quality mode requires WebGPU. CPU-only users should use Fast mode.
 - BiRefNet_HR and full BiRefNet remain deferred pending browser-compatible ONNX

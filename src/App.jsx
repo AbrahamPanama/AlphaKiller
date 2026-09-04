@@ -19,6 +19,7 @@ import {
   Paintbrush,
   Pipette,
   RefreshCcw,
+  ScanLine,
   Save,
   Scissors,
   Settings,
@@ -67,6 +68,24 @@ import {
 } from "./contourEditing.js";
 import { createContourAnchor, hitTestContour } from "./magneticContour.js";
 import { contourToSvg } from "./vectorTrace.js";
+import { getBgRemoveErrorMessage, getSuperScaleErrorMessage } from "./ipcErrorMessages.js";
+import {
+  CROP_ASPECT_OPTIONS,
+  createInitialCropBounds,
+  fitCropBoundsToAspect,
+  getCropAnchor,
+  hitTestCropBounds,
+  moveCropBounds,
+  normalizeCropBounds,
+  resizeCropFromAnchor,
+  resolveCropAspect
+} from "./cropGeometry.js";
+import {
+  getLocalBgResizePlan,
+  getPhotoroomResizePlan,
+  LOCAL_BG_PROCESSING_LIMITS,
+  PHOTOROOM_LIMITS
+} from "../electron/backgroundRemoval/photoroomLimits.js";
 
 const DEFAULT_SETTINGS = {
   defringe: { enabled: true, matteColor: "#ffffff", strength: 68, radius: 2, tolerance: 180, passes: 1, unmix: false, alphaReach: 220 },
@@ -84,7 +103,7 @@ const DEFAULT_SETTINGS = {
   }
 };
 
-const APP_VERSION_LABEL = "0.1 beta 4";
+const APP_VERSION_LABEL = "0.1 beta 5";
 
 const PRESETS = [
   {
@@ -246,6 +265,7 @@ const BG_REMOVE_LABELS = {
   idle: "",
   downloading: "Downloading background-removal model",
   warming: "Preparing model",
+  preparing: "Preparing image",
   inferring: "Removing background",
   error: "Background removal failed"
 };
@@ -357,6 +377,9 @@ export function App() {
   const [superScaleKeepPrintSize, setSuperScaleKeepPrintSize] = useState(true);
   const [superScaleStatus, setSuperScaleStatus] = useState("idle");
   const [superScaleProgress, setSuperScaleProgress] = useState(0);
+  const [cropBounds, setCropBounds] = useState(null);
+  const [cropAspect, setCropAspect] = useState("free");
+  const [backgroundResizeRequest, setBackgroundResizeRequest] = useState(null);
   const [hasBackgroundRemovedStage, setHasBackgroundRemovedStage] = useState(false);
   const [hasSuperScaleStage, setHasSuperScaleStage] = useState(false);
   const [compareBeforeLayers, setCompareBeforeLayers] = useState(DEFAULT_COMPARE_BEFORE);
@@ -378,7 +401,7 @@ export function App() {
   const [hfTokenDraft, setHfTokenDraft] = useState("");
   const [historyVersion, setHistoryVersion] = useState(0);
 
-  const isBackgroundRemoving = bgRemoveStatus === "downloading" || bgRemoveStatus === "warming" || bgRemoveStatus === "inferring";
+  const isBackgroundRemoving = bgRemoveStatus === "downloading" || bgRemoveStatus === "warming" || bgRemoveStatus === "preparing" || bgRemoveStatus === "inferring";
   const isSuperScaling = superScaleStatus === "running";
   const isSmartBrushing = smartBrushStatus === "running";
   const canUndo = historyVersion >= 0 && historyRef.current.undo.length > 0;
@@ -419,6 +442,9 @@ export function App() {
     : null;
   const selectedContourPoint = selectedContourPath?.points?.[contourSelection?.nodeIndex] || null;
   const canDeleteContourNode = Boolean(selectedContourPath?.points?.length > 3);
+  const normalizedCropBounds = cropBounds && originalImageData
+    ? normalizeCropBounds(cropBounds, originalImageData.width, originalImageData.height)
+    : null;
 
   useEffect(() => {
     const preventBrowserZoomKey = (event) => {
@@ -466,6 +492,9 @@ export function App() {
     setVectorContourStale(false);
     setCompareBeforeLayers(DEFAULT_COMPARE_BEFORE);
     setCompareAfterLayers(DEFAULT_COMPARE_AFTER);
+    setCropBounds(null);
+    setBackgroundResizeRequest(null);
+    setCanvasTool("pan");
     if (isTiffFile(file)) {
       try {
         const { imageData, previewUrl, resolution } = await decodeTiffFile(file);
@@ -1030,9 +1059,19 @@ export function App() {
         return;
       }
 
-      const maskBuffer = message.maskBuffer || message.buffer;
-      const aggressiveMaskBuffer = message.aggressiveMaskBuffer || maskBuffer;
-      const stage1MaskBuffer = message.stage1MaskBuffer || maskBuffer;
+      const requestWidth = message.width || activeJob.requestWidth || activeJob.imageData.width;
+      const requestHeight = message.height || activeJob.requestHeight || activeJob.imageData.height;
+      const [maskBuffer, aggressiveMaskBuffer, stage1MaskBuffer] = resizeMaskChannels(
+        [
+          message.maskBuffer || message.buffer,
+          message.aggressiveMaskBuffer || message.maskBuffer || message.buffer,
+          message.stage1MaskBuffer || message.maskBuffer || message.buffer
+        ],
+        requestWidth,
+        requestHeight,
+        activeJob.imageData.width,
+        activeJob.imageData.height
+      );
       const nextImageData = applyMaskToImage(activeJob.imageData, maskBuffer);
       const aggressiveImageData = applyMaskToImage(activeJob.imageData, aggressiveMaskBuffer);
       const stage1ImageData = applyMaskToImage(activeJob.imageData, stage1MaskBuffer);
@@ -1058,6 +1097,9 @@ export function App() {
       const usedStructureLock = message.stagesRun?.includes("structure");
       const usedEdgeRefinement = message.stagesRun?.includes("stage2");
       const warning = message.warnings?.find(Boolean);
+      const processingCopySummary = activeJob.resizePlan
+        ? ` A ${requestWidth} x ${requestHeight} processing copy was mapped back to the ${activeJob.imageData.width} x ${activeJob.imageData.height} document.`
+        : "";
       const refinementSummary = usedStructureLock
         ? " with SAM 3 structure lock and edge refinement"
         : usedEdgeRefinement
@@ -1066,7 +1108,7 @@ export function App() {
       setToast({
         type: warning ? "warning" : "success",
         title: warning ? "Background removed with fallback" : "Background removed",
-        message: `${completedModelLabel} mask applied in ${(message.durationMs / 1000).toFixed(1)}s${message.device === "cpu" ? " using CPU" : ""}${refinementSummary}.${warning ? ` ${warning}` : ""}`
+        message: `${completedModelLabel} mask applied in ${(message.durationMs / 1000).toFixed(1)}s${message.device === "cpu" ? " using CPU" : ""}${refinementSummary}.${processingCopySummary}${warning ? ` ${warning}` : ""}`
       });
     };
 
@@ -1086,19 +1128,25 @@ export function App() {
   }
 
   function startBgRemoveJob(job) {
+    const requestImageData = job.resizePlan
+      ? resizeImageDataForComparison(job.imageData, job.resizePlan.width, job.resizePlan.height)
+      : job.imageData;
     const worker = ensureBgRemoveWorker();
     const id = ++bgRemoveJobIdRef.current;
     activeBgRemoveJobRef.current = {
       id,
       requestId: job.requestId,
       imageData: job.imageData,
+      requestWidth: requestImageData.width,
+      requestHeight: requestImageData.height,
+      resizePlan: job.resizePlan || null,
       modelId: job.modelId,
       visibleBefore: job.visibleBefore
     };
     setBgRemoveStatus("warming");
     setBgRemoveProgress(0);
     setBgRemoveDevice(null);
-    setStatus("Preparing model");
+    setStatus(job.resizePlan ? "Preparing resized processing copy" : "Preparing model");
 
     clearBgRemoveTimeout();
     bgRemoveTimeoutRef.current = window.setTimeout(() => {
@@ -1112,13 +1160,13 @@ export function App() {
       finishBgRemoveError("Background removal took too long. Try a smaller image.");
     }, BG_REMOVE_TIMEOUT_MS);
 
-    const buffer = new Uint8ClampedArray(job.imageData.data).buffer;
+    const buffer = new Uint8ClampedArray(requestImageData.data).buffer;
     worker.postMessage({
       type: "run",
       id,
       buffer,
-      width: job.imageData.width,
-      height: job.imageData.height,
+      width: requestImageData.width,
+      height: requestImageData.height,
       options: {
         tta: true,
         refine: job.refine && BG_REMOVE_REFINE_AVAILABLE,
@@ -1177,23 +1225,123 @@ export function App() {
       return;
     }
 
-    const hfToken = await getHuggingFaceToken();
-    if (requestId !== latestBgRemoveRequestRef.current) return;
-    startBgRemoveJob({
+    const localJob = {
       requestId,
       imageData: inputImageData,
       visibleBefore: originalImageData,
       refine: bgRemoveRefine,
       modelId: bgRemoveModel,
-      safeguards: bgRemoveSafeguards,
-      hfToken
-    });
+      safeguards: bgRemoveSafeguards
+    };
+    const resizePlan = getLocalBgResizePlan(inputImageData.width, inputImageData.height);
+    if (resizePlan) {
+      setBackgroundResizeRequest({
+        kind: "local",
+        job: localJob,
+        plan: resizePlan,
+        limits: LOCAL_BG_PROCESSING_LIMITS,
+        modelLabel: model.shortLabel || model.label,
+        canRunFullSize: true
+      });
+      setStatus("Choose background-removal size");
+      return;
+    }
+
+    await startLocalBgRemoveJob(localJob);
+  }
+
+  async function startLocalBgRemoveJob(job) {
+    const hfToken = await getHuggingFaceToken();
+    if (job.requestId !== latestBgRemoveRequestRef.current) return;
+    startBgRemoveJob({ ...job, hfToken });
   }
 
   async function runRemoteApiBackgroundRemoval(job) {
-    const id = ++bgRemoveJobIdRef.current;
     const providerModel = BG_REMOVE_MODELS[job.provider];
     const providerName = providerModel?.providerName || "Remote provider";
+    let requestImageData = job.imageData;
+    let pngBytes;
+
+    try {
+      if (job.provider === "photoroom-api" && !job.resizePlan) {
+        const dimensionPlan = getPhotoroomResizePlan(job.imageData.width, job.imageData.height);
+        if (dimensionPlan) {
+          setBackgroundResizeRequest({
+            kind: "remote",
+            job,
+            plan: dimensionPlan,
+            limits: PHOTOROOM_LIMITS,
+            modelLabel: providerName,
+            canRunFullSize: false
+          });
+          setStatus("PhotoRoom processing resize required");
+          return;
+        }
+      }
+
+      setBgRemoveStatus("preparing");
+      setBgRemoveProgress(0.04);
+      setBgRemoveDevice("api");
+      setStatus(job.resizePlan ? "Preparing resized PhotoRoom copy" : "Preparing background removal");
+      await new Promise((resolve) => window.requestAnimationFrame(resolve));
+      if (job.requestId !== latestBgRemoveRequestRef.current) return;
+
+      if (job.provider === "photoroom-api" && job.resizePlan) {
+        requestImageData = resizeImageDataForComparison(
+          job.imageData,
+          job.resizePlan.width,
+          job.resizePlan.height
+        );
+      }
+
+      pngBytes = await imageDataToPngArrayBuffer(requestImageData);
+      if (job.requestId !== latestBgRemoveRequestRef.current) return;
+
+      if (job.provider === "photoroom-api") {
+        const encodedPlan = getPhotoroomResizePlan(
+          requestImageData.width,
+          requestImageData.height,
+          pngBytes.byteLength
+        );
+        if (encodedPlan) {
+          const combinedPlan = {
+            width: encodedPlan.width,
+            height: encodedPlan.height,
+            scale: encodedPlan.width / job.imageData.width,
+            reasons: [...new Set([...(job.resizePlan?.reasons || []), ...encodedPlan.reasons])]
+          };
+          if (!job.resizePlan) {
+            setBgRemoveStatus("idle");
+            setBgRemoveProgress(0);
+            setBgRemoveDevice(null);
+            setBackgroundResizeRequest({
+              kind: "remote",
+              job,
+              plan: combinedPlan,
+              limits: PHOTOROOM_LIMITS,
+              modelLabel: providerName,
+              canRunFullSize: false,
+              encodedBytes: pngBytes.byteLength
+            });
+            setStatus("PhotoRoom processing resize required");
+            return;
+          }
+
+          requestImageData = resizeImageDataForComparison(
+            job.imageData,
+            combinedPlan.width,
+            combinedPlan.height
+          );
+          pngBytes = await imageDataToPngArrayBuffer(requestImageData);
+          if (job.requestId !== latestBgRemoveRequestRef.current) return;
+        }
+      }
+    } catch (error) {
+      finishBgRemoveError(error?.message || `Could not prepare the ${providerName} request.`);
+      return;
+    }
+
+    const id = ++bgRemoveJobIdRef.current;
     activeBgRemoveJobRef.current = { id, requestId: job.requestId, imageData: job.imageData, modelId: job.provider };
     setBgRemoveStatus("inferring");
     setBgRemoveProgress(0.08);
@@ -1209,8 +1357,6 @@ export function App() {
     }, BG_REMOVE_TIMEOUT_MS);
 
     try {
-      const pngBytes = await imageDataToPngArrayBuffer(job.imageData);
-      if (!isActiveBgRemoveJob(id, job.requestId)) return;
       setBgRemoveProgress(0.28);
 
       const result = await window.alphaKiller.removeBackground({
@@ -1224,8 +1370,11 @@ export function App() {
       if (!isActiveBgRemoveJob(id, job.requestId)) return;
       setBgRemoveProgress(0.82);
 
-      const nextImageData = await pngArrayBufferToImageData(result.pngBytes);
+      const apiImageData = await pngArrayBufferToImageData(result.pngBytes);
       if (!isActiveBgRemoveJob(id, job.requestId)) return;
+      const nextImageData = job.resizePlan
+        ? applyResizedAlphaMask(job.imageData, apiImageData)
+        : apiImageData;
 
       clearBgRemoveTimeout();
       activeBgRemoveJobRef.current = null;
@@ -1252,13 +1401,17 @@ export function App() {
       setBgRemoveStatus("idle");
       setBgRemoveProgress(0);
       setBgRemoveDevice("api");
-      const resultWidth = result.width || nextImageData.width;
-      const resultHeight = result.height || nextImageData.height;
-      setStatus(`Background removed (${job.imageData.width} x ${job.imageData.height} -> ${resultWidth} x ${resultHeight})`);
+      const resultWidth = result.width || apiImageData.width;
+      const resultHeight = result.height || apiImageData.height;
+      setStatus(job.resizePlan
+        ? `Background removed (${resultWidth} x ${resultHeight} processing copy, ${nextImageData.width} x ${nextImageData.height} document)`
+        : `Background removed (${job.imageData.width} x ${job.imageData.height} -> ${resultWidth} x ${resultHeight})`);
       setToast({
         type: "success",
         title: "Background removed",
-        message: `${providerName} sent ${job.imageData.width} x ${job.imageData.height} (${formatBytes(pngBytes.byteLength)}) and returned ${resultWidth} x ${resultHeight} in ${((result.durationMs || 0) / 1000).toFixed(1)}s${result.requestId ? ` (request ${result.requestId})` : ""}.`
+        message: job.resizePlan
+          ? `${providerName} used a ${requestImageData.width} x ${requestImageData.height} processing copy and mapped its alpha back to the original ${nextImageData.width} x ${nextImageData.height} pixels in ${((result.durationMs || 0) / 1000).toFixed(1)}s.`
+          : `${providerName} sent ${job.imageData.width} x ${job.imageData.height} (${formatBytes(pngBytes.byteLength)}) and returned ${resultWidth} x ${resultHeight} in ${((result.durationMs || 0) / 1000).toFixed(1)}s${result.requestId ? ` (request ${result.requestId})` : ""}.`
       });
     } catch (error) {
       if (!isActiveBgRemoveJob(id, job.requestId)) return;
@@ -1266,6 +1419,26 @@ export function App() {
       activeBgRemoveJobRef.current = null;
       finishBgRemoveError(error?.message || `${providerName} API background removal failed.`);
     }
+  }
+
+  async function continueBackgroundResize(useResize = true) {
+    const pending = backgroundResizeRequest;
+    if (!pending) return;
+    setBackgroundResizeRequest(null);
+    if (pending.kind === "remote") {
+      runRemoteApiBackgroundRemoval({ ...pending.job, resizePlan: pending.plan });
+      return;
+    }
+    await startLocalBgRemoveJob({
+      ...pending.job,
+      resizePlan: useResize ? pending.plan : null
+    });
+  }
+
+  function cancelBackgroundResize() {
+    latestBgRemoveRequestRef.current += 1;
+    setBackgroundResizeRequest(null);
+    setStatus("Ready");
   }
 
   async function runBriaSuperScale() {
@@ -1390,6 +1563,54 @@ export function App() {
     ref.current = cropImageDataToBounds(imageData, bounds);
   }
 
+  function cropDocumentToBounds(rawBounds, {
+    statusText = "Image cropped",
+    title = "Crop complete",
+    message = null
+  } = {}) {
+    if (!originalImageData) return false;
+    const sourceWidth = originalImageData.width;
+    const sourceHeight = originalImageData.height;
+    const bounds = normalizeCropBounds(rawBounds, sourceWidth, sourceHeight);
+
+    if (bounds.x === 0 && bounds.y === 0 && bounds.width === sourceWidth && bounds.height === sourceHeight) {
+      setToast({
+        type: "info",
+        title: "Full image selected",
+        message: "The crop already includes every pixel in the document."
+      });
+      return false;
+    }
+
+    const nextImageData = cropImageDataToBounds(originalImageData, bounds);
+    commitDocumentImageEdit(nextImageData, { statusText });
+    cropRefToBounds(importedOriginalImageRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(preSegmentationOriginalRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(backgroundRemovedImageRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(backgroundStage1ImageRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(backgroundAggressiveImageRef, bounds, sourceWidth, sourceHeight);
+    refreshProcessingSegmentationStages();
+    cropRefToBounds(preSuperScaleOriginalRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(preSuperScaleProcessedRef, bounds, sourceWidth, sourceHeight);
+    cropRefToBounds(superScaledImageRef, bounds, sourceWidth, sourceHeight);
+
+    interactionRef.current = null;
+    setCropBounds(null);
+    setCanvasTool("pan");
+    setCanvasMode("idle");
+    setPan({ x: 0, y: 0 });
+    setVectorContour(null);
+    setVectorContourStale(false);
+    setContourSelection(null);
+    setMagneticAnchor(null);
+    setToast({
+      type: "success",
+      title,
+      message: message || `Cropped to ${bounds.width} x ${bounds.height}. DPI metadata was preserved.`
+    });
+    return true;
+  }
+
   function trimTransparentPadding() {
     if (!originalImageData || !processedImageData) return;
 
@@ -1412,30 +1633,56 @@ export function App() {
       return;
     }
 
-    const sourceWidth = originalImageData.width;
-    const sourceHeight = originalImageData.height;
-    const nextImageData = cropImageDataToBounds(originalImageData, bounds);
-
-    commitDocumentImageEdit(nextImageData, {
-      statusText: "Transparent padding trimmed"
+    cropDocumentToBounds(bounds, {
+      statusText: "Transparent padding auto-cropped",
+      title: "Auto Crop complete",
+      message: `Transparent padding was trimmed to ${bounds.width} x ${bounds.height}. DPI metadata was preserved.`
     });
-    cropRefToBounds(importedOriginalImageRef, bounds, sourceWidth, sourceHeight);
-    cropRefToBounds(preSegmentationOriginalRef, bounds, sourceWidth, sourceHeight);
-    cropRefToBounds(backgroundRemovedImageRef, bounds, sourceWidth, sourceHeight);
-    cropRefToBounds(backgroundStage1ImageRef, bounds, sourceWidth, sourceHeight);
-    cropRefToBounds(backgroundAggressiveImageRef, bounds, sourceWidth, sourceHeight);
-    refreshProcessingSegmentationStages();
-    cropRefToBounds(preSuperScaleOriginalRef, bounds, sourceWidth, sourceHeight);
-    cropRefToBounds(preSuperScaleProcessedRef, bounds, sourceWidth, sourceHeight);
-    cropRefToBounds(superScaledImageRef, bounds, sourceWidth, sourceHeight);
+  }
 
-    setPan({ x: 0, y: 0 });
-    setVectorContour(null);
-    setVectorContourStale(true);
-    setToast({
-      type: "success",
-      title: "Trim complete",
-      message: `Trimmed to ${bounds.width} x ${bounds.height} from the current cleaned alpha.`
+  function beginCropTool() {
+    if (!originalImageData) return;
+    if (canvasTool === "crop") {
+      cancelManualCrop();
+      return;
+    }
+    const nextBounds = createInitialCropBounds(
+      originalImageData.width,
+      originalImageData.height,
+      cropAspect
+    );
+    setCropBounds(nextBounds);
+    setCanvasTool("crop");
+    setCanvasMode("idle");
+    setStatus("Adjust crop area");
+  }
+
+  function updateCropAspect(aspectId) {
+    if (!originalImageData) return;
+    setCropAspect(aspectId);
+    const ratio = resolveCropAspect(aspectId, originalImageData.width, originalImageData.height);
+    setCropBounds((current) => {
+      const bounds = current || createInitialCropBounds(originalImageData.width, originalImageData.height);
+      return ratio
+        ? fitCropBoundsToAspect(bounds, ratio, originalImageData.width, originalImageData.height)
+        : bounds;
+    });
+    setStatus(aspectId === "free" ? "Free crop" : `${aspectId === "original" ? "Original" : aspectId} crop ratio`);
+  }
+
+  function cancelManualCrop() {
+    interactionRef.current = null;
+    setCropBounds(null);
+    setCanvasTool("pan");
+    setCanvasMode("idle");
+    setStatus("Crop canceled");
+  }
+
+  function applyManualCrop() {
+    if (!cropBounds) return;
+    cropDocumentToBounds(cropBounds, {
+      statusText: "Image cropped",
+      title: "Crop complete"
     });
   }
 
@@ -1919,6 +2166,29 @@ export function App() {
   }, [canvasTool, canReconstruct, hasCurrentVectorContour]);
 
   useEffect(() => {
+    if (canvasTool !== "crop" && cropBounds) {
+      setCropBounds(null);
+    }
+  }, [canvasTool, cropBounds]);
+
+  useEffect(() => {
+    if (canvasTool !== "crop" || !cropBounds) return;
+    const onCropKeyDown = (event) => {
+      const target = event.target;
+      if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        cancelManualCrop();
+      } else if (event.key === "Enter") {
+        event.preventDefault();
+        applyManualCrop();
+      }
+    };
+    window.addEventListener("keydown", onCropKeyDown);
+    return () => window.removeEventListener("keydown", onCropKeyDown);
+  }, [canvasTool, cropBounds]);
+
+  useEffect(() => {
     if (canvasTool !== "contour-edit" || !contourSelection || !hasCurrentVectorContour) return;
     const onContourKeyDown = (event) => {
       const target = event.target;
@@ -2056,6 +2326,10 @@ export function App() {
       }
     }
 
+    if (canvasTool === "crop" && cropBounds) {
+      drawCropOverlay(ctx, cropBounds, frame, zoom);
+    }
+
     const brushPoint = brushPointRef.current;
     if (isBrushTool && brushPoint) {
       drawBrushCursor(
@@ -2067,7 +2341,7 @@ export function App() {
         canvasTool
       );
     }
-  }, [source, originalImageData, processedImageData, compareMode, compareBeforeLayers, compareAfterLayers, split, zoom, pan, background, customBackground, canvasTool, brushSize, canvasMode, isBrushTool, hasSuperScaleStage, contourOptions, vectorContour, vectorContourStale, hasCurrentVectorContour, contourSelection, magneticAnchor]);
+  }, [source, originalImageData, processedImageData, compareMode, compareBeforeLayers, compareAfterLayers, split, zoom, pan, background, customBackground, canvasTool, brushSize, canvasMode, isBrushTool, hasSuperScaleStage, contourOptions, vectorContour, vectorContourStale, hasCurrentVectorContour, contourSelection, magneticAnchor, cropBounds]);
 
   useEffect(() => {
     renderCanvasRef.current = renderCanvas;
@@ -2450,6 +2724,39 @@ export function App() {
     const rect = canvasRef.current.getBoundingClientRect();
     const point = getCanvasPoint(event, canvasRef.current);
     const frame = getImageFrame(source, zoom, pan, rect.width, rect.height);
+    if (canvasTool === "crop" && cropBounds && event.button === 0) {
+      const rawImagePoint = getContourImagePoint(point, frame, zoom);
+      if (!rawImagePoint) return;
+      const imagePoint = {
+        x: clamp(rawImagePoint.x, 0, originalImageData.width),
+        y: clamp(rawImagePoint.y, 0, originalImageData.height)
+      };
+      const handle = hitTestCropBounds(cropBounds, imagePoint, Math.max(2, 12 / Math.max(zoom, 0.001)));
+      const startBounds = handle === "new"
+        ? { x: imagePoint.x, y: imagePoint.y, width: 1, height: 1 }
+        : { ...cropBounds };
+      const anchor = handle === "new"
+        ? imagePoint
+        : getCropAnchor(cropBounds, handle, imagePoint);
+      interactionRef.current = {
+        kind: "crop",
+        handle,
+        pointerId: event.pointerId,
+        frame,
+        anchor,
+        startImagePoint: imagePoint,
+        startBounds,
+        ratio: resolveCropAspect(cropAspect, originalImageData.width, originalImageData.height),
+        width: originalImageData.width,
+        height: originalImageData.height
+      };
+      if (handle === "new") setCropBounds(startBounds);
+      canvasRef.current.setPointerCapture(event.pointerId);
+      setCanvasMode(handle === "move" ? "crop-move" : "crop-resize");
+      setStatus(handle === "move" ? "Moving crop area" : "Resizing crop area");
+      event.preventDefault();
+      return;
+    }
     if (canvasTool === "contour-edit" && event.button === 0) {
       const imagePoint = getContourImagePoint(point, frame, zoom);
       if (!imagePoint) return;
@@ -2548,6 +2855,33 @@ export function App() {
     const point = getCanvasPoint(event, canvasRef.current);
     const interaction = interactionRef.current;
 
+    if (interaction?.kind === "crop") {
+      const imagePoint = {
+        x: clamp((point.x - interaction.frame.x) / zoom, 0, interaction.width),
+        y: clamp((point.y - interaction.frame.y) / zoom, 0, interaction.height)
+      };
+      const nextBounds = interaction.handle === "move"
+        ? moveCropBounds(
+            interaction.startBounds,
+            imagePoint.x - interaction.startImagePoint.x,
+            imagePoint.y - interaction.startImagePoint.y,
+            interaction.width,
+            interaction.height
+          )
+        : resizeCropFromAnchor(
+            interaction.anchor,
+            imagePoint,
+            interaction.ratio,
+            interaction.width,
+            interaction.height
+          );
+      setCropBounds(nextBounds);
+      const normalized = normalizeCropBounds(nextBounds, interaction.width, interaction.height);
+      setStatus(`Crop ${normalized.width} x ${normalized.height}`);
+      scheduleCanvasRender();
+      return;
+    }
+
     if (interaction?.kind === "contour-node" || interaction?.kind === "contour-handle") {
       const imagePoint = getContourImagePoint(point, interaction.frame, zoom);
       if (!imagePoint) return;
@@ -2617,7 +2951,9 @@ export function App() {
     if (interactionRef.current && canvasRef.current?.hasPointerCapture?.(event.pointerId)) {
       canvasRef.current.releasePointerCapture(event.pointerId);
     }
-    if (interaction?.kind === "contour-node" || interaction?.kind === "contour-handle") {
+    if (interaction?.kind === "crop") {
+      setStatus("Adjust crop area");
+    } else if (interaction?.kind === "contour-node" || interaction?.kind === "contour-handle") {
       if (interaction.changed) {
         pushContourUndoSnapshot(interaction.undoContour, interaction.undoSelection);
         setStatus(interaction.kind === "contour-node" ? "Contour node moved" : "Curve handle moved");
@@ -2781,10 +3117,19 @@ export function App() {
         </button>
         <button
           className="icon-button"
-          title="Trim transparent padding"
-          aria-label="Trim transparent padding"
+          title="Auto Crop: trim transparent padding"
+          aria-label="Auto Crop transparent padding"
           disabled={!processedImageData || isBackgroundRemoving || isSuperScaling || isSmartBrushing}
           onClick={trimTransparentPadding}
+        >
+          <ScanLine size={16} />
+        </button>
+        <button
+          className={`icon-button ${canvasTool === "crop" ? "active" : ""}`}
+          title="Crop Tool"
+          aria-label="Crop Tool"
+          disabled={!processedImageData || isBackgroundRemoving || isSuperScaling || isSmartBrushing}
+          onClick={beginCropTool}
         >
           <Crop size={16} />
         </button>
@@ -2902,7 +3247,7 @@ export function App() {
           </div>
         </aside>
 
-        <section className={`canvas-shell ${source ? "has-image" : ""} ${canvasTool === "delete" ? "is-eraser" : ""} ${canvasTool === "restore" ? "is-reconstruct" : ""} ${canvasTool === "contour-edit" ? "is-contour-edit" : ""} ${canvasTool === "contour-repair" ? "is-contour-repair" : ""} ${canvasMode === "pan" ? "is-panning" : ""} ${canvasMode === "split" ? "is-splitting" : ""} ${canvasMode === "delete" ? "is-deleting" : ""} ${canvasMode === "restore" ? "is-restoring" : ""} ${canvasMode === "contour-node" || canvasMode === "contour-handle" ? "is-contour-dragging" : ""} ${canvasMode === "hover-split" ? "can-split" : ""}`}>
+        <section className={`canvas-shell ${source ? "has-image" : ""} ${canvasTool === "delete" ? "is-eraser" : ""} ${canvasTool === "restore" ? "is-reconstruct" : ""} ${canvasTool === "crop" ? "is-crop" : ""} ${canvasTool === "contour-edit" ? "is-contour-edit" : ""} ${canvasTool === "contour-repair" ? "is-contour-repair" : ""} ${canvasMode === "pan" ? "is-panning" : ""} ${canvasMode === "split" ? "is-splitting" : ""} ${canvasMode === "delete" ? "is-deleting" : ""} ${canvasMode === "restore" ? "is-restoring" : ""} ${canvasMode === "crop-move" ? "is-crop-moving" : ""} ${canvasMode === "contour-node" || canvasMode === "contour-handle" ? "is-contour-dragging" : ""} ${canvasMode === "hover-split" ? "can-split" : ""}`}>
           {isBackgroundRemoving && (
             <div className="bg-remove-progress">
               <span>{BG_REMOVE_LABELS[bgRemoveStatus]}</span>
@@ -2960,6 +3305,26 @@ export function App() {
               />
             </div>
           </div>
+          {canvasTool === "crop" && normalizedCropBounds && (
+            <div className="crop-toolbar" role="toolbar" aria-label="Crop options">
+              <label>
+                <span>Aspect</span>
+                <select value={cropAspect} onChange={(event) => updateCropAspect(event.target.value)}>
+                  {CROP_ASPECT_OPTIONS.map((option) => (
+                    <option key={option.id} value={option.id}>{option.label}</option>
+                  ))}
+                </select>
+              </label>
+              <output>{normalizedCropBounds.width} x {normalizedCropBounds.height}</output>
+              <button className="icon-button" type="button" title="Cancel crop" aria-label="Cancel crop" onClick={cancelManualCrop}>
+                <X size={15} />
+              </button>
+              <button className="primary-button crop-apply" type="button" onClick={applyManualCrop}>
+                <Check size={14} />
+                Apply
+              </button>
+            </div>
+          )}
           <canvas
             ref={canvasRef}
             onWheel={onCanvasWheel}
@@ -3157,7 +3522,7 @@ export function App() {
         <span>Zoom {Math.round(zoom * 100)}%</span>
         <span>{source ? `${source.width} x ${source.height}` : "No image"}</span>
         <span>{cursor ? `Alpha ${cursor.a}` : "Alpha -"}</span>
-        <span>{canvasTool === "delete" ? `Delete Pen ${brushSize}px` : canvasTool === "restore" ? `Reconstruct Pen ${brushSize}px` : canvasTool === "contour-edit" ? "Edit contour nodes" : canvasTool === "contour-repair" ? "Magnetic contour repair" : "Pan tool"}</span>
+        <span>{canvasTool === "delete" ? `Delete Pen ${brushSize}px` : canvasTool === "restore" ? `Reconstruct Pen ${brushSize}px` : canvasTool === "crop" ? "Crop Tool" : canvasTool === "contour-edit" ? "Edit contour nodes" : canvasTool === "contour-repair" ? "Magnetic contour repair" : "Pan tool"}</span>
         <span>{isSuperScaling ? `SS BRIA ${Math.round(superScaleProgress * 100)}%` : isBackgroundRemoving ? `AI ${BG_REMOVE_LABELS[bgRemoveStatus]}${bgRemoveDevice === "cpu" ? " (CPU)" : bgRemoveDevice === "api" ? " (API)" : ""}` : `AI ${BG_REMOVE_MODELS[bgRemoveModel]?.shortLabel || "-"}`}</span>
         <span>Bg {background}</span>
       </footer>
@@ -3254,6 +3619,58 @@ export function App() {
               <button type="submit" className="primary-button" disabled={!source || isSuperScaling || !hasElectronSuperScale}>Run BRIA Super Scale</button>
             </div>
           </form>
+        </div>
+      )}
+
+      {backgroundResizeRequest && (
+        <div className="modal-backdrop" role="presentation">
+          <section className="background-resize-dialog" role="dialog" aria-modal="true" aria-labelledby="background-resize-title">
+            <div className="dialog-title-row">
+              <strong id="background-resize-title">
+                {backgroundResizeRequest.kind === "remote"
+                  ? "Resize PhotoRoom processing copy?"
+                  : "Choose background-removal size"}
+              </strong>
+              <button className="icon-button" type="button" aria-label="Cancel processing resize" onClick={cancelBackgroundResize}>
+                <X size={15} />
+              </button>
+            </div>
+            <p>
+              {backgroundResizeRequest.kind === "remote"
+                ? "This image exceeds PhotoRoom's request limit. AlphaKiller can resize only the copy sent for background removal."
+                : `${backgroundResizeRequest.modelLabel} may run out of memory at this document size. Use a smaller processing copy for a more reliable result, or try the full-resolution image.`}
+            </p>
+            <div className="resize-comparison" aria-label="Background-removal processing dimensions">
+              <div>
+                <span>Document</span>
+                <strong>{backgroundResizeRequest.job.imageData.width} x {backgroundResizeRequest.job.imageData.height}</strong>
+                <small>Unchanged</small>
+              </div>
+              <div>
+                <span>Processing copy</span>
+                <strong>{backgroundResizeRequest.plan.width} x {backgroundResizeRequest.plan.height}</strong>
+                <small>{Math.round(backgroundResizeRequest.plan.scale * 100)}% scale</small>
+              </div>
+            </div>
+            <div className="resize-limit-note">
+              <span>{backgroundResizeRequest.kind === "remote" ? "PhotoRoom limit" : "Recommended local limit"}</span>
+              <strong>
+                {backgroundResizeRequest.limits.maxEdge.toLocaleString()} px / {formatMegapixels(backgroundResizeRequest.limits.maxPixels)}
+                {backgroundResizeRequest.limits.maxBytes ? ` / ${formatBytes(backgroundResizeRequest.limits.maxBytes)}` : ""}
+              </strong>
+              {backgroundResizeRequest.encodedBytes ? (
+                <small>Encoded input: {formatBytes(backgroundResizeRequest.encodedBytes)}</small>
+              ) : null}
+            </div>
+            <p className="dialog-note">The returned alpha is mapped back to the full-resolution document. Crop, pixel dimensions, and DPI stay unchanged.</p>
+            <div className="dialog-actions">
+              <button type="button" onClick={cancelBackgroundResize}>Cancel</button>
+              {backgroundResizeRequest.canRunFullSize ? (
+                <button type="button" onClick={() => continueBackgroundResize(false)}>Try full size</button>
+              ) : null}
+              <button type="button" className="primary-button" onClick={() => continueBackgroundResize(true)}>Resize copy and continue</button>
+            </div>
+          </section>
         </div>
       )}
 
@@ -3634,8 +4051,9 @@ function AboutPage({ version }) {
         <article className="about-panel">
           <h2>Notes</h2>
           <p>
-            This beta is built for local review and iteration. Packaging, signing,
-            batch workflows, and advanced model management are still future work.
+            This beta is built for local review and iteration. Tagged macOS releases
+            are signed and notarized; batch workflows and advanced model management
+            are still future work.
           </p>
         </article>
       </section>
@@ -3826,6 +4244,50 @@ function resizeImageDataForComparison(imageData, width, height) {
   return ctx.getImageData(0, 0, width, height);
 }
 
+function resizeMaskChannels(maskBuffers, sourceWidth, sourceHeight, targetWidth, targetHeight) {
+  const sourcePixels = sourceWidth * sourceHeight;
+  const masks = maskBuffers.map((maskBuffer) => (
+    maskBuffer instanceof Uint8Array ? maskBuffer : new Uint8Array(maskBuffer)
+  ));
+  if (masks.some((mask) => mask.length < sourcePixels)) {
+    throw new Error("A background-removal mask is smaller than its reported dimensions");
+  }
+  if (sourceWidth === targetWidth && sourceHeight === targetHeight) return masks;
+
+  const rgba = new Uint8ClampedArray(sourcePixels * 4);
+  for (let pixel = 0, index = 0; pixel < sourcePixels; pixel += 1, index += 4) {
+    rgba[index] = masks[0][pixel];
+    rgba[index + 1] = masks[1][pixel];
+    rgba[index + 2] = masks[2][pixel];
+    rgba[index + 3] = 255;
+  }
+  const resized = resizeImageDataForComparison(
+    new ImageData(rgba, sourceWidth, sourceHeight),
+    targetWidth,
+    targetHeight
+  );
+  const outputs = masks.map(() => new Uint8Array(targetWidth * targetHeight));
+  for (let pixel = 0, index = 0; pixel < outputs[0].length; pixel += 1, index += 4) {
+    outputs[0][pixel] = resized.data[index];
+    outputs[1][pixel] = resized.data[index + 1];
+    outputs[2][pixel] = resized.data[index + 2];
+  }
+  return outputs;
+}
+
+function applyResizedAlphaMask(sourceImageData, maskImageData) {
+  const scaledMask = maskImageData.width === sourceImageData.width && maskImageData.height === sourceImageData.height
+    ? maskImageData
+    : resizeImageDataForComparison(maskImageData, sourceImageData.width, sourceImageData.height);
+  const output = new Uint8ClampedArray(sourceImageData.data);
+
+  for (let index = 3; index < output.length; index += 4) {
+    output[index] = Math.round((sourceImageData.data[index] * scaledMask.data[index]) / 255);
+  }
+
+  return new ImageData(output, sourceImageData.width, sourceImageData.height);
+}
+
 function drawBadge(ctx, text, x, y) {
   ctx.save();
   ctx.font = "700 10px system-ui";
@@ -3834,6 +4296,52 @@ function drawBadge(ctx, text, x, y) {
   ctx.fill();
   ctx.fillStyle = "rgba(255,255,255,.82)";
   ctx.fillText(text, x + 9, y + 15);
+  ctx.restore();
+}
+
+function drawCropOverlay(ctx, bounds, frame, zoom) {
+  const x = frame.x + bounds.x * zoom;
+  const y = frame.y + bounds.y * zoom;
+  const width = bounds.width * zoom;
+  const height = bounds.height * zoom;
+  const handleSize = 9;
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.rect(frame.x, frame.y, frame.width, frame.height);
+  ctx.rect(x, y, width, height);
+  ctx.fillStyle = "rgba(4, 6, 8, .62)";
+  ctx.fill("evenodd");
+
+  ctx.strokeStyle = "rgba(255, 255, 255, .95)";
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([]);
+  ctx.strokeRect(x, y, width, height);
+
+  ctx.strokeStyle = "rgba(255, 255, 255, .42)";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x + width / 3, y);
+  ctx.lineTo(x + width / 3, y + height);
+  ctx.moveTo(x + (width * 2) / 3, y);
+  ctx.lineTo(x + (width * 2) / 3, y + height);
+  ctx.moveTo(x, y + height / 3);
+  ctx.lineTo(x + width, y + height / 3);
+  ctx.moveTo(x, y + (height * 2) / 3);
+  ctx.lineTo(x + width, y + (height * 2) / 3);
+  ctx.stroke();
+
+  ctx.fillStyle = "#ffffff";
+  ctx.strokeStyle = "rgba(18, 22, 26, .9)";
+  for (const point of [
+    [x, y],
+    [x + width, y],
+    [x + width, y + height],
+    [x, y + height]
+  ]) {
+    ctx.fillRect(point[0] - handleSize / 2, point[1] - handleSize / 2, handleSize, handleSize);
+    ctx.strokeRect(point[0] - handleSize / 2, point[1] - handleSize / 2, handleSize, handleSize);
+  }
   ctx.restore();
 }
 
@@ -4028,6 +4536,11 @@ function formatBytes(bytes) {
   return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+function formatMegapixels(pixels) {
+  const megapixels = Math.max(0, Number(pixels) || 0) / 1_000_000;
+  return `${Number.isInteger(megapixels) ? megapixels : megapixels.toFixed(1)} MP`;
+}
+
 function estimateExportSize(format, imageData, options = {}) {
   const pixels = imageData.width * imageData.height;
   if (format === "jpeg") return pixels * 1.2;
@@ -4070,92 +4583,6 @@ function bgRemoveStageLabel(stage, status) {
   if (stage === "infer-stage2") return "Refining alpha edge";
   if (stage === "compose") return "Composing alpha matte";
   return BG_REMOVE_LABELS[status] || "Removing background";
-}
-
-function getBgRemoveErrorMessage(message = "") {
-  const lower = message.toLowerCase();
-  if (lower.includes("no handler registered") || lower.includes("background-removal:run")) {
-    return "Electron needs to be restarted so the background-removal IPC handler is registered.";
-  }
-  if (lower.includes("photoroom")) {
-    if (lower.includes("missing photoroom_api_key")) {
-      return "Missing PhotoRoom API key. Add it in Settings or launch Electron with PHOTOROOM_API_KEY set.";
-    }
-    if (lower.includes("key") && (lower.includes("rejected") || lower.includes("access"))) {
-      return "The PhotoRoom API key was rejected. Check the key and the account's API access.";
-    }
-    if (lower.includes("6,000") || lower.includes("36 megapixels")) {
-      return "PhotoRoom supports images up to 6,000 pixels on either side and 36 megapixels.";
-    }
-    if (lower.includes("format") || lower.includes("png")) {
-      return "PhotoRoom rejected the input or output format. AlphaKiller requires a full-resolution PNG response.";
-    }
-  }
-  if (lower.includes("bria")) {
-    if (lower.includes("missing bria_api_token")) {
-      return "Missing BRIA_API_TOKEN. Launch the Electron app with BRIA_API_TOKEN set in the main-process environment.";
-    }
-    if (lower.includes("token") || lower.includes("401") || lower.includes("403")) {
-      return "The BRIA API token was rejected. Check BRIA_API_TOKEN and the account's API access.";
-    }
-    if (lower.includes("415") || lower.includes("png")) {
-      return "BRIA rejected the input image format. AlphaKiller expected a normalized PNG upload.";
-    }
-  }
-  if (lower.includes("rate limit") || lower.includes("429")) {
-    return "The background-removal provider is rate limited. Wait a moment and try again.";
-  }
-  if (lower.includes("no hugging face token")) {
-    return "No Hugging Face token is available to AlphaKiller. In Electron, launch with HF_TOKEN set. In the browser preview, set localStorage key alphakiller:hf-token.";
-  }
-  if (lower.includes("token was rejected")) {
-    return "The Hugging Face token was rejected for the background-removal model. Make sure the token was created by the account that has model access and includes read permission.";
-  }
-  if (
-    lower.includes("restricted") ||
-    lower.includes("unauthorized") ||
-    lower.includes("authorization") ||
-    lower.includes("authenticate") ||
-    lower.includes("gated") ||
-    lower.includes("access to model") ||
-    lower.includes("401") ||
-    lower.includes("rmbg-2.0")
-  ) {
-    return "The background-removal model is restricted on Hugging Face. Accept the model license and authenticate before retrying.";
-  }
-  if (lower.includes("fetch") || lower.includes("network") || lower.includes("download")) {
-    return "Could not download the background removal model. Check your connection and try again.";
-  }
-  if (lower.includes("memory") || lower.includes("allocation") || lower.includes("out of")) {
-    return "Image too large for background removal at full resolution.";
-  }
-  if (lower.includes("corrupt") || lower.includes("invalid model")) {
-    return "The cached background removal model appears to be invalid. Try clearing the app cache and retrying.";
-  }
-  return message || "Background removal failed.";
-}
-
-function getSuperScaleErrorMessage(message = "") {
-  const lower = String(message || "").toLowerCase();
-  if (lower.includes("no handler registered") || lower.includes("super-scale:run")) {
-    return "Electron needs to be restarted so the Super Scale IPC handler is registered.";
-  }
-  if (lower.includes("missing bria")) {
-    return "Missing BRIA_API_TOKEN. Add a BRIA token in Settings or launch Electron with BRIA_API_TOKEN set.";
-  }
-  if (lower.includes("401") || lower.includes("403") || lower.includes("token")) {
-    return "The BRIA API token was rejected. Check the token and account access.";
-  }
-  if (lower.includes("8192")) {
-    return "BRIA Super Scale supports output up to 8192 x 8192 pixels. Try 2x or start from a smaller image.";
-  }
-  if (lower.includes("rate limit") || lower.includes("429")) {
-    return "The BRIA API is rate limited. Wait a moment and try again.";
-  }
-  if (lower.includes("format") || lower.includes("415")) {
-    return "BRIA rejected the input image format. AlphaKiller expected a normalized PNG upload.";
-  }
-  return message || "Super Scale failed.";
 }
 
 async function getHuggingFaceToken() {

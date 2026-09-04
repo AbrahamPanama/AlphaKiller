@@ -56,9 +56,117 @@ const {
 const {
   removeBackgroundWithPhotoroomApi
 } = await import("../electron/backgroundRemoval/photoroomApiProvider.js");
+const {
+  getBgRemoveErrorMessage,
+  getSuperScaleErrorMessage,
+  unwrapElectronIpcError
+} = await import("../src/ipcErrorMessages.js");
+const {
+  createInitialCropBounds,
+  fitCropBoundsToAspect,
+  getCropAnchor,
+  hitTestCropBounds,
+  moveCropBounds,
+  normalizeCropBounds,
+  resizeCropFromAnchor,
+  resolveCropAspect
+} = await import("../src/cropGeometry.js");
+const {
+  getLocalBgResizePlan,
+  getPhotoroomResizePlan,
+  LOCAL_BG_PROCESSING_LIMITS,
+  PHOTOROOM_LIMITS
+} = await import("../electron/backgroundRemoval/photoroomLimits.js");
 
 function makeImageData(width, height, pixels) {
   return new ImageData(new Uint8ClampedArray(pixels), width, height);
+}
+
+function testElectronIpcErrorMessagesPreserveProviderFailures() {
+  const rejected = "Error invoking remote method 'background-removal:run': Error: photoroom-api: PhotoRoom API key was rejected or does not have access.";
+  assert.equal(
+    getBgRemoveErrorMessage(rejected),
+    "The PhotoRoom API key was rejected. Check the key and the account's API access."
+  );
+
+  const quota = "Error invoking remote method 'background-removal:run': Error: photoroom-api: Not enough credits";
+  assert.equal(
+    getBgRemoveErrorMessage(quota),
+    "The PhotoRoom API quota is exhausted or billing is required. Check the PhotoRoom account usage."
+  );
+
+  const missingHandler = "Error invoking remote method 'background-removal:run': Error: No handler registered for 'background-removal:run'";
+  assert.equal(
+    getBgRemoveErrorMessage(missingHandler),
+    "Electron needs to be restarted so the background-removal IPC handler is registered."
+  );
+
+  const invalidPayload = "Error invoking remote method 'background-removal:run': Error: background-removal:run expected pngBytes ArrayBuffer.";
+  assert.equal(
+    getBgRemoveErrorMessage(invalidPayload),
+    "background-removal:run expected pngBytes ArrayBuffer."
+  );
+
+  assert.equal(
+    unwrapElectronIpcError("Error invoking remote method 'super-scale:run': Error: BRIA request failed.", "super-scale:run"),
+    "BRIA request failed."
+  );
+  assert.equal(
+    getSuperScaleErrorMessage("Error invoking remote method 'super-scale:run': Error: No handler registered for 'super-scale:run'"),
+    "Electron needs to be restarted so the Super Scale IPC handler is registered."
+  );
+}
+
+function testCropGeometrySupportsFreeAndFixedRatios() {
+  const original = createInitialCropBounds(1000, 500, "original");
+  assert.ok(Math.abs(original.width / original.height - 2) < 0.001);
+
+  const square = fitCropBoundsToAspect({ x: 100, y: 50, width: 600, height: 300 }, 1, 1000, 500);
+  assert.equal(square.width, square.height);
+  assert.equal(hitTestCropBounds(square, { x: square.x, y: square.y }, 1), "nw");
+  assert.equal(hitTestCropBounds(square, { x: square.x + 5, y: square.y + 5 }, 1), "move");
+
+  const anchor = getCropAnchor(square, "se", { x: 0, y: 0 });
+  const resized = resizeCropFromAnchor(anchor, { x: 850, y: 450 }, resolveCropAspect("4:5", 1000, 500), 1000, 500);
+  assert.ok(Math.abs(resized.width / resized.height - 0.8) < 0.001);
+
+  const moved = moveCropBounds({ x: 900, y: 450, width: 100, height: 50 }, 200, 100, 1000, 500);
+  assert.deepEqual(moved, { x: 900, y: 450, width: 100, height: 50 });
+  assert.deepEqual(
+    normalizeCropBounds({ x: 10.2, y: 20.7, width: 100.1, height: 200.2 }, 1000, 500),
+    { x: 10, y: 20, width: 101, height: 201 }
+  );
+}
+
+function testPhotoroomResizePlanning() {
+  assert.equal(getPhotoroomResizePlan(6000, 6000), null);
+  const edgePlan = getPhotoroomResizePlan(8000, 4000);
+  assert.deepEqual(
+    { width: edgePlan.width, height: edgePlan.height },
+    { width: 6000, height: 3000 }
+  );
+  assert.ok(edgePlan.reasons.includes("longest side"));
+
+  const bytePlan = getPhotoroomResizePlan(4000, 3000, PHOTOROOM_LIMITS.maxBytes + 1);
+  assert.ok(bytePlan.width < 4000);
+  assert.ok(bytePlan.height < 3000);
+  assert.ok(bytePlan.reasons.includes("encoded file size"));
+}
+
+function testLocalBackgroundResizePlanning() {
+  assert.equal(getLocalBgResizePlan(3000, 2000), null);
+
+  const edgePlan = getLocalBgResizePlan(4000, 2000);
+  assert.deepEqual(
+    { width: edgePlan.width, height: edgePlan.height },
+    { width: LOCAL_BG_PROCESSING_LIMITS.maxEdge, height: 1536 }
+  );
+  assert.ok(edgePlan.reasons.includes("longest side"));
+
+  const pixelPlan = getLocalBgResizePlan(4000, 4000);
+  assert.ok(pixelPlan.width < LOCAL_BG_PROCESSING_LIMITS.maxEdge);
+  assert.ok(pixelPlan.width * pixelPlan.height <= LOCAL_BG_PROCESSING_LIMITS.maxPixels);
+  assert.ok(pixelPlan.reasons.includes("pixel count"));
 }
 
 function processingSettings(overrides = {}) {
@@ -929,6 +1037,7 @@ async function testPhotoroomProviderRequest() {
 
   assert.equal(capturedUrl, "https://sdk.photoroom.com/v1/segment");
   assert.equal(capturedOptions.method, "POST");
+  assert.equal(capturedOptions.headers.Accept, "image/png, application/json");
   assert.equal(capturedOptions.headers["x-api-key"], "test-photoroom-key");
   assert.equal(capturedOptions.body.get("format"), "png");
   assert.equal(capturedOptions.body.get("channels"), "rgba");
@@ -953,6 +1062,20 @@ async function testPhotoroomProviderRejectsDimensionChanges() {
       fetchImpl: async () => new Response(minimalPng(3, 2), { status: 200 })
     }),
     /returned 3 x 2, but AlphaKiller sent 2 x 3/
+  );
+}
+
+async function testPhotoroomProviderKeepsHttpStatusInApiErrors() {
+  await assert.rejects(
+    removeBackgroundWithPhotoroomApi({
+      pngBytes: minimalPng(2, 3),
+      apiToken: "test-photoroom-key",
+      fetchImpl: async () => new Response(
+        JSON.stringify({ message: "Not enough credits" }),
+        { status: 402, headers: { "content-type": "application/json" } }
+      )
+    }),
+    /PhotoRoom request failed with HTTP 402: Not enough credits/
   );
 }
 
@@ -992,6 +1115,10 @@ function minimalJpeg() {
 }
 
 testApplyMaskToImage();
+testElectronIpcErrorMessagesPreserveProviderFailures();
+testCropGeometrySupportsFreeAndFixedRatios();
+testPhotoroomResizePlanning();
+testLocalBackgroundResizePlanning();
 testSegmentationCleanupBalanceIsReversibleAndRespectsManualEdits();
 testBuildTrimap();
 testConstrainRefinedMaskPreventsMattingHaloGrowth();
@@ -1031,5 +1158,6 @@ testVectorContourOffset();
 testVectorContourExpandsPastBorder();
 await testPhotoroomProviderRequest();
 await testPhotoroomProviderRejectsDimensionChanges();
+await testPhotoroomProviderKeepsHttpStatusInApiErrors();
 
 console.log("Unit tests passed.");

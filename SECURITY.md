@@ -36,5 +36,8 @@ screenshots, logs, or packaged renderer assets.
 ## Reporting issues
 
 Please open a GitHub issue for security hardening gaps that do not expose
-private data. If a future release process adds signed installers or auto-update,
-add a private vulnerability reporting channel before shipping those builds.
+private data. macOS release signing certificates and notarization credentials
+must stay in the protected `macos-release` GitHub Environment's secrets and
+must never be committed or exposed to pull-request workflows. Add a private
+vulnerability reporting channel before shipping beyond the current beta or
+enabling automatic updates.

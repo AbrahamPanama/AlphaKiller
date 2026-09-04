@@ -589,6 +589,14 @@ button {
   cursor: grabbing;
 }
 
+.canvas-shell.is-crop.has-image canvas {
+  cursor: crosshair;
+}
+
+.canvas-shell.is-crop-moving canvas {
+  cursor: move;
+}
+
 .canvas-tools {
   position: absolute;
   top: 12px;
@@ -600,6 +608,56 @@ button {
   align-items: flex-start;
   gap: 10px;
   pointer-events: none;
+}
+
+.crop-toolbar {
+  position: absolute;
+  top: 58px;
+  left: 50%;
+  z-index: 6;
+  min-height: 38px;
+  transform: translateX(-50%);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px 5px 10px;
+  border: 1px solid rgba(255, 255, 255, .14);
+  border-radius: 7px;
+  background: rgba(13, 16, 20, .94);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, .34);
+}
+
+.crop-toolbar label {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.crop-toolbar select {
+  width: 96px;
+  height: 28px;
+  padding: 0 24px 0 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-panel-2);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.crop-toolbar output {
+  min-width: 92px;
+  color: var(--text-2);
+  font: 11px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  text-align: center;
+}
+
+.crop-toolbar .crop-apply {
+  height: 28px;
+  padding: 0 10px;
 }
 
 .canvas-tools-left {
@@ -1334,8 +1392,9 @@ input[type="range"] {
 
 .hf-token-dialog,
 .preset-dialog,
-.super-scale-dialog {
-  width: min(420px, calc(100vw - 32px));
+.super-scale-dialog,
+.background-resize-dialog {
+  width: min(480px, calc(100vw - 32px));
   padding: 18px;
   display: grid;
   gap: 12px;
@@ -1347,13 +1406,15 @@ input[type="range"] {
 
 .hf-token-dialog strong,
 .preset-dialog strong,
-.super-scale-dialog strong {
+.super-scale-dialog strong,
+.background-resize-dialog strong {
   font-size: 15px;
 }
 
 .hf-token-dialog span,
 .preset-dialog span,
-.super-scale-dialog span {
+.super-scale-dialog span,
+.background-resize-dialog span {
   color: var(--text-2);
   font-size: 12px;
   line-height: 1.45;
@@ -1372,6 +1433,7 @@ input[type="range"] {
 
 .dialog-actions {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
   gap: 8px;
 }
@@ -1386,6 +1448,12 @@ input[type="range"] {
   border-radius: 6px;
   background: var(--bg-panel-2);
   color: var(--text-2);
+}
+
+.dialog-actions button.primary-button {
+  border-color: transparent;
+  background: var(--accent);
+  color: #07110b;
 }
 
 .dialog-title-row {
@@ -1472,6 +1540,55 @@ input[type="range"] {
   color: var(--warn);
   font-size: 12px;
   line-height: 1.4;
+}
+
+.background-resize-dialog p {
+  margin: 0;
+  color: var(--text-2);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.resize-comparison {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.resize-comparison > div,
+.resize-limit-note {
+  min-width: 0;
+  padding: 10px;
+  display: grid;
+  gap: 4px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: #101216;
+}
+
+.resize-comparison span,
+.resize-limit-note span {
+  color: var(--text-3);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.resize-comparison strong,
+.resize-limit-note strong {
+  overflow-wrap: anywhere;
+  color: var(--text);
+  font: 12px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+.resize-comparison small,
+.resize-limit-note small {
+  color: var(--text-3);
+  font-size: 11px;
+}
+
+.background-resize-dialog .dialog-note {
+  color: var(--accent);
 }
 
 .export-backdrop {

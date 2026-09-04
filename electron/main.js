@@ -28,7 +28,7 @@ function createWindow() {
     height: 900,
     minWidth: 1040,
     minHeight: 680,
-    title: "AlphaKiller 0.1 beta 4",
+    title: "AlphaKiller 0.1 beta 5",
     icon: process.platform === "win32" ? windowsIconPath : undefined,
     backgroundColor: "#0d0e10",
     titleBarStyle: process.platform === "darwin" ? "hiddenInset" : "default",
@@ -230,12 +230,17 @@ ipcMain.handle("background-removal:run", async (event, payload) => {
     throw new Error("background-removal:run expected pngBytes ArrayBuffer.");
   }
 
-  return removeBackground({
-    provider,
-    pngBytes,
-    preserveAlpha: preserveAlpha !== false,
-    apiToken: typeof apiToken === "string" ? apiToken.trim() : ""
-  });
+  try {
+    return await removeBackground({
+      provider,
+      pngBytes,
+      preserveAlpha: preserveAlpha !== false,
+      apiToken: typeof apiToken === "string" ? apiToken.trim() : ""
+    });
+  } catch (error) {
+    const providerLabel = typeof provider === "string" && provider ? provider : "background-removal";
+    throw new Error(`${providerLabel}: ${error?.message || "Request failed."}`);
+  }
 });
 
 ipcMain.handle("super-scale:run", async (event, payload) => {

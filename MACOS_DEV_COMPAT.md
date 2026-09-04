@@ -1,6 +1,6 @@
 # AlphaKiller — macOS Developer Compatibility
 
-Prepared: 2026-04-27
+Prepared: 2026-09-02
 
 This document is the current macOS development and packaging guide for
 AlphaKiller 0.1 beta. It replaces older handoff notes that described missing
@@ -94,14 +94,112 @@ npm run dist:mac
 By policy, the default macOS build targets Apple Silicon (`arm64`). Windows x86
 compatibility is handled by the Windows build scripts, not the macOS build.
 
+`dist:mac` and `dist:mac:arm64` are intentionally local-development commands.
+They keep Electron Builder's signing identity set to `null` and notarization
+disabled, so contributors do not need Apple credentials and local packaging
+continues to produce an unsigned test build. Do not distribute that artifact;
+Gatekeeper warnings are expected on another Mac.
+
 For an explicit Apple Silicon test build:
 
 ```bash
 npm run dist:mac:arm64
 ```
 
-The current beta uses Electron's default app icon. A custom macOS `.icns` icon
-can be added later under the electron-builder `mac.icon` setting.
+The packaged app uses `build/icon.icns`. Release builds enable Hardened Runtime
+and apply the narrowly scoped entitlements in `build/entitlements.mac.plist`
+and `build/entitlements.mac.inherit.plist`. AlphaKiller needs the JIT entitlement
+for Electron's V8 runtime; it does not enable the Mac App Store sandbox or add
+unrelated device, file, or network entitlements. The beta suffix stays in the
+package and artifact version, while the macOS bundle uses Apple's numeric
+version fields (`0.1.0` marketing version and build `5`). Increment the numeric
+`mac.bundleVersion` for every later macOS release build.
+
+## Signed and Notarized Releases
+
+`.github/workflows/release-macos.yml` runs only for pushed `v*` tags. It rejects
+a tag unless it is exactly `v` followed by the version in `package.json`, runs
+the full verification suite, builds the Apple Silicon DMG on macOS, signs the
+app with a Developer ID Application certificate, submits it to Apple's notary
+service, and verifies the signature, stapled ticket, Gatekeeper assessment, and
+DMG integrity against the app mounted from the final image. It then creates a
+GitHub prerelease for prerelease versions and attaches the DMG plus its SHA-256
+checksum.
+
+The release-only command is:
+
+```bash
+npm run build
+npm run dist:mac:release
+```
+
+`electron-builder.release.cjs` removes the local `identity: null` override,
+sets `forceCodeSigning: true`, enables Electron Builder's notarization step,
+and validates the credential environment before packaging. Missing signing or
+notarization credentials therefore fail the release rather than silently
+producing a public unsigned build. The release workflow runs `npm run verify`
+before exposing Apple credentials, so `dist:mac:release` packages the already
+built renderer and does not rebuild application code while secrets are present.
+
+### Required GitHub Actions secrets
+
+Create a GitHub Environment named `macos-release` under **Repository settings →
+Environments**, add a required reviewer, and restrict it to protected release
+tags where the repository plan supports those controls. Add the following as
+environment secrets. The job will not receive them until its environment is
+approved. Certificate and private-key files are ignored by Git and must never
+be committed. Also add a repository ruleset for `v*` tags so only designated
+release managers can create or update them.
+
+Signing always requires:
+
+| Secret | Value |
+|---|---|
+| `CSC_LINK` | Base64-encoded `.p12` export containing the **Developer ID Application** certificate and its private key |
+| `CSC_KEY_PASSWORD` | Password used when exporting that `.p12` file |
+
+For notarization, the preferred option is an App Store Connect Team API key
+(not an Individual key) with **App Manager** access. Apple Individual API keys
+cannot access `notarytool`:
+
+| Secret | Value |
+|---|---|
+| `APPLE_API_KEY_P8_BASE64` | Base64-encoded contents of the App Store Connect `.p8` private key |
+| `APPLE_API_KEY_ID` | App Store Connect Team API key ID |
+| `APPLE_API_ISSUER` | App Store Connect API issuer ID |
+
+The workflow decodes `APPLE_API_KEY_P8_BASE64` into the runner's temporary
+directory because Electron Builder expects `APPLE_API_KEY` to be a file path,
+then deletes that temporary file after packaging.
+
+Alternatively, configure all three Apple ID credentials:
+
+| Secret | Value |
+|---|---|
+| `APPLE_ID` | Apple Developer account email address |
+| `APPLE_APP_SPECIFIC_PASSWORD` | App-specific password created for that Apple ID |
+| `APPLE_TEAM_ID` | Apple Developer Team ID |
+
+When both notarization methods are configured, the workflow uses the App Store
+Connect API key. GitHub provides `GITHUB_TOKEN` automatically; it is not a
+custom secret. The workflow grants that token only `contents: write`, which is
+needed to create the GitHub release.
+
+### Publishing 0.1.0-beta.5
+
+After the intended release commit is reviewed and merged, verify the package
+version and push its matching annotated tag:
+
+```bash
+test "$(node -p "require('./package.json').version")" = "0.1.0-beta.5"
+git tag -a v0.1.0-beta.5 -m "AlphaKiller 0.1.0-beta.5"
+git push origin v0.1.0-beta.5
+```
+
+The workflow also rejects tags whose commit is not reachable from `main`.
+Pushing the tag is the publication action, subject to approval of the
+`macos-release` environment. Do not reuse or move a published release tag;
+increment `package.json` and create a new tag for another build.
 
 ## Windows Builds From macOS
 
@@ -138,12 +236,15 @@ Use portable builds only when a no-install executable is specifically needed.
 They can launch slowly because the app has to unpack itself before running.
 
 Unsigned Windows builds can trigger SmartScreen. That is expected until the app
-has code-signing certificates and a formal release pipeline.
+has Windows code-signing certificates and a Windows signing pipeline.
 
 ## Known Packaging Gaps
 
-- macOS builds are not notarized or signed.
+- Public macOS releases currently target Apple Silicon only; there is no Intel
+  or universal DMG.
 - Windows builds are not signed.
-- There is no custom application icon yet.
-- Release artifacts should be attached to GitHub Releases rather than committed
-  to the repository.
+- Local macOS packages remain unsigned by design; only the tag workflow creates
+  distributable signed and notarized artifacts.
+- Automatic application updates are not configured.
+- Release artifacts are attached to GitHub Releases rather than committed to
+  the repository.

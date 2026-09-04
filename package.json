@@ -1,6 +1,6 @@
 {
   "name": "alphakiller",
-  "version": "0.1.0-beta.4",
+  "version": "0.1.0-beta.5",
   "description": "Desktop image cleanup tool for transparent pixel and anti-aliasing artifacts.",
   "main": "electron/main.js",
   "type": "module",
@@ -21,6 +21,7 @@
     "build": "vite build",
     "dist:mac": "npm run build && electron-builder --mac dmg --arm64",
     "dist:mac:arm64": "npm run build && electron-builder --mac dmg --arm64",
+    "dist:mac:release": "electron-builder --config electron-builder.release.cjs --mac dmg --arm64 --publish never",
     "dist:win": "npm run build && electron-builder --win nsis --x64 --ia32",
     "dist:win:x64": "npm run build && electron-builder --win nsis --x64",
     "dist:win:ia32": "npm run build && electron-builder --win nsis --ia32",
@@ -72,6 +73,12 @@
     "mac": {
       "icon": "build/icon.icns",
       "identity": null,
+      "hardenedRuntime": true,
+      "entitlements": "build/entitlements.mac.plist",
+      "entitlementsInherit": "build/entitlements.mac.inherit.plist",
+      "notarize": false,
+      "bundleShortVersion": "0.1.0",
+      "bundleVersion": "5",
       "target": [
         {
           "target": "dmg",

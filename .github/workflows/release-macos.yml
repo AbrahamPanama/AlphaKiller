@@ -1,0 +1,220 @@
+name: Release macOS
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: macos-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Sign, notarize, and publish
+    runs-on: macos-latest
+    environment: macos-release
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+          package-manager-cache: false
+
+      - name: Validate release tag
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          package_version="$(node -p "require('./package.json').version")"
+          expected_tag="v${package_version}"
+          expected_marketing_version="${package_version%%-*}"
+          bundle_short_version="$(node -p "require('./package.json').build.mac.bundleShortVersion")"
+          bundle_version="$(node -p "require('./package.json').build.mac.bundleVersion")"
+
+          if [[ "${GITHUB_REF_NAME}" != "${expected_tag}" ]]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package version ${expected_tag}."
+            exit 1
+          fi
+
+          if [[ "${bundle_short_version}" != "${expected_marketing_version}" ]]; then
+            echo "::error::mac.bundleShortVersion must match ${expected_marketing_version}."
+            exit 1
+          fi
+
+          if [[ ! "${bundle_version}" =~ ^[0-9]+(\.[0-9]+){0,2}$ ]]; then
+            echo "::error::mac.bundleVersion must contain one to three numeric components."
+            exit 1
+          fi
+
+          if ! git show-ref --verify --quiet refs/remotes/origin/main; then
+            echo "::error::The origin/main reference is unavailable."
+            exit 1
+          fi
+
+          if ! git merge-base --is-ancestor HEAD refs/remotes/origin/main; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} must point to a commit on main."
+            exit 1
+          fi
+
+          echo "version=${package_version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run release verification
+        run: npm run verify
+
+      - name: Prepare App Store Connect API key
+        shell: bash
+        env:
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "${APPLE_API_KEY_P8_BASE64:-}" ]]; then
+            exit 0
+          fi
+
+          notary_key="${RUNNER_TEMP}/AlphaKiller-AuthKey.p8"
+          printf '%s' "${APPLE_API_KEY_P8_BASE64}" | base64 --decode > "${notary_key}"
+          chmod 600 "${notary_key}"
+          echo "APPLE_API_KEY=${notary_key}" >> "${GITHUB_ENV}"
+
+      - name: Build, sign, and notarize
+        shell: bash
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          CSC_IDENTITY_AUTO_DISCOVERY: "true"
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+
+          cleanup_notary_key() {
+            if [[ "${APPLE_API_KEY:-}" == "${RUNNER_TEMP}/AlphaKiller-AuthKey.p8" ]]; then
+              rm -f "${APPLE_API_KEY}"
+            fi
+          }
+          trap cleanup_notary_key EXIT
+
+          # Prefer the App Store Connect Team API key when both credential sets exist.
+          if [[ -n "${APPLE_API_KEY:-}" ]]; then
+            unset APPLE_ID APPLE_APP_SPECIFIC_PASSWORD APPLE_TEAM_ID
+          fi
+
+          npm run dist:mac:release
+
+      - name: Verify signed release
+        id: artifact
+        shell: bash
+        env:
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          dmg_path="release/AlphaKiller-${PACKAGE_VERSION}-arm64.dmg"
+          mount_path="$(mktemp -d "${RUNNER_TEMP}/alphakiller-dmg.XXXXXX")"
+          mounted=false
+
+          test -f "${dmg_path}"
+
+          cleanup_mount() {
+            if [[ "${mounted}" == "true" ]]; then
+              hdiutil detach "${mount_path}" > /dev/null || true
+            fi
+            rmdir "${mount_path}" 2>/dev/null || true
+          }
+          trap cleanup_mount EXIT
+
+          hdiutil verify "${dmg_path}"
+          hdiutil attach "${dmg_path}" -readonly -nobrowse -mountpoint "${mount_path}" > /dev/null
+          mounted=true
+          app_path="${mount_path}/AlphaKiller.app"
+          test -d "${app_path}"
+
+          bundle_short_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "${app_path}/Contents/Info.plist")"
+          bundle_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "${app_path}/Contents/Info.plist")"
+          expected_bundle_version="$(node -p "require('./package.json').build.mac.bundleVersion")"
+          test "${bundle_short_version}" = "${PACKAGE_VERSION%%-*}"
+          test "${bundle_version}" = "${expected_bundle_version}"
+
+          codesign --verify --deep --strict --verbose=2 "${app_path}"
+          signing_details="$(codesign --display --verbose=4 "${app_path}" 2>&1)"
+          printf '%s\n' "${signing_details}"
+          grep -q '^Authority=Developer ID Application:' <<< "${signing_details}"
+          xcrun stapler validate "${app_path}"
+          spctl --assess --type execute --verbose=4 "${app_path}"
+
+          hdiutil detach "${mount_path}" > /dev/null
+          mounted=false
+          rmdir "${mount_path}"
+          trap - EXIT
+
+          (
+            cd release
+            shasum -a 256 "$(basename "${dmg_path}")" > "$(basename "${dmg_path}").sha256"
+          )
+
+          echo "dmg=${dmg_path}" >> "${GITHUB_OUTPUT}"
+          echo "checksum=${dmg_path}.sha256" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish GitHub release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PACKAGE_VERSION: ${{ steps.version.outputs.version }}
+          DMG_PATH: ${{ steps.artifact.outputs.dmg }}
+          CHECKSUM_PATH: ${{ steps.artifact.outputs.checksum }}
+        run: |
+          set -euo pipefail
+          release_flags=(
+            --verify-tag
+            --generate-notes
+            --title "AlphaKiller ${PACKAGE_VERSION}"
+          )
+
+          if [[ "${PACKAGE_VERSION}" == *-* ]]; then
+            release_flags+=(--prerelease)
+          else
+            release_flags+=(--latest)
+          fi
+
+          if gh release view "${GITHUB_REF_NAME}" > /dev/null 2>&1; then
+            echo "::error::Release ${GITHUB_REF_NAME} already exists; published assets are immutable."
+            exit 1
+          fi
+
+          read -r remote_type remote_sha < <(
+            gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${GITHUB_REF_NAME}" \
+              --jq '[.object.type, .object.sha] | @tsv'
+          )
+          while [[ "${remote_type}" == "tag" ]]; do
+            read -r remote_type remote_sha < <(
+              gh api "repos/${GITHUB_REPOSITORY}/git/tags/${remote_sha}" \
+                --jq '[.object.type, .object.sha] | @tsv'
+            )
+          done
+          if [[ "${remote_type}" != "commit" || "${remote_sha}" != "${GITHUB_SHA}" ]]; then
+            echo "::error::Release tag ${GITHUB_REF_NAME} no longer resolves to ${GITHUB_SHA}."
+            exit 1
+          fi
+
+          gh release create "${GITHUB_REF_NAME}" \
+            "${DMG_PATH}" \
+            "${CHECKSUM_PATH}" \
+            "${release_flags[@]}"
